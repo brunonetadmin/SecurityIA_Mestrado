@@ -1,0 +1,6 @@
+2025-07-12 18:06:17 - INFO - Verificando disponibilidade de aceleração de GPU (CUDA)...
+2025-07-12 18:06:17 - WARNING - ==> AVISO: Nenhuma GPU compatível foi encontrada. O treinamento será executado na CPU, o que será significativamente mais lento.
+2025-07-12 18:06:17 - INFO - ================================================================================
+2025-07-12 18:06:17 - INFO - INICIANDO SCRIPT DE TREINAMENTO DO SISTEMA IDS
+2025-07-12 18:06:17 - INFO - ================================================================================
+2025-07-12 18:06:17 - INFO - Iniciando carregamento do dataset de 'D:\Mestrado\Base\CSE-CIC-IDS2018'...

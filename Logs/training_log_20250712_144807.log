@@ -1,0 +1,14 @@
+2025-07-12 14:48:07 - INFO - ================================================================================
+2025-07-12 14:48:07 - INFO - INICIANDO SCRIPT DE TREINAMENTO DO SISTEMA IDS
+2025-07-12 14:48:07 - INFO - ================================================================================
+2025-07-12 14:48:07 - INFO - Iniciando carregamento do dataset de 'D:\Mestrado\Base'...
+2025-07-12 14:48:07 - ERROR - Nenhum arquivo CSV encontrado em D:\Mestrado\Base
+2025-07-12 14:48:07 - ERROR - Ocorreu um erro fatal durante a execução: Nenhum arquivo CSV encontrado em D:\Mestrado\Base
+2025-07-12 14:48:07 - ERROR - Traceback:
+Traceback (most recent call last):
+  File "d:\Mestrado\1_ids_training_script.py", line 318, in main
+    df_raw = data_handler.load_dataset()
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\Mestrado\1_ids_training_script.py", line 86, in load_dataset
+    raise FileNotFoundError(f"Nenhum arquivo CSV encontrado em {self.config.DATA_DIR}")
+FileNotFoundError: Nenhum arquivo CSV encontrado em D:\Mestrado\Base

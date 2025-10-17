@@ -1,0 +1,51 @@
+2025-07-12 14:48:51 - INFO - ================================================================================
+2025-07-12 14:48:51 - INFO - INICIANDO SCRIPT DE TREINAMENTO DO SISTEMA IDS
+2025-07-12 14:48:51 - INFO - ================================================================================
+2025-07-12 14:48:51 - INFO - Iniciando carregamento do dataset de 'D:\Mestrado\Base\CSE-CIC-IDS2018'...
+2025-07-12 14:49:38 - INFO - Dataset bruto carregado. Shape: (9625148, 79)
+2025-07-12 14:49:38 - INFO - Iniciando limpeza dos dados...
+2025-07-12 14:49:47 - INFO - Dados limpos. Shape: (9625148, 79)
+2025-07-12 14:49:53 - INFO - Calculando Information Gain e Mutual Information para seleção de características...
+2025-07-12 16:39:15 - INFO - Top 23 características selecionadas: ['Init Fwd Win Byts', 'Dst Port', 'Fwd Pkts/s', 'Flow IAT Max', 'Flow IAT Mean', 'Flow Duration', 'Fwd IAT Mean', 'Fwd IAT Max', 'Fwd IAT Tot', 'Fwd Header Len', 'Flow Pkts/s', 'Bwd Pkts/s', 'Fwd IAT Min', 'Fwd Pkt Len Max', 'Fwd Seg Size Avg', 'Fwd Pkt Len Mean', 'Pkt Len Max', 'Bwd Pkt Len Max', 'Flow IAT Min', 'TotLen Fwd Pkts', 'Subflow Fwd Byts', 'Fwd Seg Size Min', 'Bwd Seg Size Avg']
+2025-07-12 16:39:20 - INFO - Aplicando normalização StandardScaler...
+2025-07-12 16:39:24 - INFO - Aplicando balanceamento de classes SMOTE-ENN...
+2025-07-12 16:51:50 - ERROR - Ocorreu um erro fatal durante a execução: Unable to allocate 1.18 GiB for an array with shape (6865923, 23) and data type float64
+2025-07-12 16:51:50 - ERROR - Traceback:
+Traceback (most recent call last):
+  File "d:\Mestrado\1_ids_training_script.py", line 319, in main
+    X_processed, y_processed, selected_features = data_handler.preprocess(df_raw)
+                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\Mestrado\1_ids_training_script.py", line 152, in preprocess
+    X_balanced, y_balanced = smote_enn.fit_resample(X_scaled, y_encoded)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\base.py", line 202, in fit_resample
+    return super().fit_resample(X, y, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\sklearn\base.py", line 1473, in wrapper
+    return fit_method(estimator, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\base.py", line 105, in fit_resample
+    output = self._fit_resample(X, y, **params)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\combine\_smote_enn.py", line 159, in _fit_resample
+    X_res, y_res = self.smote_.fit_resample(X, y)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\base.py", line 202, in fit_resample
+    return super().fit_resample(X, y, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\sklearn\base.py", line 1473, in wrapper
+    return fit_method(estimator, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\base.py", line 105, in fit_resample
+    output = self._fit_resample(X, y, **params)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\over_sampling\_smote\base.py", line 360, in _fit_resample
+    X_new, y_new = self._make_samples(
+                   ^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\over_sampling\_smote\base.py", line 118, in _make_samples
+    X_new = self._generate_samples(X, nn_data, nn_num, rows, cols, steps, y_type, y)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\over_sampling\_smote\base.py", line 185, in _generate_samples
+    X_new = X[rows] + steps * diffs
+            ~~~~~~~~^~~~~~~~~~~~~~~
+numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.18 GiB for an array with shape (6865923, 23) and data type float64

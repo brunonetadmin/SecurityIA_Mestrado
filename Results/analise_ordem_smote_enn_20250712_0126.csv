@@ -1,0 +1,3 @@
+Ordem,F1_Macro,Samples_Intermediário,Samples_Final,Taxa_Remoção,Vantagem
+SMOTE → ENN,0.8430430151497259,22400,22399,0.0%,Preserva exemplos minoritários
+ENN → SMOTE,0.7763312943414673,5245,22285,-,Remove ruído primeiro (problemático)

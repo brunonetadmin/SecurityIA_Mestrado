@@ -1,0 +1,13 @@
+2025-07-14 13:11:37 - INFO - Verificando disponibilidade de aceleração de GPU (CUDA)...
+2025-07-14 13:11:37 - INFO - ==> SUCESSO: 1 GPU(s) encontradas. Aceleração de hardware está HABILITADA.
+2025-07-14 13:11:37 - INFO - ================================================================================
+2025-07-14 13:11:37 - INFO - INICIANDO SCRIPT DE TREINAMENTO DO SISTEMA IDS (VERSÃO OTIMIZADA)
+2025-07-14 13:11:37 - INFO - ================================================================================
+2025-07-14 13:11:37 - ERROR - Ocorreu um erro fatal durante a execução: type object 'IDSConfig' has no attribute 'CACHE_DIR'
+2025-07-14 13:11:37 - ERROR - Traceback:
+Traceback (most recent call last):
+  File "d:\Mestrado\1_ids_training_script.py", line 411, in main
+    data_handler = DataHandler(IDSConfig)
+  File "d:\Mestrado\1_ids_training_script.py", line 87, in __init__
+    self.config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+AttributeError: type object 'IDSConfig' has no attribute 'CACHE_DIR'

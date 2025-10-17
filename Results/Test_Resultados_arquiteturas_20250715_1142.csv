@@ -1,0 +1,5 @@
+Arquitetura,Acurácia,Tempo_Treinamento_s,Precisão_Ataque,Recall_Ataque,F1_Score_Ataque
+SimpleRNN,1.0,67.05624437332153,1.0,1.0,1.0
+LSTM,1.0,111.29512071609497,1.0,1.0,1.0
+LSTM Bidirecional,1.0,237.0846140384674,1.0,1.0,1.0
+Transformer,1.0,100.58947396278381,1.0,1.0,1.0

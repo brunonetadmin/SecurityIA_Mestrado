@@ -1,0 +1,54 @@
+2025-07-12 18:27:48 - INFO - Verificando disponibilidade de aceleração de GPU (CUDA)...
+2025-07-12 18:27:48 - WARNING - ==> AVISO: Nenhuma GPU compatível foi encontrada. O treinamento será executado na CPU, o que será significativamente mais lento.
+2025-07-12 18:27:48 - INFO - ================================================================================
+2025-07-12 18:27:48 - INFO - INICIANDO SCRIPT DE TREINAMENTO DO SISTEMA IDS
+2025-07-12 18:27:48 - INFO - ================================================================================
+2025-07-12 18:27:48 - INFO - Iniciando carregamento do dataset de 'D:\Mestrado\Base\CSE-CIC-IDS2018'...
+2025-07-12 18:28:34 - INFO - Dataset bruto carregado. Shape: (9625148, 79)
+2025-07-12 18:28:34 - INFO - Iniciando limpeza dos dados...
+2025-07-12 18:28:42 - INFO - Dados limpos. Shape: (9625148, 79)
+2025-07-12 18:28:46 - INFO - Calculando Information Gain e Mutual Information para seleção de características...
+2025-07-12 20:06:43 - INFO - Top 23 características selecionadas: ['Init Fwd Win Byts', 'Dst Port', 'Fwd Pkts/s', 'Flow IAT Max', 'Flow IAT Mean', 'Flow Duration', 'Fwd IAT Mean', 'Fwd IAT Max', 'Fwd IAT Tot', 'Fwd Header Len', 'Flow Pkts/s', 'Bwd Pkts/s', 'Fwd IAT Min', 'Fwd Pkt Len Max', 'Fwd Seg Size Avg', 'Fwd Pkt Len Mean', 'Pkt Len Max', 'Bwd Pkt Len Max', 'Flow IAT Min', 'TotLen Fwd Pkts', 'Subflow Fwd Byts', 'Fwd Seg Size Min', 'Bwd Seg Size Avg']
+2025-07-12 20:06:47 - INFO - Aplicando normalização StandardScaler...
+2025-07-12 20:06:51 - INFO - Aplicando balanceamento de classes com estratégia híbrida (Oversampling + Undersampling)...
+2025-07-12 20:06:52 - INFO - Estratégia SMOTE (Oversampling): {1: 50000, 2: 50000, 3: 50000, 4: 50000, 5: 50000, 6: 50000, 7: 50000, 8: 50000, 9: 50000, 10: 50000, 11: 50000, 12: 50000, 13: 50000, 14: 50000}
+2025-07-12 20:06:52 - INFO - Estratégia RandomUnderSampler: {0: 150000}
+2025-07-12 20:06:53 - ERROR - Ocorreu um erro fatal durante a execução: With over-sampling methods, the number of samples in a class should be greater or equal to the original number of samples. Originally, there is 286191 samples and 50000 samples are asked.
+2025-07-12 20:06:53 - ERROR - Traceback:
+Traceback (most recent call last):
+  File "d:\Mestrado\1_ids_training_script.py", line 361, in main
+    X_processed, y_processed, selected_features = data_handler.preprocess(df_raw)
+                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "d:\Mestrado\1_ids_training_script.py", line 174, in preprocess
+    X_resampled, y_resampled = pipeline.fit_resample(X_scaled, y_encoded)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\sklearn\base.py", line 1473, in wrapper
+    return fit_method(estimator, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\pipeline.py", line 726, in fit_resample
+    Xt, yt = self._fit(X, y, routed_params)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\pipeline.py", line 440, in _fit
+    X, y, fitted_transformer = fit_resample_one_cached(
+                               ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\joblib\memory.py", line 312, in __call__
+    return self.func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\pipeline.py", line 1336, in _fit_resample_one
+    X_res, y_res = sampler.fit_resample(X, y, **params.get("fit_resample", {}))
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\base.py", line 202, in fit_resample
+    return super().fit_resample(X, y, **params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\sklearn\base.py", line 1473, in wrapper
+    return fit_method(estimator, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\base.py", line 101, in fit_resample
+    self.sampling_strategy_ = check_sampling_strategy(
+                              ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\utils\_validation.py", line 557, in check_sampling_strategy
+    sorted(_sampling_strategy_dict(sampling_strategy, y, sampling_type).items())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Mestrado\.conda\Lib\site-packages\imblearn\utils\_validation.py", line 335, in _sampling_strategy_dict
+    raise ValueError(
+ValueError: With over-sampling methods, the number of samples in a class should be greater or equal to the original number of samples. Originally, there is 286191 samples and 50000 samples are asked.

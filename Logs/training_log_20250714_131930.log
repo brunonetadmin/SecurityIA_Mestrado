@@ -1,0 +1,35 @@
+2025-07-14 13:19:30 - INFO - Verificando disponibilidade de aceleração de GPU (CUDA)...
+2025-07-14 13:19:30 - INFO - ==> SUCESSO: 1 GPU(s) encontradas. Aceleração de hardware está HABILITADA.
+2025-07-14 13:19:30 - INFO - ================================================================================
+2025-07-14 13:19:30 - INFO - INICIANDO SCRIPT DE TREINAMENTO DO SISTEMA IDS (VERSÃO OTIMIZADA)
+2025-07-14 13:19:30 - INFO - ================================================================================
+2025-07-14 13:19:30 - INFO - AVISO: Cache de dados limpos não encontrado ou recarga forçada. Executando do zero.
+2025-07-14 13:19:30 - INFO - Iniciando carregamento do dataset de 'D:\Mestrado\Base\CSE-CIC-IDS2018'...
+2025-07-14 13:20:10 - INFO - Dataset bruto carregado. Shape: (9625148, 79)
+2025-07-14 13:20:10 - INFO - Iniciando limpeza dos dados...
+2025-07-14 13:20:16 - INFO - Dados limpos. Shape: (9625148, 79)
+2025-07-14 13:20:16 - INFO - Salvando DataFrame limpo em cache para uso futuro: 'D:\Mestrado\Cache\01_cleaned_dataframe.parquet'
+2025-07-14 13:20:16 - ERROR - Ocorreu um erro fatal durante a execução: Unable to find a usable engine; tried using: 'pyarrow', 'fastparquet'.
+A suitable version of pyarrow or fastparquet is required for parquet support.
+Trying to import the above resulted in these errors:
+ - Missing optional dependency 'pyarrow'. pyarrow is required for parquet support. Use pip or conda to install pyarrow.
+ - Missing optional dependency 'fastparquet'. fastparquet is required for parquet support. Use pip or conda to install fastparquet.
+2025-07-14 13:20:16 - ERROR - Traceback:
+Traceback (most recent call last):
+  File "d:\Mestrado\1_ids_training_script.py", line 412, in main
+    df_raw = data_handler.load_and_clean_data_with_cache()
+  File "d:\Mestrado\1_ids_training_script.py", line 129, in load_and_clean_data_with_cache
+    df.to_parquet(cached_df_path)
+  File "C:\Users\strik\miniconda3\envs\tf_env\lib\site-packages\pandas\util\_decorators.py", line 333, in wrapper
+    return func(*args, **kwargs)
+  File "C:\Users\strik\miniconda3\envs\tf_env\lib\site-packages\pandas\core\frame.py", line 3118, in to_parquet
+    return to_parquet(
+  File "C:\Users\strik\miniconda3\envs\tf_env\lib\site-packages\pandas\io\parquet.py", line 478, in to_parquet
+    impl = get_engine(engine)
+  File "C:\Users\strik\miniconda3\envs\tf_env\lib\site-packages\pandas\io\parquet.py", line 68, in get_engine
+    raise ImportError(
+ImportError: Unable to find a usable engine; tried using: 'pyarrow', 'fastparquet'.
+A suitable version of pyarrow or fastparquet is required for parquet support.
+Trying to import the above resulted in these errors:
+ - Missing optional dependency 'pyarrow'. pyarrow is required for parquet support. Use pip or conda to install pyarrow.
+ - Missing optional dependency 'fastparquet'. fastparquet is required for parquet support. Use pip or conda to install fastparquet.

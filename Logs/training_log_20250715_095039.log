@@ -1,0 +1,20 @@
+2025-07-15 09:50:39 - INFO - Verificando disponibilidade de aceleração de GPU (CUDA)...
+2025-07-15 09:50:39 - WARNING - ==> AVISO: Nenhuma GPU compatível foi encontrada. O treinamento será executado na CPU.
+2025-07-15 09:50:39 - INFO - ================================================================================
+2025-07-15 09:50:39 - INFO - INICIANDO SCRIPT DE TREINAMENTO DO SISTEMA IDS (VERSÃO OTIMIZADA)
+2025-07-15 09:50:39 - INFO - ================================================================================
+2025-07-15 09:50:39 - INFO - SUCESSO: Carregando DataFrame limpo do cache: 'D:\Mestrado\Cache\01_cleaned_dataframe.parquet'
+2025-07-15 09:50:44 - INFO - SUCESSO: Carregando arrays de treino (X, y) balanceados do cache.
+2025-07-15 09:50:44 - INFO - Dividindo dados em conjuntos de treino, validação e teste...
+2025-07-15 09:50:46 - INFO - Treino: (1821967, 23), Validação: (560605, 23), Teste: (420455, 23)
+2025-07-15 09:50:46 - INFO - SUCESSO: Modelo treinado encontrado em 'D:\Mestrado\Model\ids_lstm_model.keras' e 'force_retrain' é False. Pulando etapa de treinamento.
+2025-07-15 09:50:47 - INFO - Iniciando avaliação do modelo no conjunto de teste...
+2025-07-15 09:52:40 - WARNING - Histórico de treinamento não disponível para esta execução. Pulando gráfico.
+2025-07-15 09:52:40 - INFO - Gerando matriz de confusão...
+2025-07-15 09:52:41 - INFO - Gerando e salvando relatório de classificação...
+2025-07-15 09:52:42 - INFO - Relatório salvo em 'D:\Mestrado\Results\run_20250715_095240\classification_report.txt'
+2025-07-15 09:52:42 - INFO - ================================================================================
+2025-07-15 09:52:42 - INFO - PROCESSO CONCLUÍDO COM SUCESSO!
+2025-07-15 09:52:42 - INFO - Modelo salvo em 'D:\Mestrado\Model'
+2025-07-15 09:52:42 - INFO - Relatórios e gráficos salvos em 'D:\Mestrado\Results\run_20250715_095240'
+2025-07-15 09:52:42 - INFO - ================================================================================

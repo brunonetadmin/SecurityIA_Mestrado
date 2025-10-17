@@ -1,0 +1,63 @@
+2025-07-14 16:18:11 - INFO - Verificando disponibilidade de aceleração de GPU (CUDA)...
+2025-07-14 16:18:11 - WARNING - ==> AVISO: Nenhuma GPU compatível foi encontrada. O treinamento será executado na CPU.
+2025-07-14 16:18:11 - INFO - ================================================================================
+2025-07-14 16:18:11 - INFO - INICIANDO SCRIPT DE TREINAMENTO DO SISTEMA IDS (VERSÃO OTIMIZADA)
+2025-07-14 16:18:11 - INFO - ================================================================================
+2025-07-14 16:18:11 - INFO - AVISO: Cache de dados limpos não encontrado ou recarga forçada. Executando do zero.
+2025-07-14 16:18:11 - INFO - Iniciando carregamento do dataset de 'D:\Mestrado\Base\CSE-CIC-IDS2018'...
+2025-07-14 16:18:52 - INFO - Dataset bruto carregado. Shape: (9625148, 79)
+2025-07-14 16:18:52 - INFO - Iniciando limpeza dos dados...
+2025-07-14 16:19:00 - INFO - Dados limpos. Shape: (9625148, 79)
+2025-07-14 16:19:00 - INFO - Salvando DataFrame limpo em cache para uso futuro: 'D:\Mestrado\Cache\01_cleaned_dataframe.parquet'
+2025-07-14 16:19:16 - INFO - AVISO: Cache de dados processados não encontrado ou reprocessamento forçado.
+2025-07-14 16:19:16 - INFO - Otimização: Usando uma amostra do dataset para seleção de features.
+2025-07-14 16:19:16 - INFO - Calculando Mutual Information para seleção de características...
+2025-07-14 16:20:27 - INFO - Top 23 características selecionadas: ['Init Fwd Win Byts', 'Dst Port', 'Flow IAT Max', 'Flow Duration', 'Fwd Pkts/s', 'Flow IAT Mean', 'Fwd IAT Max', 'Fwd Header Len', 'Fwd IAT Tot', 'Fwd IAT Mean', 'Flow Pkts/s', 'Fwd IAT Min', 'Bwd Pkts/s', 'Flow IAT Min', 'TotLen Fwd Pkts', 'Subflow Fwd Byts', 'Fwd Pkt Len Max', 'Fwd Pkt Len Mean', 'Fwd Seg Size Avg', 'Bwd Seg Size Avg', 'Bwd Pkt Len Mean', 'TotLen Bwd Pkts', 'Subflow Bwd Byts']
+2025-07-14 16:20:29 - INFO - Aplicando normalização StandardScaler...
+2025-07-14 16:20:32 - INFO - Aplicando balanceamento de classes com estratégia híbrida dinâmica...
+2025-07-14 16:20:33 - INFO - Distribuição original das classes: Counter({0: 6876913, 4: 686012, 6: 576191, 8: 461912, 1: 286191, 11: 193360, 14: 187589, 12: 161934, 9: 139890, 7: 41508, 10: 10990, 5: 1730, 2: 611, 3: 230, 13: 87})
+2025-07-14 16:20:33 - INFO - Estratégia SMOTE (Oversampling): {1: 286191, 2: 50000, 3: 50000, 4: 686012, 5: 50000, 6: 576191, 7: 50000, 8: 461912, 9: 139890, 10: 50000, 11: 193360, 12: 161934, 13: 50000, 14: 187589}
+2025-07-14 16:20:33 - INFO - Estratégia RandomUnderSampler: {0: 150000}
+2025-07-14 16:20:38 - INFO - Aplicando ENN para limpeza de ruído...
+2025-07-14 18:11:09 - INFO - Dataset final para treinamento. Shape: (2803027, 23)
+2025-07-14 18:11:09 - INFO - Salvando arrays de treino (X, y) balanceados e processadores em cache.
+2025-07-14 18:11:10 - INFO - Dividindo dados em conjuntos de treino, validação e teste...
+2025-07-14 18:11:11 - INFO - Treino: (1821967, 23), Validação: (560605, 23), Teste: (420455, 23)
+2025-07-14 18:11:11 - INFO - AVISO: Modelo não encontrado ou 'force_retrain' é True. Iniciando processo de treinamento.
+2025-07-14 18:11:11 - INFO - Nenhum modelo encontrado ou fine-tuning desabilitado. Construindo modelo do zero.
+2025-07-14 18:11:11 - INFO - Construindo nova arquitetura LSTM Híbrida...
+2025-07-14 18:11:13 - INFO - Model: "sequential"
+2025-07-14 18:11:13 - INFO - _________________________________________________________________
+2025-07-14 18:11:13 - INFO -  Layer (type)                Output Shape              Param #   
+2025-07-14 18:11:13 - INFO - =================================================================
+2025-07-14 18:11:13 - INFO -  bidirectional (Bidirectiona  (None, 23, 256)          133120    
+2025-07-14 18:11:13 - INFO -  l)                                                              
+2025-07-14 18:11:13 - INFO -                                                                  
+2025-07-14 18:11:13 - INFO -  dropout (Dropout)           (None, 23, 256)           0         
+2025-07-14 18:11:13 - INFO -                                                                  
+2025-07-14 18:11:13 - INFO -  bidirectional_1 (Bidirectio  (None, 128)              164352    
+2025-07-14 18:11:13 - INFO -  nal)                                                            
+2025-07-14 18:11:13 - INFO -                                                                  
+2025-07-14 18:11:13 - INFO -  dropout_1 (Dropout)         (None, 128)               0         
+2025-07-14 18:11:13 - INFO -                                                                  
+2025-07-14 18:11:13 - INFO -  dense (Dense)               (None, 32)                4128      
+2025-07-14 18:11:13 - INFO -                                                                  
+2025-07-14 18:11:13 - INFO -  dropout_2 (Dropout)         (None, 32)                0         
+2025-07-14 18:11:13 - INFO -                                                                  
+2025-07-14 18:11:13 - INFO -  dense_1 (Dense)             (None, 15)                495       
+2025-07-14 18:11:13 - INFO -                                                                  
+2025-07-14 18:11:13 - INFO - =================================================================
+2025-07-14 18:11:13 - INFO - Total params: 302,095
+2025-07-14 18:11:13 - INFO - Trainable params: 302,095
+2025-07-14 18:11:13 - INFO - Non-trainable params: 0
+2025-07-14 18:11:13 - INFO - _________________________________________________________________
+2025-07-14 18:11:13 - ERROR - Ocorreu um erro fatal durante a execução: You must install pydot (`pip install pydot`) and install graphviz (see instructions at https://graphviz.gitlab.io/download/) for plot_model to work.
+2025-07-14 18:11:13 - ERROR - Traceback:
+Traceback (most recent call last):
+  File "d:\Mestrado\1_ids_training_script.py", line 443, in main
+    trainer.build_or_load_model(input_shape, num_classes)
+  File "d:\Mestrado\1_ids_training_script.py", line 275, in build_or_load_model
+    plot_model(self.model, to_file=plot_path, show_shapes=True, show_layer_names=True)
+  File "C:\Users\strik\miniconda3\envs\ids-env\lib\site-packages\keras\utils\vis_utils.py", line 449, in plot_model
+    raise ImportError(message)
+ImportError: You must install pydot (`pip install pydot`) and install graphviz (see instructions at https://graphviz.gitlab.io/download/) for plot_model to work.
