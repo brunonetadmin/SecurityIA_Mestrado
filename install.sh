@@ -27,10 +27,19 @@ readonly MENDELEY_ZIP_URL="https://prod-dcd-datasets-cache-zipfiles.s3.eu-west-1
 readonly KAGGLE_SLUG="solarmainframe/ids-intrusion-csv"
 
 EXPECTED_CSVS=(
-  "02-14-2018.csv" "02-15-2018.csv" "02-16-2018.csv"
-  "02-20-2018.csv" "02-21-2018.csv" "02-22-2018.csv"
-  "02-23-2018.csv" "02-28-2018.csv" "03-01-2018.csv"
-  "03-02-2018.csv"
+  "Bot.csv"
+  "Brute Force -Web.csv"
+  "Brute Force -XSS.csv"
+  "DDOS attack-HOIC.csv"
+  "DDOS attack-LOIC-UDP.csv"
+  "DoS attacks-GoldenEye.csv"
+  "DoS attacks-Hulk.csv"
+  "DoS attacks-SlowHTTPTest.csv"
+  "DoS attacks-Slowloris.csv"
+  "FTP-BruteForce.csv"
+  "Infilteration.csv"
+  "SQL Injection.csv"
+  "SSH-Bruteforce.csv"
 )
 
 if [[ -t 1 ]]; then

@@ -30,9 +30,23 @@ np.random.seed(42)
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. CAMINHOS BASE
 # ═══════════════════════════════════════════════════════════════════════════════
-BASE_DIR     = Path("/opt/Testes")
-DATASET_DIR  = BASE_DIR / "Base"
-REPORTS_DIR  = BASE_DIR / "Reports"
+
+# Estrutura esperada:
+# SecurityIA/
+# ├── Tests/
+# ├── Base/
+# ├── Model/
+# └── IDS/
+
+ROOT_DIR    = Path(__file__).resolve().parent.parent   # .../SecurityIA
+DATASET_DIR = ROOT_DIR / "Base"
+MODEL_DIR   = ROOT_DIR / "Model"
+TESTS_DIR  = ROOT_DIR / "Tests"
+IDS_DIR     = ROOT_DIR / "IDS"
+
+# Mantém compatibilidade com o restante do projeto/menu
+BASE_DIR    = ROOT_DIR
+REPORTS_DIR = TESTS_DIR / "Reports"
 
 # Sub-diretórios de relatório (um por análise)
 REPORT_DIRS = {
@@ -51,10 +65,19 @@ REPORT_NAMES = {
 
 # Arquivos esperados do dataset CIC-IDS2018 (versão Mendeley — Rabelo et al., 2024)
 DATASET_FILES = [
-    "02-14-2018.csv", "02-15-2018.csv", "02-16-2018.csv",
-    "02-20-2018.csv", "02-21-2018.csv", "02-22-2018.csv",
-    "02-23-2018.csv", "02-28-2018.csv", "03-01-2018.csv",
-    "03-02-2018.csv",
+    "Bot.csv",
+    "Brute Force -Web.csv",
+    "Brute Force -XSS.csv",
+    "DDOS attack-HOIC.csv",
+    "DDOS attack-LOIC-UDP.csv",
+    "DoS attacks-GoldenEye.csv",
+    "DoS attacks-Hulk.csv",
+    "DoS attacks-SlowHTTPTest.csv",
+    "DoS attacks-Slowloris.csv",
+    "FTP-BruteForce.csv",
+    "Infilteration.csv",
+    "SQL Injection.csv",
+    "SSH-Bruteforce.csv",
 ]
 
 # URL da versão reduzida (Rabelo et al., 2024 — Mendeley DOI: 10.17632/29hdbdzx2r.1)
@@ -90,7 +113,14 @@ ATTENTION_UNITS         = 64
 # 4. DATASET SINTÉTICO
 # ═══════════════════════════════════════════════════════════════════════════════
 N_FEATURES    = 23
-CLASS_NAMES   = ["Normal", "DoS", "Probe", "R2L", "U2R"]
+CLASS_NAMES = [
+    "Benign", "Bot", "Brute Force", "DDoS-HOIC", "DDoS-LOIC-HTTP",
+    "DoS-GoldenEye", "DoS-Hulk", "DoS-SlowHTTPTest", "DoS-Slowloris",
+    "Infiltration", "SQL Injection", "SSH-Bruteforce",
+    "Web-BruteForce", "Web-SQLInjection", "Web-XSS",
+]
+CLASS_NAMES_SYNTHETIC = ["Normal", "DoS", "DDoS", "Infiltração", "Web Attack"]
+
 CLASS_DIST    = [0.80, 0.12, 0.05, 0.02, 0.01]
 
 FEATURE_NAMES = [
@@ -146,8 +176,10 @@ FIG_LABEL_FS = 11
 
 def setup_environment() -> None:
     """Cria estrutura de diretórios e configura TF."""
-    for d in [DATASET_DIR, REPORTS_DIR, *REPORT_DIRS.values()]:
+    for d in [TESTS_DIR, DATASET_DIR, MODEL_DIR, IDS_DIR, REPORTS_DIR, *REPORT_DIRS.values()]:
         d.mkdir(parents=True, exist_ok=True)
+
+    for d in REPORT_DIRS.values():
         (d / "figuras").mkdir(exist_ok=True)
         (d / "tabelas").mkdir(exist_ok=True)
 
