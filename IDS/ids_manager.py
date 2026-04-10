@@ -1,742 +1,470 @@
 #!/usr/bin/env python3
 """
-ids_manager.py — Interface Principal do Sistema IDS
+IDS/ids_manager.py — Interface de Linha de Comando Principal (SecurityIA)
 
-Frontend interativo que orquestra os módulos do sistema:
-  - ids_system.py  : detecção e análise de incidentes
-  - ids_learn.py   : re-treinamento e avaliação do modelo
-  - ids_report.py  : geração de relatórios HTML/TXT
+Menu interativo completo para gerenciamento do sistema IDS:
+  1. Collector   — iniciar/parar daemon de captura
+  2. Detector    — análise de tráfego (watch/batch/arquivo)
+  3. Treinamento — treinar ou fazer fine-tuning do modelo
+  4. Avaliação   — benchmark e histórico de métricas
+  5. Relatórios  — listar e abrir relatórios gerados
+  6. Status      — visão geral do sistema
+  0. Sair
 
-Uso interativo (recomendado):
-  python3 ids_manager.py
-
-Uso direto pelo console (opcional — todos os comandos disponíveis via --help):
-  python3 ids_manager.py analyze
-  python3 ids_manager.py retrain
-  python3 ids_manager.py both
-  python3 ids_manager.py evaluate v1 "7 dias de coleta"
-  python3 ids_manager.py benchmark
-  python3 ids_manager.py report-eval
-  python3 ids_manager.py status
-
-Autor: Bruno Cavalcante Barbosa — UFAL
+Uso:
+    python3 IDS/ids_manager.py
+    python3 IDS/ids_manager.py --batch        # análise imediata (não-interativo)
+    python3 IDS/ids_manager.py --train        # treinar imediatamente
 """
 
 import argparse
-import logging
+import json
+import os
+import subprocess
 import sys
 import time
-from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional
 
-import warnings
-warnings.filterwarnings('ignore')
-
-try:
-    import pyarrow.parquet as pq
-except ImportError as exc:
-    sys.exit(f"[ERRO] {exc}. Execute: pip install pyarrow")
-
-from ids_config import IDSConfig
-from ids_system import (
-    ACTION, CONF_HIGH, CONF_MEDIUM, FEATURE_COLUMNS, META_COLUMNS,
-    MITRE, SEVERITY, BENIGN_LABEL,
-    ModelArtifacts, ManagerState,
-    analyze_file, scan_new_files,
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import Config
+from IDS.modules.utils import (
+    get_app_logger,
+    print_header, _section, pause, prompt, confirm,
+    progress_bar, print_table, format_bytes, format_duration,
+    _c, _C, _sep, _WIDTH,
+    run_background, is_process_running,
 )
-from ids_learn import load_evaluator, run_retraining
-from ids_report import generate_report, list_reports
+from IDS.modules.incident_engine import (
+    ModelArtifacts, ManagerState, scan_new_files,
+)
 
+log = get_app_logger()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Utilitários de terminal (ANSI, formatação, entrada do usuário)
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Estado de processos em background
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Códigos ANSI por chave de cor.
-_ANSI: Dict[str, str] = {
-    'R': '\033[91m', 'Y': '\033[93m', 'B': '\033[94m',
-    'G': '\033[92m', 'C': '\033[96m', 'W': '\033[1m',
-    'D': '\033[2m',  'X': '\033[0m',
-}
+_PID_FILE_COLLECTOR = Config.TEMP_DIR / ".collector.pid"
+_PID_FILE_DETECTOR  = Config.TEMP_DIR / ".detector.pid"
 
 
-def _c(text: str, *codes: str) -> str:
-    """Aplica cores ANSI ao texto se o stdout for um TTY; retorna texto limpo em pipes."""
-    if not sys.stdout.isatty():
-        return text
-    prefix = ''.join(_ANSI.get(code, '') for code in codes)
-    return f"{prefix}{text}{_ANSI['X']}"
+def _write_pid(pid_file: Path, pid: int) -> None:
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(str(pid))
 
 
-def _progress_bar(done: int, total: int, width: int = 30) -> str:
-    """Barra de progresso textual: [████░░░] 53.0% 420/800."""
-    if not total:
-        return ''
-    filled = int(done / total * width)
-    return f"[{'█' * filled}{'░' * (width - filled)}] {done / total * 100:5.1f}%  {done:,}/{total:,}"
-
-
-def _sev_color(label: str) -> str:
-    """Retorna o label de severidade com a cor ANSI correspondente."""
-    color_map = {'CRÍTICA': 'R', 'ALTA': 'Y', 'MÉDIA': 'B', 'BAIXA': 'C', 'INFO': 'D'}
-    return _c(f'{label:7s}', color_map.get(label, 'X'), 'W')
-
-
-def _sep(width: int = 68) -> str:
-    return '─' * width
-
-
-def _section(title: str) -> None:
-    print(f"\n{_sep()}\n  {_c(title, 'W')}\n{_sep()}")
-
-
-def _prompt(text: str) -> str:
-    return input(f"  {text}").strip()
-
-
-def _choice(prompt: str, options: List[str]) -> str:
-    """Lê uma opção válida do usuário, repetindo até obter uma entrada aceita."""
-    while True:
-        value = _prompt(prompt)
-        if value in options:
-            return value
-        print(f"  {_c('Opção inválida.', 'R')} Escolha entre: {', '.join(options)}")
-
-
-BANNER = r"""
-  ██╗██████╗ ███████╗
-  ██║██╔══██╗██╔════╝
-  ██║██║  ██║███████╗
-  ██║██║  ██║╚════██║
-  ██║██████╔╝███████║
-  ╚═╝╚═════╝ ╚══════╝"""
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Callbacks de progresso para analyze_file (exibição em tempo real)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _make_callbacks(total_rows: int) -> Tuple[Any, Any]:
-    """
-    Cria os dois callbacks usados por analyze_file para exibição em tempo real:
-      on_incident : imprime cada incidente detectado em uma linha colorida.
-      on_progress : atualiza a barra de progresso na mesma linha (\\r).
-    """
-
-    def on_incident(inc: dict) -> None:
-        ts      = f"[{inc['flow_start']}]"
-        attack  = inc['attack']
-        conf    = inc['confidence']
-        src     = f"{inc['src_ip']}:{inc['src_port']}"
-        dst     = f"{inc['dst_ip']}:{inc['dst_port']}"
-        proto   = inc['protocol']
-        sev_lbl = inc['severity']
-        print(
-            f"  {_c(ts, 'D')}  {_sev_color(sev_lbl)}  "
-            f"{_c(f'{attack:<32}', 'W')}  conf={conf:.3f}  "
-            f"{_c(src, 'C')} → {_c(dst, 'Y')}  {proto}"
-        )
-
-    def on_progress(done: int, total: int, n_inc: int) -> None:
-        bar   = _progress_bar(done, total)
-        label = _c(f"{n_inc} incidente(s)", 'R' if n_inc else 'D')
-        print(f"  Progresso: {bar}  {label}", end='\r', flush=True)
-
-    return on_incident, on_progress
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Operações principais (chamadas pelo menu e pelo CLI direto)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def op_analyze(state: ManagerState, arts: ModelArtifacts, files: List[Path]) -> List[Dict]:
-    """
-    Executa a análise de incidentes sobre os arquivos fornecidos, exibindo cada
-    incidente em tempo real e uma barra de progresso por batch.
-
-    Retorna a lista de resultados de analyze_file().
-    """
-    _section("Análise de Incidentes em Andamento")
-    print(
-        f"\n  {_c('Legenda:', 'W')}  "
-        f"{_c('CRÍTICA', 'R', 'W')}  {_c('ALTA   ', 'Y', 'W')}  "
-        f"{_c('MÉDIA  ', 'B', 'W')}  {_c('BAIXA  ', 'C', 'W')}"
-    )
-    print(
-        f"  Formato: [hh:mm:ss]  SEVERIDADE  "
-        f"Tipo de Ataque                   conf=X.XXX  ORIGEM:P → DESTINO:P  PROTO\n"
-    )
-
-    t0      = time.time()
-    results = []
-
-    for idx, path in enumerate(files, 1):
-        pf = pq.ParquetFile(str(path))
-        total = pf.metadata.num_rows
-        has_meta = all(c in pf.schema_arrow.names for c in META_COLUMNS)
-
-        print(f"\n  {_c(f'[{idx}/{len(files)}]', 'C', 'W')} {_c(path.name, 'W')}")
-        print(f"  Fluxos: {total:,}  |  Metadados IP: {'sim' if has_meta else 'não'}")
-        print(f"  {_sep()}")
-
-        on_incident, on_progress = _make_callbacks(total)
-        result = analyze_file(path, arts, on_incident=on_incident, on_progress=on_progress)
-        results.append(result)
-
-        # Limpa a linha da barra de progresso e exibe resumo do arquivo
-        n_inc   = len(result['incidents'])
-        elapsed = result['elapsed_s']
-        rate    = total / elapsed if elapsed > 0 else 0
-        print(' ' * 80, end='\r')
-        print(
-            f"  {_c('✔', 'G')} {elapsed:.1f}s  |  {rate:,.0f} fluxos/s  |  "
-            f"Normal={_c(str(result['normal']), 'G')}  |  "
-            f"Incidentes={_c(str(n_inc), 'R' if n_inc else 'G')}"
-        )
-
-    total_inc = sum(len(r['incidents']) for r in results)
-    total_time = time.time() - t0
-    print(
-        f"\n  {_c('✔ Análise global concluída:', 'G', 'W')}  "
-        f"{total_time:.1f}s  |  {len(files)} arquivo(s)  |  "
-        f"{_c(str(total_inc) + ' incidente(s)', 'R' if total_inc else 'G', 'W')}"
-    )
-
-    state.mark_analyzed([f.name for f in files])
-    return results
-
-
-def op_retrain(results: List[Dict], files: List[Path], state: ManagerState) -> bool:
-    """
-    Prepara o dataset anotado e executa o fine-tuning do modelo.
-    Atualiza o estado persistido se bem-sucedido.
-    """
-    _section("Re-Treinamento do Modelo")
-
-    if not results:
-        print(f"  {_c('[AVISO]', 'Y')} Nenhum resultado de análise disponível.")
-        print("  Execute a opção [3] Análise + Re-Treinamento para melhores resultados.")
-        return False
-
-    def _step_callback(step: int, msg: str) -> None:
-        label = _c(f'Passo {step}/3', 'C', 'W')
-        icon  = _c('[AVISO]', 'Y') if 'AVISO' in msg or 'Erro' in msg else ''
-        print(f"\n  {label} — {icon} {msg}")
-
-    ok = run_retraining(results, on_step=_step_callback)
-
-    if ok:
-        state.mark_trained([f.name for f in files])
-        # Descarta o singleton para que o próximo acesso recarregue o modelo atualizado
-        ModelArtifacts.reset()
-        print(f"\n  {_c('✔ Re-treinamento concluído. Modelo será recarregado na próxima análise.', 'G', 'W')}")
-    else:
-        print(f"\n  {_c('[AVISO]', 'Y')} Re-treinamento não concluído. Verifique os logs.")
-
-    return ok
-
-
-def op_generate_report(results: List[Dict], version: str, retrained: bool) -> Tuple[Path, Path]:
-    """Gera e exibe os caminhos do relatório HTML e do resumo TXT."""
-    _section("Gerando Relatório")
-    html_path, txt_path = generate_report(results, version, retrained)
-    print(f"\n  {_c('✔', 'G')} HTML : {html_path}")
-    print(f"  {_c('✔', 'G')} TXT  : {txt_path}")
-    return html_path, txt_path
-
-
-def print_terminal_summary(results: List[Dict], retrained: bool = False) -> None:
-    """Exibe um resumo estruturado no terminal, agrupado por tipo de ataque e IP destino."""
-    from collections import defaultdict as _dd
-
-    all_inc     = [inc for r in results for inc in r['incidents']]
-    total_flows = sum(r.get('rows', 0) for r in results)
-    total_inc   = len(all_inc)
-    atk_rate    = total_inc / total_flows * 100 if total_flows > 0 else 0.0
-
-    print(f"\n{'═' * 68}")
-    print(f"  {_c('RESUMO FINAL DA ANÁLISE', 'W')}")
-    print(f"{'═' * 68}")
-    print(f"  Arquivos analisados : {len(results)}")
-    print(f"  Fluxos totais       : {total_flows:,}")
-    print(f"  Incidentes          : {_c(str(total_inc), 'R' if total_inc else 'G', 'W')}")
-    print(f"  Taxa de ataque      : {atk_rate:.2f}%")
-    if retrained:
-        print(f"  Re-treinamento      : {_c('Concluído', 'G', 'W')}")
-
-    if not all_inc:
-        print(f"\n  {_c('✔ Nenhum incidente. Tráfego dentro do padrão normal.', 'G', 'W')}")
-        print(f"\n{'═' * 68}\n")
-        return
-
-    # Agrupa por (tipo de ataque → IP destino → contagem)
-    groups: Dict = _dd(lambda: _dd(int))
-    for inc in all_inc:
-        groups[inc['attack']][inc['dst_ip']] += 1
-
-    # Ordena por severidade decrescente, depois por volume
-    sorted_attacks = sorted(
-        groups.items(),
-        key=lambda kv: (-SEVERITY.get(kv[0], (0,))[0], -sum(kv[1].values())),
-    )
-
-    print(f"\n  {_sep()}")
-    print(f"  {_c('Detalhamento por Tipo de Ataque e Destino', 'W')}")
-    print(f"  {_sep()}\n")
-
-    for attack, dst_counts in sorted_attacks:
-        _, sev_lbl, _ = SEVERITY.get(attack, (0, 'ALTA', ''))
-        total_this    = sum(dst_counts.values())
-
-        print(f"  {_sev_color(sev_lbl)}  {_c(attack, 'W')}  ({_c(str(total_this), 'W')} total)")
-
-        for dst_ip, count in sorted(dst_counts.items(), key=lambda x: -x[1]):
-            plural   = 'incidente' if count == 1 else 'incidentes'
-            dst_fmt  = _c(f"'{dst_ip}'", 'Y') if dst_ip != '—' else _c(dst_ip, 'D')
-            action   = ACTION.get(attack, 'Investigar')
-            print(
-                f"    {_c('→', 'D')}  {_c(str(count), 'W')} {plural} do tipo "
-                f"{_c(attack, 'C')} com destino para {dst_fmt}"
-            )
-
-        print(f"    {_c('⚡ Ação recomendada:', 'D')} {ACTION.get(attack, 'Investigar')}\n")
-
-    # Totais por arquivo
-    print(f"  {_sep()}")
-    print(f"  {_c('Por arquivo de captura:', 'W')}\n")
-    for result in results:
-        n   = len(result.get('incidents', []))
-        bar = _c('█' * min(28, int(n / max(1, total_inc) * 28)), 'R') if n else _c('░' * 8, 'D')
-        print(f"  {result['filename']:<46}  {_c(str(n), 'R' if n else 'G', 'W'):>5}  {bar}")
-
-    print(f"\n{'═' * 68}\n")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Submenus
-# ──────────────────────────────────────────────────────────────────────────────
-
-def submenu_avaliacao() -> None:
-    """Submenu de avaliação de Continual Learning, delegado ao ids_model_evaluator."""
-    ev = load_evaluator()
-    if ev is None:
-        return
-
-    while True:
-        _section("Menu de Avaliação do Modelo")
-        print()
-        print("  [1]  Criar Benchmark Congelado")
-        print("         └─ Separa 10% do dataset original (executar uma única vez)")
-        print()
-        print("  [2]  Avaliar Versão Atual")
-        print("         └─ Calcula métricas no benchmark e registra FM/BWT/McNemar")
-        print()
-        print("  [3]  Ver Histórico de Avaliações")
-        print("         └─ Lista versões, F1-macro, Kappa e Forgetting Measure")
-        print()
-        print("  [4]  Gerar Relatório de Evolução")
-        print("         └─ HTML com gráficos, heatmap de classes e testes estatísticos")
-        print()
-        print("  [0]  Voltar")
-        print()
-
-        choice = _choice("  Escolha: ", ['0', '1', '2', '3', '4'])
-
-        if choice == '0':
-            break
-        elif choice == '1':
-            print()
-            ev.create_benchmark(force=False)
-        elif choice == '2':
-            print()
-            version = _prompt("Identificador da versão (ex: v1): ") or 'v?'
-            label   = _prompt("Descrição (ex: 7 dias de coleta): ") or version
-            notes   = _prompt("Notas adicionais (opcional): ")
-            ev.evaluate_model(version, label, notes)
-        elif choice == '3':
-            history = ev._load_history()
-            if not history:
-                print(f"\n  {_c('Nenhuma avaliação registrada.', 'D')}")
-            else:
-                print(f"\n  {'Versão':<8} {'Label':<28} {'F1-Macro':<12} {'Kappa':<10} {'FM':<10} Data")
-                print('  ' + '─' * 74)
-                for h in history:
-                    fm  = h.get('forgetting_measure')
-                    fms = f'{fm:.4f}' if fm is not None else '    —   '
-                    print(
-                        f"  {h['version_id']:<8} {h['label']:<28} "
-                        f"{h['f1_macro']:<12.6f} {h.get('cohen_kappa', 0.0):<10.6f} "
-                        f"{fms:<10} {h['evaluated_at'][:16]}"
-                    )
-        elif choice == '4':
-            ev.generate_evolution_report()
-
-        _prompt("\n  [Enter] para continuar...")
-
-
-def submenu_relatorios() -> None:
-    """Submenu dedicado à gestão e visualização de relatórios gerados."""
-    while True:
-        _section("Menu de Relatórios")
-        print()
-        print("  [1]  Listar relatórios gerados")
-        print("         └─ Exibe todos os relatórios em ordem cronológica inversa")
-        print()
-        print("  [2]  Ver último relatório")
-        print("         └─ Exibe caminho completo e metadados do relatório mais recente")
-        print()
-        print("  [3]  Gerar Relatório de Evolução do Modelo")
-        print("         └─ HTML com métricas de Continual Learning (requer avaliações)")
-        print()
-        print("  [0]  Voltar")
-        print()
-
-        choice = _choice("  Escolha: ", ['0', '1', '2', '3'])
-
-        if choice == '0':
-            break
-        elif choice == '1':
-            reports = list_reports()
-            if not reports:
-                print(f"\n  {_c('Nenhum relatório gerado ainda.', 'D')}")
-                print(f"  Execute a análise (opção [1] ou [3] do menu principal) para gerar.")
-            else:
-                print(f"\n  {len(reports)} relatório(s) encontrado(s):\n")
-                for rpt in reports[:20]:
-                    sz = rpt.stat().st_size
-                    print(f"    {rpt.name}  {sz / 1024:.0f} KB")
-                if len(reports) > 20:
-                    print(f"    ... e mais {len(reports) - 20} relatório(s).")
-        elif choice == '2':
-            reports = list_reports()
-            if not reports:
-                print(f"\n  {_c('Nenhum relatório disponível.', 'D')}")
-            else:
-                last = reports[0]
-                print(f"\n  {_c('Último relatório:', 'W')}")
-                print(f"    Arquivo : {last.name}")
-                print(f"    Caminho : {last}")
-                print(f"    Tamanho : {last.stat().st_size / 1024:.0f} KB")
-                txt = last.with_suffix('.txt')
-                if txt.exists():
-                    print(f"    Resumo  : {txt}")
-        elif choice == '3':
-            ev = load_evaluator()
-            if ev:
-                ev.generate_evolution_report()
-
-        _prompt("\n  [Enter] para continuar...")
-
-
-def submenu_configuracoes() -> None:
-    """Submenu de visualização do estado do sistema e configurações ativas."""
-    while True:
-        _section("Menu de Configurações")
-        print()
-        print("  [1]  Exibir configurações ativas")
-        print("  [2]  Status do diretório do coletor")
-        print("  [0]  Voltar")
-        print()
-
-        choice = _choice("  Escolha: ", ['0', '1', '2'])
-
-        if choice == '0':
-            break
-        elif choice == '1':
-            print(f"\n{IDSConfig.summary()}")
-            print(f"\n  Para alterar as configurações, edite: {_c('ids_config.py', 'W')}")
-        elif choice == '2':
-            collector = IDSConfig.COLLECTOR_DIR
-            print(f"\n  Diretório: {collector}")
-            if collector.exists():
-                files = sorted(collector.glob('captura_*.parquet'))
-                if files:
-                    state = ManagerState()
-                    total_size = sum(f.stat().st_size for f in files)
-                    print(f"  {len(files)} arquivo(s) | {total_size / 1024 ** 3:.2f} GiB total\n")
-                    for f in files:
-                        status = _c('[Analisado]', 'G') if state.was_analyzed(f.name) else _c('[Novo]     ', 'Y')
-                        print(f"    {status}  {f.name}  {f.stat().st_size / 1024 ** 3:.2f} GiB")
-                else:
-                    print(f"  {_c('Nenhum arquivo de captura encontrado.', 'D')}")
-                    print(f"  Execute: python3 ids_coletor.py")
-            else:
-                print(f"  {_c('[AVISO]', 'Y')} Diretório não existe: {collector}")
-
-        _prompt("\n  [Enter] para continuar...")
-
-
-def menu_status() -> None:
-    """Exibe um painel de status geral do sistema."""
-    _section("Status do Sistema")
-
-    state    = ManagerState()
-    new_files = scan_new_files(state)
-    all_files = (
-        sorted(IDSConfig.COLLECTOR_DIR.glob('captura_*.parquet'))
-        if IDSConfig.COLLECTOR_DIR.exists() else []
-    )
-
-    model_ok = (IDSConfig.MODEL_DIR / IDSConfig.MODEL_FILENAME).exists()
-    bench_ok = (IDSConfig.EVALUATION_DIR / 'benchmark' / 'benchmark_meta.json').exists()
-
-    print(f"\n  {_c('● Modelo treinado', 'G' if model_ok else 'R')}    : "
-          f"{'Disponível' if model_ok else 'NÃO ENCONTRADO'}")
-    print(f"  {_c('● Benchmark', 'G' if bench_ok else 'Y')}          : "
-          f"{'Criado' if bench_ok else 'Não criado (Avaliação → [1])'}")
-    print(f"  {_c('● Arquivos no coletor', 'W')} : {len(all_files)} total  |  "
-          f"{_c(str(len(new_files)) + ' novo(s)', 'Y' if new_files else 'G')}")
-
-    if all_files:
-        total_gb = sum(f.stat().st_size for f in all_files) / 1024 ** 3
-        print(f"  {_c('● Volume total', 'W')}        : {total_gb:.2f} GiB")
-
+def _read_pid(pid_file: Path) -> Optional[int]:
     try:
-        import json
-        with open(IDSConfig.MODEL_DIR / IDSConfig.MODEL_INFO_FILENAME) as f:
-            info = json.load(f)
-        print(f"  {_c('● Features selecionadas', 'W')}: {len(info.get('selected_features', []))}")
-        print(f"  {_c('● Classes do modelo', 'W')}   : {len(info.get('label_mapping', {}))}")
+        return int(pid_file.read_text().strip())
     except Exception:
-        pass
-
-    reports = list_reports()
-    print(f"  {_c('● Relatórios gerados', 'W')}  : {len(reports)}")
-    if reports:
-        print(f"    Último : {reports[0].name}")
+        return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Menu Principal
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _print_header(new_count: int) -> None:
-    """Imprime o banner e o cabeçalho do menu principal."""
-    print(f"\n{'═' * 52}")
-    print(BANNER)
-    print("═" * 52)
-    print("  Sistema de Detecção de Intrusão — v2.0")
-    print("  Universidade Federal de Alagoas")
-    print(f"  Coletor   : {IDSConfig.COLLECTOR_DIR}")
-    print(f"  Relatórios: {IDSConfig.IDS_REPORTS_DIR}")
-    if new_count:
-        print(f"\n  {_c(f'● {new_count} arquivo(s) novo(s) disponível(is)', 'Y', 'W')}")
-    print("═" * 52)
+def _proc_status(pid_file: Path, label: str) -> str:
+    pid = _read_pid(pid_file)
+    if pid and is_process_running(pid):
+        return _c(f"ATIVO  (PID {pid})", _C.GREEN, _C.BOLD)
+    return _c("PARADO", _C.RED)
 
 
-def _print_main_menu() -> None:
-    """Imprime as opções do menu principal."""
-    print()
-    print(f"  {_c('# Menu Principal', 'W')}")
-    print()
-    print("  [1]  Análise de Incidentes")
-    print("         └─ Detecta ataques nos arquivos novos e exibe incidentes em tempo real")
-    print()
-    print("  [2]  Re-Treinamento do Modelo")
-    print("         └─ Fine-tuning com dados capturados (recomenda-se análise prévia)")
-    print()
-    print("  [3]  Análise + Re-Treinamento")
-    print("         └─ Executa detecção e atualiza o modelo em sequência")
-    print()
-    print("  [4]  Avaliação do Modelo  →")
-    print("         └─ Métricas de Continual Learning: FM, BWT, McNemar")
-    print()
-    print("  [5]  Relatórios  →")
-    print("         └─ Listar, visualizar e exportar relatórios gerados")
-    print()
-    print("  [6]  Status do Sistema")
-    print("         └─ Visão geral de arquivos, modelo e relatórios")
-    print()
-    print("  [7]  Configurações  →")
-    print("         └─ Configurações ativas e estado do diretório de coleta")
-    print()
-    print("  [0]  Sair")
-    print()
+# ─────────────────────────────────────────────────────────────────────────────
+# Status geral do sistema
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _system_status() -> None:
+    _section("STATUS DO SISTEMA")
+    state = ManagerState()
+    st    = state.stats()
+
+    model_ok = (Config.MODEL_DIR / Config.MODEL_FILENAME).exists()
+    version  = "—"
+    trained  = "—"
+    if model_ok:
+        mi = Config.MODEL_DIR / Config.MODEL_INFO_FILENAME
+        if mi.exists():
+            with open(mi, encoding="utf-8") as f:
+                info = json.load(f)
+            version = info.get("version", "?")
+            trained = info.get("trained_at", "?")[:19]
+
+    new_files = scan_new_files(state)
+
+    print(f"  {'Collector':<22s}: {_proc_status(_PID_FILE_COLLECTOR, 'Collector')}")
+    print(f"  {'Detector':<22s}: {_proc_status(_PID_FILE_DETECTOR, 'Detector')}")
+    print(f"  {'Modelo':<22s}: {_c(f'v{version} ({trained})', _C.CYAN) if model_ok else _c('Não treinado', _C.RED)}")
+    print(f"  {'Arquivos analisados':<22s}: {st['analyzed']:,}")
+    print(f"  {'Arquivos pendentes':<22s}: {_c(str(len(new_files)), _C.YELLOW if new_files else _C.DIM)}")
+    print(f"  {'Diretório collector':<22s}: {Config.COLLECTOR_DIR}")
+
+    col_files = list(Config.COLLECTOR_DIR.glob("*.parquet")) if Config.COLLECTOR_DIR.exists() else []
+    col_size  = sum(f.stat().st_size for f in col_files)
+    print(f"  {'Dados capturados':<22s}: {len(col_files)} arquivo(s) | {format_bytes(col_size)}")
+
+    rep_files = list(Config.REPORTS_DIR.glob("*.html")) if Config.REPORTS_DIR.exists() else []
+    print(f"  {'Relatórios gerados':<22s}: {len(rep_files)}")
+
+    staging   = Config.RETRAIN_CONFIG["staging_dir"]
+    stg_files = list(staging.glob("*.parquet")) if staging.exists() else []
+    stg_rows  = sum(1 for _ in stg_files)
+    print(f"  {'Staging (re-treino)':<22s}: {stg_rows} arquivo(s)")
+    print(_sep("─"))
 
 
-def _handle_analysis_choice(
-    choice: str,
-    state: ManagerState,
-    new_files: List[Path],
-) -> None:
-    """Processa as escolhas [1], [2] e [3] do menu principal."""
-    if not new_files:
-        print(f"\n  {_c('Nenhum arquivo novo no diretório de coleta.', 'Y')}")
-        print(f"  Diretório: {IDSConfig.COLLECTOR_DIR}")
-        print(f"  Execute ids_coletor.py para iniciar a captura.")
-        _prompt("\n  [Enter] para voltar...")
+# ─────────────────────────────────────────────────────────────────────────────
+# Submenu — Collector
+# ─────────────────────────────────────────────────────────────────────────────
+
+def menu_collector() -> None:
+    while True:
+        print_header()
+        _section("GERENCIAMENTO DO COLLECTOR")
+        pid = _read_pid(_PID_FILE_COLLECTOR)
+        running = pid and is_process_running(pid)
+
+        print(f"  Status    : {_proc_status(_PID_FILE_COLLECTOR, 'Collector')}")
+        print(f"  Interface : {Config.CAPTURE_INTERFACE}")
+        print(f"  Saída     : {Config.COLLECTOR_DIR}")
+        print(f"  Budget    : {Config.COLLECTOR_BUDGET_GB:.1f} GiB/dia")
+        print()
+        print(f"  {_c('[1]', _C.CYAN)} {'Parar Collector' if running else 'Iniciar Collector'}")
+        print(f"  {_c('[2]', _C.CYAN)} Ver log do Collector")
+        print(f"  {_c('[3]', _C.CYAN)} Listar arquivos capturados")
+        print(f"  {_c('[0]', _C.DIM)} Voltar")
+        print(_sep("─"))
+
+        op = prompt("Opção")
+        if op == "1":
+            if running:
+                if confirm("Parar o Collector?"):
+                    import signal as _signal
+                    os.kill(pid, _signal.SIGTERM)
+                    _PID_FILE_COLLECTOR.unlink(missing_ok=True)
+                    print(f"  {_c('Collector encerrado.', _C.YELLOW)}")
+                    log.info(f"Collector (PID {pid}) encerrado pelo operador.")
+                    time.sleep(1)
+            else:
+                print(f"  Iniciando Collector em background …")
+                proc = run_background(
+                    [sys.executable,
+                     str(Path(__file__).parent / "ids_collector.py")],
+                    log_file=Config.LOG_COLLECTOR,
+                    cwd=Path(__file__).parents[1],
+                )
+                _write_pid(_PID_FILE_COLLECTOR, proc.pid)
+                print(f"  {_c(f'Collector iniciado — PID {proc.pid}', _C.GREEN)}")
+                print(f"  Log: {Config.LOG_COLLECTOR}")
+                log.info(f"Collector iniciado (PID {proc.pid}) via menu.")
+                pause()
+
+        elif op == "2":
+            if Config.LOG_COLLECTOR.exists():
+                print()
+                tail = subprocess.run(
+                    ["tail", "-n", "50", str(Config.LOG_COLLECTOR)],
+                    capture_output=True, text=True,
+                )
+                print(tail.stdout)
+            else:
+                print(f"  {_c('Log não encontrado.', _C.DIM)}")
+            pause()
+
+        elif op == "3":
+            files = sorted(Config.COLLECTOR_DIR.glob("*.parquet")) \
+                if Config.COLLECTOR_DIR.exists() else []
+            if files:
+                rows = [[f.name, format_bytes(f.stat().st_size),
+                         datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")]
+                        for f in files]
+                print_table(["Arquivo", "Tamanho", "Modificado"], rows, title="Arquivos Capturados")
+            else:
+                print(f"  {_c('Nenhum arquivo encontrado.', _C.DIM)}")
+            pause()
+
+        elif op == "0":
+            return
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Submenu — Detector
+# ─────────────────────────────────────────────────────────────────────────────
+
+def menu_detector() -> None:
+    while True:
+        print_header()
+        _section("GERENCIAMENTO DO DETECTOR")
+        state    = ManagerState()
+        new_files = scan_new_files(state)
+
+        print(f"  Status detector : {_proc_status(_PID_FILE_DETECTOR, 'Detector')}")
+        print(f"  Arquivos novos  : {_c(str(len(new_files)), _C.YELLOW if new_files else _C.DIM)}")
+        print()
+        print(f"  {_c('[1]', _C.CYAN)} Análise em lote (todos os arquivos pendentes)")
+        print(f"  {_c('[2]', _C.CYAN)} Monitor contínuo (background)")
+        print(f"  {_c('[3]', _C.CYAN)} Analisar arquivo específico")
+        print(f"  {_c('[4]', _C.CYAN)} Parar monitor")
+        print(f"  {_c('[5]', _C.CYAN)} Ver log de detecção")
+        print(f"  {_c('[0]', _C.DIM)} Voltar")
+        print(_sep("─"))
+
+        op = prompt("Opção")
+
+        if op == "1":
+            from IDS.ids_detector import cmd_batch
+            cmd_batch()
+            pause()
+
+        elif op == "2":
+            interval = int(prompt("Intervalo de varredura (s)", "60"))
+            proc = run_background(
+                [sys.executable,
+                 str(Path(__file__).parent / "ids_detector.py"),
+                 "watch", "--interval", str(interval)],
+                log_file=Config.LOG_APP,
+                cwd=Path(__file__).parents[1],
+            )
+            _write_pid(_PID_FILE_DETECTOR, proc.pid)
+            print(f"  {_c(f'Monitor iniciado — PID {proc.pid}', _C.GREEN)}")
+            log.info(f"Detector watch iniciado (PID {proc.pid}).")
+            pause()
+
+        elif op == "3":
+            path_str = prompt("Caminho do arquivo .parquet")
+            path = Path(path_str)
+            from IDS.ids_detector import cmd_file
+            cmd_file(path)
+            pause()
+
+        elif op == "4":
+            pid = _read_pid(_PID_FILE_DETECTOR)
+            if pid and is_process_running(pid):
+                if confirm("Parar o monitor?"):
+                    import signal as _signal
+                    os.kill(pid, _signal.SIGTERM)
+                    _PID_FILE_DETECTOR.unlink(missing_ok=True)
+                    print(f"  {_c('Monitor encerrado.', _C.YELLOW)}")
+                    log.info(f"Detector (PID {pid}) encerrado pelo operador.")
+            else:
+                print(f"  {_c('Monitor não está em execução.', _C.DIM)}")
+            pause()
+
+        elif op == "5":
+            if Config.LOG_APP.exists():
+                tail = subprocess.run(
+                    ["tail", "-n", "80", str(Config.LOG_APP)],
+                    capture_output=True, text=True,
+                )
+                print("\n" + tail.stdout)
+            pause()
+
+        elif op == "0":
+            return
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Submenu — Treinamento
+# ─────────────────────────────────────────────────────────────────────────────
+
+def menu_training() -> None:
+    while True:
+        print_header()
+        _section("GERENCIAMENTO DE TREINAMENTO")
+
+        from IDS.ids_learn import cmd_status
+        cmd_status()
+        print()
+        staging = Config.RETRAIN_CONFIG["staging_dir"]
+        stg_cnt = len(list(staging.glob("*.parquet"))) if staging.exists() else 0
+
+        print(f"  {_c('[1]', _C.CYAN)} Treinamento completo (do zero)")
+        print(f"  {_c('[2]', _C.CYAN)} Treinamento forçado (limpa cache)")
+        print(f"  {_c('[3]', _C.CYAN)} Fine-tuning incremental"
+              + (f"  {_c(f'({stg_cnt} arquivo(s) em staging)', _C.YELLOW)}" if stg_cnt else ""))
+        print(f"  {_c('[4]', _C.CYAN)} Ver log de treinamento")
+        print(f"  {_c('[0]', _C.DIM)} Voltar")
+        print(_sep("─"))
+
+        op = prompt("Opção")
+
+        if op in ("1", "2"):
+            force = op == "2"
+            msg = "Treinamento forçado" if force else "Treinamento completo"
+            if confirm(f"Iniciar {msg}? (pode demorar 30–120 min)"):
+                print(f"\n  Iniciando em background …")
+                extra = ["--force"] if force else []
+                proc = run_background(
+                    [sys.executable,
+                     str(Path(__file__).parent / "ids_learn.py"),
+                     "train"] + extra,
+                    log_file=Config.LOG_LEARN,
+                    cwd=Path(__file__).parents[1],
+                )
+                print(f"  {_c(f'Treinamento iniciado — PID {proc.pid}', _C.GREEN)}")
+                print(f"  Acompanhe em: {Config.LOG_LEARN}")
+                log.info(f"Treinamento iniciado (PID {proc.pid}, force={force}).")
+            pause()
+
+        elif op == "3":
+            if stg_cnt == 0:
+                print(f"  {_c('Nenhum dado de staging disponível.', _C.DIM)}")
+            elif confirm(f"Fine-tuning com {stg_cnt} arquivo(s)?"):
+                proc = run_background(
+                    [sys.executable,
+                     str(Path(__file__).parent / "ids_learn.py"),
+                     "finetune"],
+                    log_file=Config.LOG_LEARN,
+                    cwd=Path(__file__).parents[1],
+                )
+                print(f"  {_c(f'Fine-tuning iniciado — PID {proc.pid}', _C.GREEN)}")
+                log.info(f"Fine-tuning iniciado (PID {proc.pid}).")
+            pause()
+
+        elif op == "4":
+            if Config.LOG_LEARN.exists():
+                tail = subprocess.run(
+                    ["tail", "-n", "100", str(Config.LOG_LEARN)],
+                    capture_output=True, text=True,
+                )
+                print("\n" + tail.stdout)
+            pause()
+
+        elif op == "0":
+            return
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Submenu — Relatórios
+# ─────────────────────────────────────────────────────────────────────────────
+
+def menu_reports() -> None:
+    print_header()
+    _section("RELATÓRIOS GERADOS")
+
+    html_files = sorted(Config.REPORTS_DIR.glob("*.html"), reverse=True) \
+        if Config.REPORTS_DIR.exists() else []
+
+    if not html_files:
+        print(f"  {_c('Nenhum relatório encontrado em', _C.DIM)} {Config.REPORTS_DIR}")
+        pause()
         return
 
-    # Lista os arquivos disponíveis para o operador confirmar
-    print(f"\n  {_c('Arquivos novos disponíveis:', 'W')}\n")
-    for idx, f in enumerate(new_files, 1):
-        sz = f.stat().st_size
+    rows = [
+        [f.stem, format_bytes(f.stat().st_size),
+         datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")]
+        for f in html_files[:20]
+    ]
+    print_table(["Relatório", "Tamanho", "Gerado"], rows)
+    print(f"\n  {_c('Diretório:', _C.DIM)} {Config.REPORTS_DIR}")
+    op = prompt("Abrir relatório no browser? [s/N]", "n").lower()
+    if op in ("s", "sim", "y", "yes"):
+        idx = prompt(f"Número (1–{min(20, len(html_files))})", "1")
         try:
-            rows = pq.ParquetFile(str(f)).metadata.num_rows
-            rows_str = f"{rows:,} fluxos"
-        except Exception:
-            rows_str = "?"
-        print(f"    [{idx:2d}] {f.name:<46}  {sz / 1024 ** 3:.2f} GiB  {rows_str}")
+            chosen = html_files[int(idx) - 1]
+            subprocess.run(
+                ["xdg-open" if os.name != "nt" else "start",
+                 str(chosen)],
+                check=False, stderr=subprocess.DEVNULL,
+            )
+            print(f"  Abrindo: {chosen.name}")
+        except Exception as e:
+            print(f"  Erro: {e}")
+    pause()
 
-    total_gb = sum(f.stat().st_size for f in new_files) / 1024 ** 3
-    print(f"\n  Total: {len(new_files)} arquivo(s) | {total_gb:.2f} GiB")
 
-    do_analysis = choice in ('1', '3')
-    do_training = choice in ('2', '3')
-    results:   List[Dict] = []
-    retrained: bool       = False
+# ─────────────────────────────────────────────────────────────────────────────
+# Menu principal
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Carrega artefatos do modelo uma única vez por sessão
-    _section("Carregando Modelo")
-    arts = ModelArtifacts()
-    try:
-        arts.load()
-    except FileNotFoundError as exc:
-        print(f"\n  {_c('[ERRO]', 'R')} {exc}")
-        print("  Execute o treinamento inicial antes de usar o IDS Manager.")
-        _prompt("\n  [Enter] para voltar...")
-        return
+_MENU_ITEMS = [
+    ("1", "Collector",    "Iniciar/parar captura de pacotes"),
+    ("2", "Detector",     "Analisar tráfego capturado"),
+    ("3", "Treinamento",  "Treinar ou fazer fine-tuning do modelo"),
+    ("4", "Relatórios",   "Listar e abrir relatórios HTML"),
+    ("5", "Status",       "Visão geral do sistema"),
+    ("0", "Sair",         ""),
+]
 
-    version = arts.version_tag()
 
-    if do_analysis:
-        results = op_analyze(state, arts, new_files)
+def _print_main_menu(new_files: int) -> None:
+    state_col = _proc_status(_PID_FILE_COLLECTOR, "Collector")
+    state_det = _proc_status(_PID_FILE_DETECTOR,  "Detector")
 
-    if do_training:
-        retrained = op_retrain(results, new_files, state)
+    print(f"\n  {_c('Collector', _C.DIM)}: {state_col}   "
+          f"{_c('Detector', _C.DIM)}: {state_det}\n")
 
-    if do_analysis and results:
-        print_terminal_summary(results, retrained)
-        op_generate_report(results, version, retrained)
-    elif not do_analysis and retrained:
-        print(f"\n  {_c('✔ Re-treinamento concluído com sucesso.', 'G', 'W')}")
+    if new_files > 0:
+        print(f"  {_c(f'⚠  {new_files} arquivo(s) pendente(s) para análise', _C.YELLOW, _C.BOLD)}\n")
 
-    _prompt("\n  [Enter] para voltar ao menu...")
+    for key, label, desc in _MENU_ITEMS:
+        label_s = _c(f"[{key}]", _C.CYAN, _C.BOLD)
+        desc_s  = _c(f"  {desc}", _C.DIM) if desc else ""
+        print(f"  {label_s}  {label}{desc_s}")
+
+    print(_sep("─"))
 
 
 def main_menu() -> None:
-    """Loop principal do menu interativo."""
-    state = ManagerState()
+    Config.ensure_dirs()
+    log.info("SecurityIA Manager iniciado.")
 
     while True:
-        new_files = scan_new_files(state)
-        _print_header(len(new_files))
-        _print_main_menu()
+        print_header()
+        state     = ManagerState()
+        new_files = len(scan_new_files(state))
+        _print_main_menu(new_files)
 
-        choice = _choice("  Escolha: ", ['0', '1', '2', '3', '4', '5', '6', '7'])
+        op = prompt("Opção")
 
-        if choice == '0':
-            print(f"\n  {_c('Até logo.', 'D')}\n")
-            break
-        elif choice in ('1', '2', '3'):
-            _handle_analysis_choice(choice, state, new_files)
-        elif choice == '4':
-            submenu_avaliacao()
-        elif choice == '5':
-            submenu_relatorios()
-        elif choice == '6':
-            menu_status()
-            _prompt("\n  [Enter] para voltar...")
-        elif choice == '7':
-            submenu_configuracoes()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI direto (uso opcional pelo console, sem menu interativo)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def cli_direct(args: argparse.Namespace) -> None:
-    """Executa uma operação diretamente, sem menu interativo."""
-    state = ManagerState()
-
-    if args.command == 'status':
-        menu_status()
-        return
-
-    if args.command in ('analyze', 'retrain', 'both'):
-        new_files = scan_new_files(state)
-        if not new_files:
-            print("Nenhum arquivo novo no diretório de coleta.")
-            return
-
-        arts = ModelArtifacts()
-        arts.load()
-        version = arts.version_tag()
-        results: List[Dict] = []
-        retrained = False
-
-        if args.command in ('analyze', 'both'):
-            results = op_analyze(state, arts, new_files)
-
-        if args.command in ('retrain', 'both'):
-            retrained = op_retrain(results, new_files, state)
-
-        if results:
-            print_terminal_summary(results, retrained)
-            op_generate_report(results, version, retrained)
-        return
-
-    if args.command == 'evaluate':
-        ev = load_evaluator()
-        if ev:
-            ev.evaluate_model(args.version, args.label, getattr(args, 'notes', ''))
-        return
-
-    if args.command == 'benchmark':
-        ev = load_evaluator()
-        if ev:
-            ev.create_benchmark(force=getattr(args, 'force', False))
-        return
-
-    if args.command == 'report-eval':
-        ev = load_evaluator()
-        if ev:
-            ev.generate_evolution_report()
-        return
+        if op == "1":
+            menu_collector()
+        elif op == "2":
+            menu_detector()
+        elif op == "3":
+            menu_training()
+        elif op == "4":
+            menu_reports()
+        elif op == "5":
+            print_header()
+            _system_status()
+            pause()
+        elif op == "0":
+            print(f"\n  {_c('Encerrando SecurityIA. Bons experimentos!', _C.CYAN)}")
+            print(f"  Relatórios disponíveis em: {Config.REPORTS_DIR}\n")
+            log.info("SecurityIA Manager encerrado.")
+            sys.exit(0)
+        else:
+            print(f"  {_c('Opção inválida.', _C.DIM)}")
+            time.sleep(0.8)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Ponto de entrada
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI direto (não-interativo)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "IDS Manager — Interface principal do sistema de detecção de intrusão.\n"
-            "Sem argumentos: abre o menu interativo.\n"
-            "Com subcomando: executa a operação diretamente (modo console)."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+    p = argparse.ArgumentParser(
+        description="SecurityIA — Interface Principal do Sistema IDS",
     )
-    sub = parser.add_subparsers(dest='command')
+    p.add_argument("--batch",  action="store_true", help="Análise em lote imediata")
+    p.add_argument("--train",  action="store_true", help="Treinar modelo imediatamente")
+    p.add_argument("--status", action="store_true", help="Exibir status e sair")
+    args = p.parse_args()
 
-    sub.add_parser('analyze',     help='Análise de incidentes nos arquivos novos.')
-    sub.add_parser('retrain',     help='Re-treinamento do modelo com dados capturados.')
-    sub.add_parser('both',        help='Análise + re-treinamento em sequência.')
-    sub.add_parser('status',      help='Exibe o status geral do sistema.')
+    Config.ensure_dirs()
 
-    ev_p = sub.add_parser('evaluate', help='Avalia o modelo no benchmark congelado.')
-    ev_p.add_argument('version', help='Identificador da versão (ex: v1)')
-    ev_p.add_argument('label',   help='Descrição legível (ex: "7 dias de coleta")')
-    ev_p.add_argument('--notes', default='', help='Notas adicionais para o histórico.')
-
-    bm_p = sub.add_parser('benchmark', help='Cria o benchmark congelado de avaliação.')
-    bm_p.add_argument('--force', action='store_true',
-                      help='Recria o benchmark mesmo que já exista.')
-
-    sub.add_parser('report-eval', help='Gera o relatório HTML de evolução do modelo.')
-
-    args = parser.parse_args()
-
-    logging.basicConfig(level=logging.WARNING,
-                        format='%(asctime)s [%(levelname)s] %(message)s')
-
-    if args.command:
-        cli_direct(args)
+    if args.batch:
+        from IDS.ids_detector import cmd_batch
+        cmd_batch()
+    elif args.train:
+        from IDS.ids_learn import cmd_train
+        cmd_train()
+    elif args.status:
+        print_header()
+        _system_status()
     else:
         main_menu()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

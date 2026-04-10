@@ -1,720 +1,448 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
-
 # ==============================================================================
-# SecurityIA - Installer
-# Root expected:
-# SecurityIA/
-# ├── install.sh
-# ├── Base/
-# ├── Model/
-# ├── IDS/
-# └── Tests/
-# ==============================================================================
-
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly PROJECT_ROOT="$SCRIPT_DIR"
-readonly LEGACY_TESTS_DIR="$PROJECT_ROOT/Testes"
-readonly TESTS_DIR="$PROJECT_ROOT/Tests"
-readonly DATASET_DIR="$PROJECT_ROOT/Base"
-readonly MODEL_DIR="$PROJECT_ROOT/Model"
-readonly IDS_DIR="$PROJECT_ROOT/IDS"
-readonly REPORTS_DIR="$TESTS_DIR/Reports"
-readonly VENV_DIR="$PROJECT_ROOT/.venv"
-readonly REQ_LOG="$PROJECT_ROOT/.install_packages.log"
-readonly MENDELEY_PAGE_URL="https://data.mendeley.com/datasets/29hdbdzx2r/1"
+#  SecurityIA — Script de Instalação e Configuração de Ambiente
+#  Versão: 3.0
 #
+#  Compatível com: Ubuntu Server 24.04 LTS
+#
+#  O que este script faz:
+#    1. Instala dependências do sistema (Python 3.11, libpcap, etc.)
+#    2. Cria e configura o ambiente virtual Python
+#    3. Instala todas as dependências Python do projeto
+#    4. Aplica tuning de kernel para captura de alta performance
+#    5. Configura capacidades de captura (cap_net_raw sem root)
+#    6. Cria templates de serviços systemd
+#    7. Configura rotação de logs
+#
+#  Uso:
+#    chmod +x install.sh
+#    sudo ./install.sh [--no-venv] [--no-tuning] [--no-systemd]
+#
+#  Autor: Bruno Cavalcante Barbosa — PPGI/IC/UFAL
+# ==============================================================================
 
-#!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
+IFS=$'\n\t'
 
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly PROJECT_ROOT="$SCRIPT_DIR"
-readonly LEGACY_TESTS_DIR="$PROJECT_ROOT/Testes"
-readonly TESTS_DIR="$PROJECT_ROOT/Tests"
-readonly DATASET_DIR="$PROJECT_ROOT/Base"
-readonly MODEL_DIR="$PROJECT_ROOT/Model"
-readonly IDS_DIR="$PROJECT_ROOT/IDS"
-readonly REPORTS_DIR="$TESTS_DIR/Reports"
-readonly VENV_DIR="$PROJECT_ROOT/.venv"
-readonly REQ_LOG="$PROJECT_ROOT/.install_packages.log"
-readonly MENDELEY_PAGE_URL="https://data.mendeley.com/datasets/29hdbdzx2r/1"
-readonly CIC_PAGE_URL="https://www.unb.ca/cic/datasets/ids-2018.html"
+# ── Cores ─────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
-EXPECTED_CSVS=(
-  "Bot.csv"
-  "Brute Force -Web.csv"
-  "Brute Force -XSS.csv"
-  "DDOS attack-HOIC.csv"
-  "DDOS attack-LOIC-UDP.csv"
-  "DoS attacks-GoldenEye.csv"
-  "DoS attacks-Hulk.csv"
-  "DoS attacks-SlowHTTPTest.csv"
-  "DoS attacks-Slowloris.csv"
-  "FTP-BruteForce.csv"
-  "Infilteration.csv"
-  "SQL Injection.csv"
-  "SSH-Bruteforce.csv"
-)
+log()  { echo -e "${CYAN}[INFO ]${RESET} $*"; }
+ok()   { echo -e "${GREEN}[OK   ]${RESET} $*"; }
+warn() { echo -e "${YELLOW}[WARN ]${RESET} $*"; }
+err()  { echo -e "${RED}[ERROR]${RESET} $*"; }
+sep()  { echo -e "${BOLD}══════════════════════════════════════════════════════${RESET}"; }
 
-WRONG_CSVS=(
-  "02-14-2018.csv"
-  "02-15-2018.csv"
-  "02-16-2018.csv"
-  "02-20-2018.csv"
-  "02-21-2018.csv"
-  "02-22-2018.csv"
-  "02-23-2018.csv"
-  "02-28-2018.csv"
-  "03-01-2018.csv"
-  "03-02-2018.csv"
-)
+# ── Configuração ──────────────────────────────────────────────────────────────
+INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$INSTALL_DIR/.venv"
+PYTHON_MIN="3.10"
+DO_VENV=true
+DO_TUNING=true
+DO_SYSTEMD=true
 
-if [[ -t 1 ]]; then
-  C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
-  C_BLUE='\033[1;34m'; C_GREEN='\033[1;32m'; C_YELLOW='\033[1;33m'; C_RED='\033[1;31m'; C_CYAN='\033[1;36m'
-else
-  C_RESET=''; C_BOLD=''; C_DIM=''; C_BLUE=''; C_GREEN=''; C_YELLOW=''; C_RED=''; C_CYAN=''
+for arg in "$@"; do
+  case $arg in
+    --no-venv)    DO_VENV=false ;;
+    --no-tuning)  DO_TUNING=false ;;
+    --no-systemd) DO_SYSTEMD=false ;;
+  esac
+done
+
+# ── Verificação de root ───────────────────────────────────────────────────────
+if [[ $EUID -ne 0 ]]; then
+  err "Este script deve ser executado como root: sudo $0"
+  exit 1
 fi
 
-line() { printf '%*s\n' 78 '' | tr ' ' '═'; }
-subline() { printf '%*s\n' 78 '' | tr ' ' '─'; }
-info() { echo -e "${C_BLUE}ℹ${C_RESET} $*"; }
-ok()   { echo -e "${C_GREEN}✓${C_RESET} $*"; }
-warn() { echo -e "${C_YELLOW}⚠${C_RESET} $*"; }
-fail() { echo -e "${C_RED}✖${C_RESET} $*" >&2; }
-step() { echo -e "\n${C_CYAN}${C_BOLD}▶ $*${C_RESET}"; }
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo 'ubuntu')}"
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 
-on_error() {
-  local exit_code=$?
-  fail "A instalação foi interrompida por um erro."
-  [[ -f "$REQ_LOG" ]] && fail "Consulte o log: $REQ_LOG"
-  exit "$exit_code"
-}
-trap on_error ERR
+sep
+echo -e "${BOLD}  SecurityIA — Instalação e Configuração${RESET}"
+echo "  Diretório : $INSTALL_DIR"
+echo "  Usuário   : $REAL_USER"
+echo "  Python    : $PYTHON_MIN+"
+sep
 
-header() {
-  clear 2>/dev/null || true
-  line
-  echo -e "${C_BOLD} SecurityIA — Instalador de Ambiente${C_RESET}"
-  echo " Estrutura alvo: SecurityIA/{Tests,Base,Model,IDS}"
-  echo " Projeto        : $PROJECT_ROOT"
-  line
-}
+# ==============================================================================
+# § 1 — Dependências do sistema
+# ==============================================================================
+log "Atualizando índice APT …"
+apt-get update -qq
 
-ask_yes_no() {
-  local prompt="$1"
-  local default="${2:-N}"
-  local answer=""
-  local suffix='[y/N]'
-  [[ "${default^^}" == "Y" ]] && suffix='[Y/n]'
+log "Instalando dependências do sistema …"
+apt-get install -y --no-install-recommends \
+  python3.11 python3.11-dev python3.11-venv python3-pip \
+  build-essential gcc g++ \
+  libpcap-dev libpcap0.8 \
+  tcpdump net-tools ethtool \
+  libhdf5-dev libhdf5-serial-dev \
+  pkg-config \
+  git curl wget \
+  logrotate \
+  procps lsof \
+  numactl \
+  >/dev/null 2>&1
 
-  while true; do
-    read -r -p "$prompt $suffix: " answer || true
-    answer="${answer:-$default}"
-    case "${answer,,}" in
-      y|yes|s|sim) return 0 ;;
-      n|no|nao|não) return 1 ;;
-      *) warn "Resposta inválida. Use y/yes/s/sim ou n/no." ;;
-    esac
-  done
-}
+ok "Dependências do sistema instaladas."
 
-require_python() {
-  step "Validando Python"
+# ==============================================================================
+# § 2 — Ambiente virtual Python
+# ==============================================================================
+if $DO_VENV; then
+  log "Criando ambiente virtual em '$VENV_DIR' …"
+  python3.11 -m venv "$VENV_DIR"
+  PYTHON="$VENV_DIR/bin/python"
+  PIP="$VENV_DIR/bin/pip"
+  chown -R "$REAL_USER:$REAL_USER" "$VENV_DIR"
+  ok "Ambiente virtual criado."
+else
+  PYTHON="$(which python3.11 || which python3)"
+  PIP="$(which pip3)"
+  warn "--no-venv: usando Python do sistema: $PYTHON"
+fi
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    fail "python3 não foi encontrado no PATH."
-    echo "Ubuntu/Debian: sudo apt install python3 python3-venv python3-pip"
-    exit 1
-  fi
+"$PIP" install --upgrade pip setuptools wheel -q
 
-  local pyver
-  pyver="$(python3 - <<'PY'
-import sys
-print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
-PY
-)"
-  info "Python detectado: $pyver"
+# ==============================================================================
+# § 3 — Dependências Python
+# ==============================================================================
+log "Instalando dependências Python …"
 
-  if ! python3 - <<'PY' >/dev/null 2>&1
-import sys
-assert sys.version_info >= (3, 10)
-PY
-  then
-    fail "É necessário Python 3.10 ou superior."
-    exit 1
-  fi
+"$PIP" install --no-deps -q \
+  numpy>=1.24.0,\<2.0.0 \
+  pandas>=2.0.0 \
+  pyarrow>=14.0.0 \
+  scipy>=1.11.0
 
-  if ! python3 - <<'PY' >/dev/null 2>&1
-import venv
-PY
-  then
-    fail "O módulo venv não está disponível."
-    echo "Ubuntu/Debian: sudo apt install python3-venv"
-    exit 1
-  fi
+"$PIP" install -q \
+  scikit-learn>=1.4.0 \
+  imbalanced-learn>=0.12.0 \
+  joblib>=1.3.0
 
-  ok "Python e venv estão prontos."
-}
+"$PIP" install -q \
+  tensorflow-cpu>=2.15.0 \
+  keras>=3.0.0
 
-prepare_project_structure() {
-  step "Preparando a estrutura do projeto"
+"$PIP" install -q \
+  scapy>=2.5.0
 
-  if [[ -d "$LEGACY_TESTS_DIR" && ! -d "$TESTS_DIR" ]]; then
-    warn "Diretório legado encontrado: $LEGACY_TESTS_DIR"
-    info "Ele será migrado para o padrão em inglês: $TESTS_DIR"
-    mv "$LEGACY_TESTS_DIR" "$TESTS_DIR"
-    ok "Migração concluída: Testes → Tests"
-  elif [[ -d "$LEGACY_TESTS_DIR" && -d "$TESTS_DIR" ]]; then
-    warn "Foram encontrados os diretórios 'Testes' e 'Tests'. O instalador usará 'Tests'."
-  fi
+"$PIP" install -q \
+  matplotlib>=3.7.0 \
+  seaborn>=0.13.0
 
-  mkdir -p "$TESTS_DIR" "$DATASET_DIR" "$MODEL_DIR" "$IDS_DIR" "$REPORTS_DIR"
-  for i in 1 2 3 4; do
-    mkdir -p "$REPORTS_DIR/Relatorio_${i}/figuras" "$REPORTS_DIR/Relatorio_${i}/tabelas"
-  done
+"$PIP" install -q \
+  optuna>=3.5.0
 
-  ok "Estrutura principal garantida."
-  echo " • Tests   : $TESTS_DIR"
-  echo " • Base    : $DATASET_DIR"
-  echo " • Model   : $MODEL_DIR"
-  echo " • IDS     : $IDS_DIR"
-  echo " • Reports : $REPORTS_DIR"
-}
+"$PIP" install -q \
+  shap>=0.44.0
 
-check_project_files() {
-  step "Validando arquivos esperados"
+"$PIP" install -q \
+  psutil>=5.9.0 \
+  tqdm>=4.66.0
 
-  local files=(
-    config.py menu.py
-    analise_1_arquiteturas.py analise_2_balanceamento.py
-    analise_3_teoria_informacao.py analise_4_otimizacao_validacao.py
-  )
-  local missing=0
+ok "Dependências Python instaladas."
 
-  for f in "${files[@]}"; do
-    if [[ -f "$TESTS_DIR/$f" ]]; then
-      ok "Encontrado: Tests/$f"
-    else
-      warn "Não encontrado: Tests/$f"
-      ((missing+=1)) || true
-    fi
-  done
+# Verificação rápida
+log "Verificando imports críticos …"
+"$PYTHON" -c "
+import numpy, pandas, pyarrow, sklearn, tensorflow, scapy, scipy
+print(f'  numpy={numpy.__version__}')
+print(f'  pandas={pandas.__version__}')
+print(f'  tensorflow={tensorflow.__version__}')
+print(f'  sklearn={sklearn.__version__}')
+print(f'  scapy={scapy.__version__}')
+"
+ok "Imports verificados."
 
-  if (( missing > 0 )); then
-    warn "Há arquivos ausentes em Tests. O ambiente será preparado mesmo assim."
-  fi
-}
+# ==============================================================================
+# § 4 — Capacidades de captura (sem precisar de root em produção)
+# ==============================================================================
+log "Configurando cap_net_raw para Python …"
+PYTHON_BIN="$(realpath "$PYTHON")"
+setcap cap_net_raw,cap_net_admin=eip "$PYTHON_BIN" 2>/dev/null && \
+  ok "cap_net_raw configurado em '$PYTHON_BIN'." || \
+  warn "Não foi possível configurar cap_net_raw. Execute o collector como root."
 
-patch_config_py() {
-  local config_file="$TESTS_DIR/config.py"
+# ==============================================================================
+# § 5 — Tuning de kernel (Ubuntu 24.04 — captura de alta performance)
+# ==============================================================================
+if $DO_TUNING; then
+  log "Aplicando tuning de kernel para captura de rede …"
 
-  step "Ajustando Tests/config.py para a estrutura SecurityIA"
+  SYSCTL_FILE="/etc/sysctl.d/99-security-ia.conf"
+  cat > "$SYSCTL_FILE" << 'EOF'
+# ==============================================================
+#  SecurityIA — Tuning de Kernel (Ubuntu 24.04)
+#  Otimizado para: captura Scapy em 10 Gbps + TF training/inference
+# ==============================================================
 
-  if [[ ! -f "$config_file" ]]; then
-    warn "config.py não encontrado em $TESTS_DIR. Ajuste automático ignorado."
-    return 0
-  fi
+# ── Buffers de socket de rede (captura Scapy / pcap) ─────────
+# Aumenta buffer de recepção para reduzir drops em alta taxa de pacotes.
+# 256 MiB por socket — Scapy AsyncSniffer usa SO_RCVBUF implicitamente.
+net.core.rmem_max          = 268435456
+net.core.rmem_default      = 268435456
+net.core.wmem_max          = 268435456
+net.core.wmem_default      = 268435456
+net.core.netdev_max_backlog = 300000
+net.core.netdev_budget     = 600
+net.core.netdev_budget_usecs = 8000
 
-  python3 - "$config_file" <<'PY'
-from pathlib import Path
-import re
-import sys
+# ── Backlog de conexões TCP ───────────────────────────────────
+net.core.somaxconn         = 65536
+net.ipv4.tcp_max_syn_backlog = 65536
 
-config_path = Path(sys.argv[1])
-text = config_path.read_text(encoding="utf-8")
-original = text
+# ── Timeouts TCP ─────────────────────────────────────────────
+net.ipv4.tcp_fin_timeout   = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_keepalive_intvl = 15
 
-paths_block = '''ROOT_DIR    = Path(__file__).resolve().parent.parent   # .../SecurityIA
-TESTS_DIR   = ROOT_DIR / "Tests"
-DATASET_DIR = ROOT_DIR / "Base"
-MODEL_DIR   = ROOT_DIR / "Model"
-IDS_DIR     = ROOT_DIR / "IDS"
-BASE_DIR    = ROOT_DIR
-REPORTS_DIR = TESTS_DIR / "Reports"'''
+# ── Memória do kernel para buffers de pacote ─────────────────
+net.ipv4.tcp_rmem          = 4096 131072 268435456
+net.ipv4.tcp_wmem          = 4096 65536  268435456
+net.ipv4.udp_rmem_min      = 16384
+net.ipv4.udp_wmem_min      = 16384
 
-text = re.sub(
-    r'BASE_DIR\s*=\s*Path\("/opt/Testes"\)\s*\n\s*DATASET_DIR\s*=\s*BASE_DIR\s*/\s*"Base"\s*\n\s*REPORTS_DIR\s*=\s*BASE_DIR\s*/\s*"Reports"',
-    paths_block,
-    text,
-    count=1,
-)
+# ── Desabilita reverse path filtering (porta mirror) ─────────
+# CRÍTICO para captura em porta mirror: pacotes vindos de IPs
+# que não são rota da interface seriam descartados sem este ajuste.
+net.ipv4.conf.all.rp_filter    = 0
+net.ipv4.conf.default.rp_filter = 0
 
-text = re.sub(
-    r'DATASET_FILES\s*=\s*\[(?:.|\n)*?\]',
-    '''DATASET_FILES = [
-    "Bot.csv",
-    "Brute Force -Web.csv",
-    "Brute Force -XSS.csv",
-    "DDOS attack-HOIC.csv",
-    "DDOS attack-LOIC-UDP.csv",
-    "DoS attacks-GoldenEye.csv",
-    "DoS attacks-Hulk.csv",
-    "DoS attacks-SlowHTTPTest.csv",
-    "DoS attacks-Slowloris.csv",
-    "FTP-BruteForce.csv",
-    "Infilteration.csv",
-    "SQL Injection.csv",
-    "SSH-Bruteforce.csv",
-]''',
-    text,
-    count=1,
-)
+# ── Descomentar se usar eth1 especificamente ──────────────────
+# net.ipv4.conf.eth1.rp_filter = 0
 
-text = re.sub(
-    r'DATASET_KAGGLE_SLUG\s*=\s*.*',
-    'DATASET_KAGGLE_SLUG   = ""  # download automático desabilitado para evitar variante incorreta',
-    text,
-    count=1,
-)
+# ── Memória virtual (TensorFlow / NumPy) ──────────────────────
+# vm.swappiness baixo mantém dados de modelo em RAM.
+vm.swappiness             = 10
+vm.dirty_ratio            = 15
+vm.dirty_background_ratio = 5
 
-setup_block = '''def setup_environment() -> None:
-    """Cria estrutura de diretórios e configura TF."""
-    for d in [ROOT_DIR, TESTS_DIR, DATASET_DIR, MODEL_DIR, IDS_DIR, REPORTS_DIR, *REPORT_DIRS.values()]:
-        d.mkdir(parents=True, exist_ok=True)
+# ── Hugepages para TensorFlow MKL (opcional, ajuda com matrizes grandes) ─────
+# vm.nr_hugepages = 512  # descomente se tiver 64+ GB RAM
 
-    for d in REPORT_DIRS.values():
-        (d / "figuras").mkdir(exist_ok=True)
-        (d / "tabelas").mkdir(exist_ok=True)
+# ── Limite de arquivos abertos ────────────────────────────────
+fs.file-max               = 2097152
 
-    try:
-        import tensorflow as tf
-        tf.config.threading.set_inter_op_parallelism_threads(TF_INTER_OP_THREADS)
-        tf.config.threading.set_intra_op_parallelism_threads(TF_INTRA_OP_THREADS)
-        tf.random.set_seed(RANDOM_SEED)
-        gpus = tf.config.list_physical_devices("GPU")
-        if gpus:
-            tf.config.set_visible_devices([], "GPU")
-    except ImportError:
-        pass'''
+# ── Parâmetros de IRQ / NAPI ─────────────────────────────────
+kernel.pid_max            = 4194304
+EOF
 
-text = re.sub(
-    r'def setup_environment\(\) -> None:\n(?:    .*\n)+?(?=\n\ndef apply_plot_style)',
-    setup_block + '\n',
-    text,
-    count=1,
-)
+  sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1
+  ok "Parâmetros de kernel aplicados em '$SYSCTL_FILE'."
 
-baixar_mendeley_block = '''def _baixar_mendeley() -> bool:
-    """
-    O Mendeley é mantido apenas como referência para download manual,
-    pois links diretos hardcoded podem retornar 403.
-    """
-    print("  Download automático via Mendeley desabilitado.")
-    print("  Use o link oficial da página do dataset no navegador:")
-    print(f"  {DATASET_MENDELEY_URL}")
-    print(f"  DOI: {DATASET_MENDELEY_DOI}")
-    return False'''
+  # ── Limites de recursos (ulimits) ────────────────────────────────────────
+  LIMITS_FILE="/etc/security/limits.d/99-security-ia.conf"
+  cat > "$LIMITS_FILE" << EOF
+# SecurityIA — limites de recursos do usuário $REAL_USER
+$REAL_USER soft nofile 1048576
+$REAL_USER hard nofile 1048576
+$REAL_USER soft nproc  65536
+$REAL_USER hard nproc  65536
+$REAL_USER soft memlock unlimited
+$REAL_USER hard memlock unlimited
+EOF
+  ok "Limites de recursos configurados em '$LIMITS_FILE'."
 
-text = re.sub(
-    r'def _baixar_mendeley\(\) -> bool:\n(?:    .*\n)+?(?=\n\ndef _instrucoes_manuais)',
-    baixar_mendeley_block + '\n',
-    text,
-    count=1,
-)
+  # ── IRQ affinity e offloads da NIC ───────────────────────────────────────
+  IFACE="eth1"  # mesma que Config.CAPTURE_INTERFACE
+  if ip link show "$IFACE" &>/dev/null; then
+    # Desabilita GRO/LRO na interface de captura (reduz latência de processamento)
+    ethtool -K "$IFACE" gro off lro off 2>/dev/null && \
+      ok "GRO/LRO desabilitado em $IFACE." || \
+      warn "Não foi possível desabilitar GRO/LRO em $IFACE."
 
-instrucoes_block = '''def _instrucoes_manuais() -> None:
-    print("\\n" + "─" * 60)
-    print("  DOWNLOAD MANUAL — BASE ESPERADA PELO PROJETO")
-    print("─" * 60)
-    print("\\n  1. Mendeley (versão cleaned esperada):")
-    print(f"     {DATASET_MENDELEY_URL}")
-    print(f"     DOI: {DATASET_MENDELEY_DOI}")
-    print("\\n  2. CIC/UNB (fonte original completa):")
-    print("     https://www.unb.ca/cic/datasets/ids-2018.html")
-    print(f"\\n  Copie os CSVs corretos para: {DATASET_DIR}")
-    print("  Esperados: Bot.csv, Brute Force -Web.csv, DDOS attack-HOIC.csv, etc.")
-    print("─" * 60)'''
-
-text = re.sub(
-    r'def _instrucoes_manuais\(\) -> None:\n(?:    .*\n)+?(?=\n\ndef verificar_dataset)',
-    instrucoes_block + '\n',
-    text,
-    count=1,
-)
-
-verificar_block = '''def verificar_dataset(interativo: bool = True) -> bool:
-    """
-    Verifica se o dataset esperado pelo projeto existe em DATASET_DIR.
-    Aceita apenas a variante cleaned por classe (Bot.csv, Brute Force -Web.csv, etc.).
-    """
-    presente, ausentes = _dataset_presente()
-
-    wrong_files = [
-        "02-14-2018.csv", "02-15-2018.csv", "02-16-2018.csv", "02-20-2018.csv",
-        "02-21-2018.csv", "02-22-2018.csv", "02-23-2018.csv", "02-28-2018.csv",
-        "03-01-2018.csv", "03-02-2018.csv",
-    ]
-    detectados_errados = [f for f in wrong_files if (DATASET_DIR / f).exists()]
-
-    if detectados_errados:
-        print(f"\\n  ⚠ Foi detectada uma variante incorreta da base em: {DATASET_DIR}")
-        print("  Estes arquivos por data não são a base esperada por este projeto:")
-        for f in detectados_errados:
-            print(f"    - {f}")
-        print("  Remova-os e use a versão cleaned do Mendeley.")
-        if interativo:
-            _instrucoes_manuais()
-        return False
-
-    if presente:
-        csvs = list(DATASET_DIR.glob("*.csv"))
-        print(f"  ✓ Dataset encontrado: {len(csvs)} arquivo(s) CSV em {DATASET_DIR}")
-        return True
-
-    print(f"\\n  ⚠ Dataset esperado não encontrado em: {DATASET_DIR}")
-    if ausentes:
-        print(f"  Arquivos ausentes: {len(ausentes)} de {len(DATASET_FILES)}")
-
-    if not interativo:
-        print("  Modo não-interativo: prosseguindo com dados sintéticos.")
-        return False
-
-    print("\\n  Como deseja continuar?")
-    print("  [1] Exibir instruções para download manual da base correta")
-    print("  [2] Prosseguir com dados sintéticos")
-
-    while True:
-        opcao = input("\\n  Opção [1-2]: ").strip()
-        if opcao == "1":
-            _instrucoes_manuais()
-            return False
-        elif opcao == "2":
-            print("  Prosseguindo com dados sintéticos.")
-            return False
-        else:
-            print("  Opção inválida. Digite 1 ou 2.")'''
-
-text = re.sub(
-    r'def verificar_dataset\(interativo: bool = True\) -> bool:\n(?:    .*\n)+?(?=\n\ndef carregar_dataset_real)',
-    verificar_block + '\n',
-    text,
-    count=1,
-)
-
-print_config_block = '''def print_config() -> None:
-    sep = "═" * 62
-    print(f"\\n{sep}")
-    print("  CONFIGURAÇÃO — IDS Bi-LSTM + Atenção | PPGI/UFAL")
-    print(sep)
-    print(f"  Root dir      : {ROOT_DIR}")
-    print(f"  Tests dir     : {TESTS_DIR}")
-    print(f"  Dataset dir   : {DATASET_DIR}")
-    print(f"  Model dir     : {MODEL_DIR}")
-    print(f"  IDS dir       : {IDS_DIR}")
-    print(f"  Reports dir   : {REPORTS_DIR}")
-    print(f"  Seed          : {RANDOM_SEED}")
-    print(f"  TF threads    : inter={TF_INTER_OP_THREADS}, intra={TF_INTRA_OP_THREADS}")
-    print(f"  Features      : {N_FEATURES} | Dropout: {DROPOUT_RATE}")
-    print(f"  LSTM L1/L2    : {LSTM_UNITS_L1}/{LSTM_UNITS_L2} | Atenção: {ATTENTION_UNITS}u")
-    print(f"  SMOTE k/ENN k : {SMOTE_K}/{ENN_K} | IG/MI: {IG_WEIGHT}/{MI_WEIGHT}")
-    print(f"  CV folds / α  : {CV_FOLDS} / {ALPHA_SIGNIFICANCE}")
-    print(sep + "\\n")'''
-
-text = re.sub(
-    r'def print_config\(\) -> None:\n(?:    .*\n)+?(?=\n\n# Inicializa diretórios ao importar)',
-    print_config_block + '\n',
-    text,
-    count=1,
-)
-
-if text != original:
-    backup = config_path.with_suffix(config_path.suffix + '.bak')
-    backup.write_text(original, encoding='utf-8')
-    config_path.write_text(text, encoding='utf-8')
-    print(f'PATCHED:{backup}')
-else:
-    print('UNCHANGED')
-PY
-
-  ok "config.py ajustado. Um backup .bak foi criado se houve alteração."
-}
-
-setup_venv() {
-  step "Preparando ambiente virtual Python"
-
-  if [[ ! -d "$VENV_DIR" ]]; then
-    python3 -m venv "$VENV_DIR"
-    ok "Ambiente virtual criado em $VENV_DIR"
+    # Aumenta ring buffer da NIC
+    ethtool -G "$IFACE" rx 4096 tx 4096 2>/dev/null && \
+      ok "Ring buffer aumentado em $IFACE." || \
+      warn "Ring buffer em $IFACE não alterado (driver pode não suportar)."
   else
-    info "Ambiente virtual já existe: $VENV_DIR"
+    warn "Interface '$IFACE' não encontrada. Configure CAPTURE_INTERFACE em config.py."
   fi
 
-  # shellcheck disable=SC1090
-  source "$VENV_DIR/bin/activate"
+else
+  warn "--no-tuning: otimizações de kernel ignoradas."
+fi
 
-  python -m pip install --upgrade pip setuptools wheel >/dev/null
+# ==============================================================================
+# § 6 — Criação de diretórios do projeto
+# ==============================================================================
+log "Criando estrutura de diretórios …"
+for d in Base Model Logs Temp Temp/capture Temp/staging Temp/evaluation Reports Tests; do
+  mkdir -p "$INSTALL_DIR/$d"
+done
+chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR"
+ok "Diretórios criados."
 
-  local tf_pkg="tensorflow-cpu"
-  [[ "$(uname -s)" == "Darwin" ]] && tf_pkg="tensorflow"
-
-  info "Instalando dependências principais..."
-  python -m pip install \
-    "$tf_pkg" \
-    numpy pandas matplotlib seaborn \
-    scikit-learn imbalanced-learn scipy \
-    requests tabulate >"$REQ_LOG" 2>&1 || {
-      fail "Falha ao instalar dependências principais."
-      fail "Veja o log em: $REQ_LOG"
-      exit 1
-    }
-
-  info "Instalando dependências opcionais (não bloqueantes)..."
-  python -m pip install scikit-optimize >>"$REQ_LOG" 2>&1 || \
-    warn "Não foi possível instalar alguma dependência opcional."
-
-  info "Validando imports principais..."
-  python - <<'PY'
-mods = [
-    'numpy', 'pandas', 'matplotlib', 'seaborn', 'sklearn',
-    'imblearn', 'scipy', 'requests', 'tabulate', 'tensorflow'
-]
-for mod in mods:
-    __import__(mod)
-print('OK')
-PY
-
-  ok "Ambiente Python preparado com sucesso."
+# ==============================================================================
+# § 7 — Rotação de logs (logrotate)
+# ==============================================================================
+log "Configurando rotação de logs …"
+cat > /etc/logrotate.d/security-ia << EOF
+$INSTALL_DIR/Logs/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    dateext
+    dateformat -%Y%m%d
+    create 0640 $REAL_USER $REAL_USER
 }
+EOF
+ok "Logrotate configurado."
 
-count_csvs() {
-  shopt -s nullglob
-  local csvs=("$DATASET_DIR"/*.csv)
-  shopt -u nullglob
-  echo "${#csvs[@]}"
-}
+# ==============================================================================
+# § 8 — Templates systemd
+# ==============================================================================
+if $DO_SYSTEMD; then
+  log "Criando templates systemd …"
 
-dataset_present_correct() {
-  local missing=0
-  for file in "${EXPECTED_CSVS[@]}"; do
-    [[ -f "$DATASET_DIR/$file" ]] || ((missing+=1))
-  done
-  (( missing == 0 ))
-}
+  VENV_PYTHON="${PYTHON}"
 
-wrong_dataset_present() {
-  local found=1
-  for file in "${WRONG_CSVS[@]}"; do
-    if [[ -f "$DATASET_DIR/$file" ]]; then
-      found=0
-      break
-    fi
-  done
-  return "$found"
-}
+  # ── ids-collector.service ─────────────────────────────────────────────────
+  cat > /etc/systemd/system/ids-collector.service << EOF
+[Unit]
+Description=SecurityIA — Collector Daemon de Captura de Rede
+Documentation=file://$INSTALL_DIR/README.md
+After=network-online.target
+Wants=network-online.target
 
-list_wrong_dataset_files() {
-  for file in "${WRONG_CSVS[@]}"; do
-    [[ -f "$DATASET_DIR/$file" ]] && echo "  - $file"
-  done
-}
+[Service]
+Type=simple
+User=$REAL_USER
+Group=$REAL_USER
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$VENV_PYTHON $INSTALL_DIR/IDS/ids_collector.py
+Restart=on-failure
+RestartSec=15
+StandardOutput=append:$INSTALL_DIR/Logs/Collector.log
+StandardError=append:$INSTALL_DIR/Logs/Collector.log
+LimitNOFILE=1048576
 
-remove_wrong_dataset_files() {
-  local removed=0
-  for file in "${WRONG_CSVS[@]}"; do
-    if [[ -f "$DATASET_DIR/$file" ]]; then
-      rm -f "$DATASET_DIR/$file"
-      ((removed+=1)) || true
-    fi
-  done
-  echo "$removed"
-}
+# Capacidade de captura de pacotes (dispensa execução como root)
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 
-extract_expected_csvs_from_dir() {
-  local src_dir="$1"
-  python3 - "$src_dir" "$DATASET_DIR" <<'PY'
-from pathlib import Path
-import shutil
-import sys
+# Hardening
+PrivateTmp=true
+NoNewPrivileges=false
+ProtectSystem=strict
+ReadWritePaths=$INSTALL_DIR/Temp $INSTALL_DIR/Logs
 
-src = Path(sys.argv[1])
-out = Path(sys.argv[2])
-expected = {
-    "Bot.csv",
-    "Brute Force -Web.csv",
-    "Brute Force -XSS.csv",
-    "DDOS attack-HOIC.csv",
-    "DDOS attack-LOIC-UDP.csv",
-    "DoS attacks-GoldenEye.csv",
-    "DoS attacks-Hulk.csv",
-    "DoS attacks-SlowHTTPTest.csv",
-    "DoS attacks-Slowloris.csv",
-    "FTP-BruteForce.csv",
-    "Infilteration.csv",
-    "SQL Injection.csv",
-    "SSH-Bruteforce.csv",
-}
-count = 0
-for path in src.rglob("*.csv"):
-    if path.name in expected:
-        shutil.move(str(path), str(out / path.name))
-        count += 1
-print(count)
-PY
-}
+[Install]
+WantedBy=multi-user.target
+EOF
 
-extract_zip_by_path() {
-  local zip_path="$1"
-  local tmp_dir moved
+  # ── ids-learn.service (oneshot — disparado por timer) ────────────────────
+  cat > /etc/systemd/system/ids-learn.service << EOF
+[Unit]
+Description=SecurityIA — Treinamento/Fine-tuning do Modelo LSTM
+After=network.target
 
-  if [[ ! -f "$zip_path" ]]; then
-    warn "Arquivo não encontrado: $zip_path"
-    return 1
-  fi
+[Service]
+Type=oneshot
+User=$REAL_USER
+Group=$REAL_USER
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$VENV_PYTHON $INSTALL_DIR/IDS/ids_learn.py train
+TimeoutStartSec=7200
+StandardOutput=append:$INSTALL_DIR/Logs/Learn.log
+StandardError=append:$INSTALL_DIR/Logs/Learn.log
+LimitNOFILE=1048576
 
-  tmp_dir="$(mktemp -d)"
-  info "Descompactando: $zip_path"
+[Install]
+WantedBy=multi-user.target
+EOF
 
-  if ! python3 - "$zip_path" "$tmp_dir" <<'PY'
-import sys
-import zipfile
-from pathlib import Path
-zip_path = Path(sys.argv[1])
-out_dir = Path(sys.argv[2])
-out_dir.mkdir(parents=True, exist_ok=True)
-with zipfile.ZipFile(zip_path, 'r') as zf:
-    zf.extractall(out_dir)
-PY
-  then
-    warn "Falha ao descompactar o arquivo ZIP."
-    rm -rf "$tmp_dir"
-    return 1
-  fi
+  # ── ids-learn.timer (semanal, domingo às 02:00) ───────────────────────────
+  cat > /etc/systemd/system/ids-learn.timer << EOF
+[Unit]
+Description=SecurityIA — Timer de Re-treinamento Semanal
 
-  moved="$(extract_expected_csvs_from_dir "$tmp_dir")"
-  rm -rf "$tmp_dir"
+[Timer]
+OnCalendar=Sun 02:00:00
+Persistent=true
+Unit=ids-learn.service
 
-  if [[ "$moved" -gt 0 ]]; then
-    ok "Foram copiados $moved CSV(s) esperados para $DATASET_DIR"
-    return 0
-  fi
+[Install]
+WantedBy=timers.target
+EOF
 
-  warn "Nenhum dos CSVs esperados foi encontrado no ZIP informado."
-  return 1
-}
+  # ── ids-detector.service ──────────────────────────────────────────────────
+  cat > /etc/systemd/system/ids-detector.service << EOF
+[Unit]
+Description=SecurityIA — Detector de Incidentes (modo watch)
+After=ids-collector.service
+Wants=ids-collector.service
 
-show_manual_dataset_instructions() {
+[Service]
+Type=simple
+User=$REAL_USER
+Group=$REAL_USER
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$VENV_PYTHON $INSTALL_DIR/IDS/ids_detector.py watch --interval 60
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:$INSTALL_DIR/Logs/App.log
+StandardError=append:$INSTALL_DIR/Logs/App.log
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  ok "Serviços systemd criados e daemon recarregado."
+
   echo
-  subline
-  echo " Base esperada pelo projeto"
-  subline
-  echo " Fonte principal : $MENDELEY_PAGE_URL"
-  echo " Fonte original  : $CIC_PAGE_URL"
-  echo
-  echo " Copie os seguintes arquivos para: $DATASET_DIR"
-  for file in "${EXPECTED_CSVS[@]}"; do
-    echo "  - $file"
-  done
-  echo
-  echo " Atenção: esta instalação NÃO aceita a variante por data"
-  echo " (02-14-2018.csv, 02-15-2018.csv, ..., 03-02-2018.csv)."
-  subline
-}
+  log "Para ativar os serviços:"
+  echo "    sudo systemctl enable --now ids-collector"
+  echo "    sudo systemctl enable --now ids-detector"
+  echo "    sudo systemctl enable --now ids-learn.timer  # re-treino semanal"
+else
+  warn "--no-systemd: serviços systemd não criados."
+fi
 
-handle_dataset() {
-  step "Validando a base de dados"
+# ==============================================================================
+# § 9 — Verificação final
+# ==============================================================================
+sep
+echo -e "${BOLD}  Verificação Final${RESET}"
+sep
 
-  if dataset_present_correct; then
-    ok "Base correta encontrada em $DATASET_DIR"
-    return 0
-  fi
-
-  if wrong_dataset_present; then
-    warn "Foi detectada uma variante incorreta da base em $DATASET_DIR"
-    list_wrong_dataset_files
-    warn "Esses arquivos por data não são a base esperada por este projeto."
-    if ask_yes_no "Deseja remover esses CSVs incorretos agora?" "Y"; then
-      local removed
-      removed="$(remove_wrong_dataset_files)"
-      ok "$removed arquivo(s) incorreto(s) removido(s)."
-    else
-      warn "Os arquivos incorretos foram mantidos. A validação da base continuará falhando."
-    fi
-  fi
-
-  if dataset_present_correct; then
-    ok "Base correta encontrada em $DATASET_DIR"
-    return 0
-  fi
-
-  warn "A base correta ainda não está disponível em $DATASET_DIR"
-  echo
-  echo "Como deseja continuar?"
-  echo "  [1] Informar o caminho de um ZIP já baixado e extrair os CSVs corretos"
-  echo "  [2] Exibir instruções para download manual da base correta"
-  echo "  [3] Continuar sem a base real (dados sintéticos nos testes compatíveis)"
-
-  local choice zip_path
-  while true; do
-    read -r -p "Opção [1-3]: " choice || true
-    case "$choice" in
-      1)
-        read -r -p "Caminho completo do arquivo ZIP: " zip_path || true
-        if [[ -n "${zip_path:-}" ]] && extract_zip_by_path "$zip_path"; then
-          if dataset_present_correct; then
-            ok "Base correta preparada com sucesso."
-            return 0
-          fi
-        fi
-        warn "Não foi possível preparar a base correta a partir do ZIP informado."
-        ;;
-      2)
-        show_manual_dataset_instructions
-        return 0
-        ;;
-      3)
-        warn "Continuando sem a base real."
-        return 0
-        ;;
-      *)
-        warn "Opção inválida. Digite 1, 2 ou 3."
-        ;;
-    esac
-  done
-}
-
-show_summary() {
-  echo
-  line
-  echo " Instalação concluída"
-  line
-  echo " Projeto     : $PROJECT_ROOT"
-  echo " Tests       : $TESTS_DIR"
-  echo " Base        : $DATASET_DIR"
-  echo " Model       : $MODEL_DIR"
-  echo " IDS         : $IDS_DIR"
-  echo " Reports     : $REPORTS_DIR"
-  echo " Venv        : $VENV_DIR"
-  echo " CSVs na Base: $(count_csvs)"
-  echo
-  if dataset_present_correct; then
-    ok "A base correta está pronta para uso."
+CHECKS=(
+  "Scapy disponível:$("$PYTHON" -c 'import scapy; print("OK")' 2>/dev/null || echo 'FALHOU')"
+  "TensorFlow (CPU):$("$PYTHON" -c 'import tensorflow as tf; tf.config.set_visible_devices([],"GPU"); print("OK")' 2>/dev/null || echo 'FALHOU')"
+  "imbalanced-learn:$("$PYTHON" -c 'import imblearn; print("OK")' 2>/dev/null || echo 'FALHOU')"
+  "pyarrow         :$("$PYTHON" -c 'import pyarrow; print("OK")' 2>/dev/null || echo 'FALHOU')"
+  "scipy           :$("$PYTHON" -c 'import scipy; print("OK")' 2>/dev/null || echo 'FALHOU')"
+)
+for c in "${CHECKS[@]}"; do
+  label="${c%%:*}"
+  status="${c##*:}"
+  if [[ "$status" == "OK" ]]; then
+    ok "  $label"
   else
-    warn "A base correta ainda não foi detectada."
+    err "  $label — FALHOU"
   fi
-  echo
-  echo "Para ativar o ambiente virtual:"
-  echo "  source \"$VENV_DIR/bin/activate\""
-  echo
-  if [[ -f "$TESTS_DIR/menu.py" ]]; then
-    echo "Para executar os testes:"
-    echo "  cd \"$TESTS_DIR\" && python menu.py"
-  fi
-  line
-}
+done
 
-main() {
-  header
-  require_python
-  prepare_project_structure
-  check_project_files
-  patch_config_py
-  setup_venv
-  handle_dataset
-  show_summary
-}
-
-main "$@"
-
-main "$@"
+sep
+echo -e "${BOLD}  Instalação concluída!${RESET}"
+echo
+echo "  Próximos passos:"
+echo "  1. Edite config.py → CAPTURE_INTERFACE (interface da porta mirror)"
+echo "  2. Coloque os CSVs do CIC-IDS2018 em: $INSTALL_DIR/Base/CSE-CIC-IDS2018/"
+echo "  3. Execute o treinamento:"
+echo "     source $VENV_DIR/bin/activate"
+echo "     python3 IDS/ids_learn.py train"
+echo "  4. Inicie o sistema:"
+echo "     python3 IDS/ids_manager.py"
+echo
+sep
