@@ -1,111 +1,98 @@
 #!/usr/bin/env python3
 """
-################################################################################
-#  SecurityIA — Arquivo de Configuração Centralizado (SSOT)
-#  Versão: 3.0
-#
-#  ÚNICA fonte de verdade do sistema. Todos os scripts (IDS/, Tests/) importam
-#  daqui. Edite as seções marcadas com ← para o seu ambiente.
-#
-#  Estrutura de diretórios:
-#    SecurityIA/
-#    ├── config.py          ← este arquivo
-#    ├── install.sh
-#    ├── Base/              ← dataset CSE-CIC-IDS2018 (.csv ou .parquet)
-#    ├── Model/             ← artefatos do modelo treinado
-#    ├── Logs/              ← App.log | Collector.log | Learn.log
-#    ├── Temp/              ← cache e staging de re-treinamento
-#    ├── Reports/           ← relatórios HTML do IDS
-#    ├── Tests/             ← scripts de validação metodológica (não modificar)
-#    └── IDS/               ← sistema de coleta, detecção e aprendizado
-#
-#  Autor: Bruno Cavalcante Barbosa — PPGI/IC/UFAL
-#  Orient.: Prof. Dr. André Luiz Lins de Aquino
-################################################################################
+SecurityIA — Configuração central compatível com:
+  - nova arquitetura do projeto (Base/CSE-CIC-IDS2018, Model, IDS, Reports, Temp)
+  - scripts legados de testes em Tests/
+  - app_menu.py
+
+Este arquivo mantém uma API moderna via Config/IDSConfig e, ao mesmo tempo,
+expõe aliases legados em nível de módulo para evitar quebrar os scripts de
+análise acadêmica.
 """
 
+from __future__ import annotations
+
 import os
+import textwrap
+import warnings
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Configuração antecipada de ambiente (deve preceder qualquer import TF)
-# ──────────────────────────────────────────────────────────────────────────────
-os.environ.setdefault("CUDA_VISIBLE_DEVICES",  "-1")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL",  "3")
-os.environ.setdefault("TF_DETERMINISTIC_OPS",  "1")
-os.environ.setdefault("PYTHONHASHSEED",         "42")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+os.environ.setdefault("PYTHONHASHSEED", "42")
+warnings.filterwarnings("ignore")
 
 
 class Config:
-    """
-    Namespace centralizado. Todos os atributos são variáveis de classe.
-    Acesse via Config.ATTR — sem instanciação.
-    """
+    # ------------------------------------------------------------------
+    # Diretórios principais
+    # ------------------------------------------------------------------
+    BASE_DIR = Path(__file__).resolve().parent
+    ROOT_DIR = BASE_DIR
+    TESTS_DIR = BASE_DIR / "Tests"
+    DATA_DIR = BASE_DIR / "Base" / "CSE-CIC-IDS2018"
+    DATASET_DIR = DATA_DIR
+    MODEL_DIR = BASE_DIR / "Model"
+    IDS_DIR = BASE_DIR / "IDS"
+    LOGS_DIR = BASE_DIR / "Logs"
+    TEMP_DIR = BASE_DIR / "Temp"
 
-    # =========================================================================
-    # § 1 — DIRETÓRIOS RAIZ
-    # =========================================================================
-    BASE_DIR    = Path(__file__).resolve().parent        # raiz do projeto
-    DATA_DIR    = BASE_DIR / "Base" / "CSE-CIC-IDS2018"  # ← dataset
-    MODEL_DIR   = BASE_DIR / "Model"
-    LOGS_DIR    = BASE_DIR / "Logs"
-    TEMP_DIR    = BASE_DIR / "Temp"
-    REPORTS_DIR = BASE_DIR / "Reports"                   # relatórios HTML do IDS
-    TESTS_DIR   = BASE_DIR / "Tests"
+    # Relatórios do IDS (HTML / operação)
+    IDS_REPORTS_DIR = BASE_DIR / "Reports"
+    REPORTS_DIR = IDS_REPORTS_DIR
 
-    # =========================================================================
-    # § 2 — ARQUIVOS DE LOG (3 logs independentes)
-    # =========================================================================
-    LOG_APP       = LOGS_DIR / "App.log"         # geral: erros, warnings, info
-    LOG_COLLECTOR = LOGS_DIR / "Collector.log"   # coleta: início, erros, fim
-    LOG_LEARN     = LOGS_DIR / "Learn.log"       # treinamento: épocas, métricas
+    # Relatórios dos testes acadêmicos
+    TEST_REPORTS_DIR = TESTS_DIR / "Reports"
+
+    # ------------------------------------------------------------------
+    # Configuração de logs / operação IDS
+    # ------------------------------------------------------------------
+    LOG_APP = LOGS_DIR / "App.log"
+    LOG_COLLECTOR = LOGS_DIR / "Collector.log"
+    LOG_LEARN = LOGS_DIR / "Learn.log"
 
     LOG_CONFIG = {
-        "level":   "INFO",
-        "format":  "%(asctime)s  [%(levelname)-8s]  %(name)-18s  %(message)s",
+        "level": "INFO",
+        "format": "%(asctime)s  [%(levelname)-8s]  %(name)-18s  %(message)s",
         "datefmt": "%Y-%m-%d %H:%M:%S",
-        "max_bytes":   50 * 1024 * 1024,  # 50 MiB por arquivo
+        "max_bytes": 50 * 1024 * 1024,
         "backup_count": 5,
     }
 
-    # =========================================================================
-    # § 3 — PIPELINE DE COLETA (ids_collector.py)
-    # =========================================================================
-    CAPTURE_INTERFACE    = "eth1"               # ← porta mirror do roteador
-    COLLECTOR_DIR        = TEMP_DIR / "capture" # saída dos parquets diários
-    COLLECTOR_SAMPLE_RATE = 1.0                 # 1.0 = 100 % dos fluxos
-    COLLECTOR_BUDGET_GB  = 7.0                  # budget máximo de armazenamento/dia
-    COLLECTOR_ACTIVE_TIMEOUT  = 120             # s — expirar fluxo ativo
-    COLLECTOR_IDLE_TIMEOUT    = 30              # s — expirar fluxo ocioso
-    COLLECTOR_MAX_PKT_FLOW    = 10_000          # máx. pacotes por fluxo
-    COLLECTOR_PKT_QUEUE_SIZE  = 200_000
+    # ------------------------------------------------------------------
+    # IDS / operação
+    # ------------------------------------------------------------------
+    CAPTURE_INTERFACE = "eth1"
+    COLLECTOR_DIR = TEMP_DIR / "capture"
+    COLLECTOR_SAMPLE_RATE = 1.0
+    COLLECTOR_BUDGET_GB = 7.0
+    COLLECTOR_ACTIVE_TIMEOUT = 120
+    COLLECTOR_IDLE_TIMEOUT = 30
+    COLLECTOR_MAX_PKT_FLOW = 10_000
+    COLLECTOR_PKT_QUEUE_SIZE = 200_000
     COLLECTOR_FLOW_QUEUE_SIZE = 50_000
-    COLLECTOR_FLUSH_ROWS      = 50_000          # linhas por flush em disco
-    COLLECTOR_FLUSH_SECS      = 60             # flush periódico (segundos)
+    COLLECTOR_FLUSH_ROWS = 50_000
+    COLLECTOR_FLUSH_SECS = 60
 
-    # =========================================================================
-    # § 4 — ARTEFATOS DO MODELO
-    # =========================================================================
-    MODEL_FILENAME             = "ids_lstm_model.keras"
-    SCALER_FILENAME            = "scaler.pkl"
-    LABEL_ENCODER_FILENAME     = "label_encoder.pkl"
-    MODEL_INFO_FILENAME        = "ids_model_info.json"
+    MODEL_FILENAME = "ids_lstm_model.keras"
+    SCALER_FILENAME = "scaler.pkl"
+    LABEL_ENCODER_FILENAME = "label_encoder.pkl"
+    MODEL_INFO_FILENAME = "ids_model_info.json"
     SELECTED_FEATURES_FILENAME = "ids_selected_features.json"
 
-    # =========================================================================
-    # § 5 — FEATURES (23 — compatíveis com CSE-CIC-IDS2018)
-    # Deve ser idêntico ao schema do collector e ao treinamento.
-    # =========================================================================
     FEATURE_COLUMNS = [
-        "Flow_Duration",         "Total_Fwd_Packets",    "Flow_Bytes_s",
-        "Flow_Packets_s",        "Fwd_Packet_Length_Mean","Bwd_Packet_Length_Mean",
-        "Flow_IAT_Mean",         "Fwd_IAT_Total",        "Bwd_IAT_Total",
-        "Packet_Length_Variance","Flow_IAT_Std",          "Active_Mean",
-        "Active_Std",            "Idle_Mean",             "Idle_Std",
-        "TCP_Flag_Count",        "Protocol_Type",         "Service_Type",
-        "Flag_Type",             "Source_Bytes",          "Destination_Bytes",
-        "Count",                 "Same_Service_Rate",
+        "Flow_Duration", "Total_Fwd_Packets", "Flow_Bytes_s",
+        "Flow_Packets_s", "Fwd_Packet_Length_Mean", "Bwd_Packet_Length_Mean",
+        "Flow_IAT_Mean", "Fwd_IAT_Total", "Bwd_IAT_Total",
+        "Packet_Length_Variance", "Flow_IAT_Std", "Active_Mean",
+        "Active_Std", "Idle_Mean", "Idle_Std",
+        "TCP_Flag_Count", "Protocol_Type", "Service_Type",
+        "Flag_Type", "Source_Bytes", "Destination_Bytes",
+        "Count", "Same_Service_Rate",
     ]
 
     META_COLUMNS = [
@@ -114,188 +101,152 @@ class Config:
         "meta_flow_start", "meta_flow_end",
     ]
 
-    # =========================================================================
-    # § 6 — PRÉ-PROCESSAMENTO
-    # =========================================================================
     PREPROCESSING_CONFIG = {
-        "missing_value_threshold": 0.5,   # remove col se > 50 % NaN
-        "variance_threshold":      1e-5,
-        "apply_variance_filter":   True,
-        "force_reload":            False,  # True = ignora cache de CSV
-        "force_preprocess":        False,  # True = ignora cache de arrays
-        "sample_size_for_selection": 200_000,  # amostra para IG+MI
+        "missing_value_threshold": 0.5,
+        "variance_threshold": 1e-5,
+        "apply_variance_filter": True,
+        "force_reload": False,
+        "force_preprocess": False,
+        "sample_size_for_selection": 200_000,
     }
 
-    # =========================================================================
-    # § 7 — SELEÇÃO DE CARACTERÍSTICAS (Teoria da Informação)
-    # score = ig_weight * IG_norm + mi_weight * MI_norm
-    # =========================================================================
     FEATURE_SELECTION_CONFIG = {
-        "k_best":                 23,
-        "ig_weight":              0.6,
-        "mi_weight":              0.4,
-        "normalization_epsilon":  1e-9,
+        "k_best": 23,
+        "ig_weight": 0.6,
+        "mi_weight": 0.4,
+        "normalization_epsilon": 1e-9,
         "ig_discretization_bins": 10,
     }
 
-    # =========================================================================
-    # § 8 — ARQUITETURA DO MODELO (Bi-LSTM + Atenção de Bahdanau)
-    # =========================================================================
     MODEL_CONFIG = {
-        "lstm_units_1":          128,
-        "lstm_units_2":          64,
-        "dense_units":           32,
-        "attention_units":       64,   # Bahdanau attention dim
-        "dropout_rate":          0.5,
-        "recurrent_dropout_rate": 0.0, # 0.0 = caminho CuDNN-compatível (CPU-safe)
-        "learning_rate":         1e-3,
-        "loss_function":         "sparse_categorical_crossentropy",
-        "metrics":               ["accuracy"],
-        "sequence_length":       1,    # reshape (n, features, 1) — fluxos tabulares
+        "lstm_units_1": 128,
+        "lstm_units_2": 64,
+        "dense_units": 32,
+        "attention_units": 64,
+        "dropout_rate": 0.5,
+        "recurrent_dropout_rate": 0.0,
+        "learning_rate": 1e-3,
+        "loss_function": "sparse_categorical_crossentropy",
+        "metrics": ["accuracy"],
+        # Mantemos 100 para compatibilidade com os testes acadêmicos
+        "sequence_length": 100,
     }
 
-    # =========================================================================
-    # § 9 — TREINAMENTO
-    # =========================================================================
     TRAINING_CONFIG = {
-        "random_state":     42,
+        "random_state": 42,
         "validation_split": 0.15,
-        "test_split":       0.15,
-        "epochs":           50,
-        "batch_size":       1024,
-        "patience":         10,        # early stopping
-        "force_retrain":    False,
+        "test_split": 0.15,
+        "epochs": 50,
+        "batch_size": 1024,
+        "patience": 10,
+        "force_retrain": False,
     }
 
     FINE_TUNING_CONFIG = {
-        "enable":        True,
+        "enable": True,
         "learning_rate": 1e-5,
-        "epochs":        20,
-        "patience":      5,
+        "epochs": 20,
+        "patience": 5,
     }
 
-    # =========================================================================
-    # § 10 — BALANCEAMENTO (SMOTE → RUS → ENN)
-    # =========================================================================
     BALANCING_CONFIG = {
-        "smote_k_neighbors":  5,
-        "enn_n_neighbors":    3,
+        "smote_k_neighbors": 5,
+        "enn_n_neighbors": 3,
         "n_samples_minority": 50_000,
         "n_samples_majority": 150_000,
     }
 
-    # =========================================================================
-    # § 11 — DETECÇÃO (limiares de confiança)
-    # =========================================================================
-    CONF_MEDIUM = 0.60   # limiar mínimo para registrar incidente
-    CONF_HIGH   = 0.85   # limiar para incluir no dataset de re-treinamento
+    CONF_MEDIUM = 0.60
+    CONF_HIGH = 0.85
     BENIGN_LABEL = "Benign"
 
-    # Mapeamento de referência do dataset CIC-IDS2018
     REFERENCE_ATTACK_TYPES = {
-        0:  "Benign",
-        1:  "Bot",
-        2:  "DDoS",
-        3:  "DoS GoldenEye",
-        4:  "DoS Hulk",
-        5:  "DoS Slowhttptest",
-        6:  "DoS slowloris",
-        7:  "FTP-Patator",
-        8:  "Heartbleed",
-        9:  "Infiltration",
+        0: "Benign",
+        1: "Bot",
+        2: "DDoS",
+        3: "DoS GoldenEye",
+        4: "DoS Hulk",
+        5: "DoS Slowhttptest",
+        6: "DoS slowloris",
+        7: "FTP-Patator",
+        8: "Heartbleed",
+        9: "Infiltration",
         10: "PortScan",
         11: "SSH-Patator",
-        12: "Web Attack \u2013 Brute Force",
-        13: "Web Attack \u2013 Sql Injection",
-        14: "Web Attack \u2013 XSS",
+        12: "Web Attack – Brute Force",
+        13: "Web Attack – Sql Injection",
+        14: "Web Attack – XSS",
     }
 
-    # =========================================================================
-    # § 12 — RE-TREINAMENTO AUTOMÁTICO
-    # =========================================================================
     RETRAIN_CONFIG = {
-        "staging_dir":   TEMP_DIR / "staging",
-        "state_file":    TEMP_DIR / ".retrain_state.json",
-        "min_days":      3,        # mínimo de dias acumulados antes de re-treinar
-        "min_flows":     50_000,   # mínimo de fluxos anotados
-        "method":        "direct", # "direct" | "flag"
-        "flag_file":     TEMP_DIR / "RETRAIN_READY.flag",
+        "staging_dir": TEMP_DIR / "staging",
+        "state_file": TEMP_DIR / ".retrain_state.json",
+        "min_days": 3,
+        "min_flows": 50_000,
+        "method": "direct",
+        "flag_file": TEMP_DIR / "RETRAIN_READY.flag",
     }
 
-    # =========================================================================
-    # § 13 — AVALIAÇÃO E BENCHMARK
-    # =========================================================================
     EVALUATION_CONFIG = {
-        "eval_dir":           TEMP_DIR / "evaluation",
-        "benchmark_fraction": 0.10,  # 10 % do dataset para benchmark congelado
-        "history_file":       TEMP_DIR / "evaluation" / "eval_history.json",
+        "eval_dir": TEMP_DIR / "evaluation",
+        "benchmark_fraction": 0.10,
+        "history_file": TEMP_DIR / "evaluation" / "eval_history.json",
         "significance_alpha": 0.001,
-        "batch_size":         4096,
+        "batch_size": 4096,
     }
 
-    # =========================================================================
-    # § 14 — HARDWARE / TensorFlow (CPU-only)
-    # Servidor alvo: 20 vCPUs, 64 GB RAM
-    # =========================================================================
     CPU_CONFIG = {
-        "inter_op_threads": 4,   # paralelismo entre ops TF independentes
-        "intra_op_threads": 16,  # paralelismo interno (BLAS/MKL/oneDNN)
+        "inter_op_threads": 4,
+        "intra_op_threads": 16,
     }
 
-    # =========================================================================
-    # § 15 — VISUALIZAÇÃO
-    # =========================================================================
     VIZ_CONFIG = {
-        "style":       "ggplot",
+        "style": "ggplot",
         "save_format": "png",
-        "dpi":         300,
+        "dpi": 300,
     }
 
-    # =========================================================================
-    # § 16 — RELATÓRIOS (IDS)
-    # =========================================================================
-    REPORT_COUNTER_FILE = REPORTS_DIR / ".report_counter"
-    MANAGER_STATE_FILE  = TEMP_DIR / ".manager_state.json"
-
-    # =========================================================================
-    # Métodos utilitários de classe
-    # =========================================================================
+    REPORT_COUNTER_FILE = IDS_REPORTS_DIR / ".report_counter"
+    MANAGER_STATE_FILE = TEMP_DIR / ".manager_state.json"
 
     @classmethod
     def configure_tensorflow(cls) -> None:
-        """
-        Configura TF para CPU-only antes de qualquer operação TF.
-        Deve ser chamado no topo de qualquer script que importe TF.
-        Não altera pesos, loss ou métricas (diferença < 1e-6 float32).
-        """
         import tensorflow as tf
         tf.config.set_visible_devices([], "GPU")
-        tf.config.threading.set_inter_op_parallelism_threads(
-            cls.CPU_CONFIG["inter_op_threads"]
-        )
-        tf.config.threading.set_intra_op_parallelism_threads(
-            cls.CPU_CONFIG["intra_op_threads"]
-        )
+        tf.config.threading.set_inter_op_parallelism_threads(cls.CPU_CONFIG["inter_op_threads"])
+        tf.config.threading.set_intra_op_parallelism_threads(cls.CPU_CONFIG["intra_op_threads"])
         tf.get_logger().setLevel("ERROR")
 
     @classmethod
     def ensure_dirs(cls) -> None:
-        """Cria todos os diretórios necessários (idempotente)."""
         dirs = [
-            cls.DATA_DIR, cls.MODEL_DIR, cls.LOGS_DIR, cls.TEMP_DIR,
-            cls.REPORTS_DIR, cls.TESTS_DIR, cls.COLLECTOR_DIR,
+            cls.DATA_DIR,
+            cls.MODEL_DIR,
+            cls.LOGS_DIR,
+            cls.TEMP_DIR,
+            cls.IDS_REPORTS_DIR,
+            cls.TESTS_DIR,
+            cls.TEST_REPORTS_DIR,
+            cls.COLLECTOR_DIR,
             cls.RETRAIN_CONFIG["staging_dir"],
-            cls.RETRAIN_CONFIG["staging_dir"].parent,
             cls.EVALUATION_CONFIG["eval_dir"],
         ]
         for d in dirs:
-            d.mkdir(parents=True, exist_ok=True)
+            Path(d).mkdir(parents=True, exist_ok=True)
+
+        for d in [
+            cls.TEST_REPORTS_DIR / "Relatorio_1_Arquiteturas",
+            cls.TEST_REPORTS_DIR / "Relatorio_2_Balanceamento",
+            cls.TEST_REPORTS_DIR / "Relatorio_3_Teoria_Informacao",
+            cls.TEST_REPORTS_DIR / "Relatorio_4_Otimizacao_Validacao",
+        ]:
+            (d / "figuras").mkdir(parents=True, exist_ok=True)
+            (d / "tabelas").mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def next_report_number(cls) -> int:
-        """Contador global de relatórios — thread-safe via lock de arquivo."""
         import time
-        cls.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        cls.IDS_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         lock = cls.REPORT_COUNTER_FILE.with_suffix(".lock")
         for _ in range(30):
             try:
@@ -304,8 +255,7 @@ class Config:
             except FileExistsError:
                 time.sleep(0.1)
         try:
-            n = int(cls.REPORT_COUNTER_FILE.read_text().strip()) + 1 \
-                if cls.REPORT_COUNTER_FILE.exists() else 1
+            n = int(cls.REPORT_COUNTER_FILE.read_text().strip()) + 1 if cls.REPORT_COUNTER_FILE.exists() else 1
             cls.REPORT_COUNTER_FILE.write_text(str(n))
         finally:
             lock.unlink(missing_ok=True)
@@ -313,56 +263,55 @@ class Config:
 
     @classmethod
     def report_path(cls, label: str = "", ext: str = "html") -> Path:
-        """
-        Gera caminho padronizado para relatório:
-        Reports/relatorio_NNN_LABEL_YYYYMMDD.html
-        """
         from datetime import date
-        n   = cls.next_report_number()
+        n = cls.next_report_number()
         lbl = label.replace(" ", "_") if label else "ids"
-        dt  = date.today().strftime("%Y%m%d")
-        return cls.REPORTS_DIR / f"relatorio_{n:03d}_{lbl}_{dt}.{ext}"
+        dt = date.today().strftime("%Y%m%d")
+        return cls.IDS_REPORTS_DIR / f"relatorio_{n:03d}_{lbl}_{dt}.{ext}"
 
     @classmethod
     def summary(cls) -> str:
-        """Resumo formatado das configurações principais."""
-        sep = "═" * 62
+        sep = "═" * 70
         return "\n".join([
             sep,
             "  SecurityIA — Configuração Ativa",
             sep,
+            f"  Projeto              : {cls.BASE_DIR}",
+            f"  Tests                : {cls.TESTS_DIR}",
+            f"  Dataset              : {cls.DATA_DIR}",
+            f"  Model                : {cls.MODEL_DIR}",
+            f"  IDS Reports          : {cls.IDS_REPORTS_DIR}",
+            f"  Tests Reports        : {cls.TEST_REPORTS_DIR}",
+            f"  Logs                 : {cls.LOGS_DIR}",
+            f"  Temp                 : {cls.TEMP_DIR}",
             f"  Interface de captura : {cls.CAPTURE_INTERFACE}",
             f"  Diretório de captura : {cls.COLLECTOR_DIR}",
-            f"  Amostragem           : {cls.COLLECTOR_SAMPLE_RATE * 100:.0f} %",
-            f"  Budget diário        : {cls.COLLECTOR_BUDGET_GB:.1f} GiB",
-            f"  Dataset              : {cls.DATA_DIR}",
-            f"  Modelo               : {cls.MODEL_DIR}",
-            f"  Relatórios           : {cls.REPORTS_DIR}",
-            f"  Logs                 : {cls.LOGS_DIR}",
-            f"  Threads TF           : inter={cls.CPU_CONFIG['inter_op_threads']} "
-            f"intra={cls.CPU_CONFIG['intra_op_threads']}",
-            f"  k-best features      : {cls.FEATURE_SELECTION_CONFIG['k_best']}",
-            f"  LSTM units           : {cls.MODEL_CONFIG['lstm_units_1']} / "
-            f"{cls.MODEL_CONFIG['lstm_units_2']}",
+            f"  Threads TF           : inter={cls.CPU_CONFIG['inter_op_threads']} intra={cls.CPU_CONFIG['intra_op_threads']}",
+            f"  LSTM units           : {cls.MODEL_CONFIG['lstm_units_1']} / {cls.MODEL_CONFIG['lstm_units_2']}",
             f"  Dropout              : {cls.MODEL_CONFIG['dropout_rate']}",
-            f"  Atenção (Bahdanau)   : {cls.MODEL_CONFIG['attention_units']} unidades",
+            f"  Atenção              : {cls.MODEL_CONFIG['attention_units']}",
             sep,
         ])
 
 
-# Alias para compatibilidade com scripts antigos que importam IDSConfig
 IDSConfig = Config
 
-# Relatórios de TESTES (não usar o REPORTS_DIR do IDS aqui)
-TEST_REPORTS_DIR = Config.TESTS_DIR / "Reports"
-REPORTS_DIR      = TEST_REPORTS_DIR
+# =============================================================================
+# API LEGADA PARA OS TESTES ACADÊMICOS
+# =============================================================================
 
-REPORT_DIRS = {
-    1: REPORTS_DIR / "Relatorio_1_Arquiteturas",
-    2: REPORTS_DIR / "Relatorio_2_Balanceamento",
-    3: REPORTS_DIR / "Relatorio_3_Teoria_Informacao",
-    4: REPORTS_DIR / "Relatorio_4_Otimizacao_Validacao",
-}
+ROOT_DIR = Config.ROOT_DIR
+BASE_DIR = Config.BASE_DIR
+TESTS_DIR = Config.TESTS_DIR
+DATASET_DIR = Config.DATA_DIR
+MODEL_DIR = Config.MODEL_DIR
+IDS_DIR = Config.IDS_DIR
+LOGS_DIR = Config.LOGS_DIR
+TEMP_DIR = Config.TEMP_DIR
+IDS_REPORTS_DIR = Config.IDS_REPORTS_DIR
+TEST_REPORTS_DIR = Config.TEST_REPORTS_DIR
+# Para scripts legados, REPORTS_DIR deve apontar para os relatórios de testes.
+REPORTS_DIR = TEST_REPORTS_DIR
 
 REPORT_NAMES = {
     1: "Análise Comparativa de Arquiteturas de Redes Neurais",
@@ -371,5 +320,323 @@ REPORT_NAMES = {
     4: "Análise de Estratégias de Otimização e Validação",
 }
 
+REPORT_DIRS = {
+    1: REPORTS_DIR / "Relatorio_1_Arquiteturas",
+    2: REPORTS_DIR / "Relatorio_2_Balanceamento",
+    3: REPORTS_DIR / "Relatorio_3_Teoria_Informacao",
+    4: REPORTS_DIR / "Relatorio_4_Otimizacao_Validacao",
+}
+
+# -----------------------------------------------------------------------------
+# Constantes acadêmicas / compatibilidade
+# -----------------------------------------------------------------------------
+RANDOM_SEED = 42
+TF_INTER_OP_THREADS = Config.CPU_CONFIG["inter_op_threads"]
+TF_INTRA_OP_THREADS = Config.CPU_CONFIG["intra_op_threads"]
+
+LSTM_UNITS_L1 = Config.MODEL_CONFIG["lstm_units_1"]
+LSTM_UNITS_L2 = Config.MODEL_CONFIG["lstm_units_2"]
+LSTM_DENSE_UNITS = Config.MODEL_CONFIG["dense_units"]
+LSTM_N_CLASSES = 15
+DROPOUT_RATE = Config.MODEL_CONFIG["dropout_rate"]
+RECURRENT_DROPOUT_RATE = Config.MODEL_CONFIG["recurrent_dropout_rate"]
+LEARNING_RATE_INITIAL = Config.MODEL_CONFIG["learning_rate"]
+LEARNING_RATE_FINETUNE = Config.FINE_TUNING_CONFIG["learning_rate"]
+BATCH_SIZE = Config.TRAINING_CONFIG["batch_size"]
+MAX_EPOCHS = Config.TRAINING_CONFIG["epochs"]
+EARLY_STOPPING_PATIENCE = Config.TRAINING_CONFIG["patience"]
+SEQUENCE_LENGTH = Config.MODEL_CONFIG["sequence_length"]
+ATTENTION_UNITS = Config.MODEL_CONFIG["attention_units"]
+
+N_FEATURES = 23
+CLASS_NAMES = ["Normal", "DoS", "Probe", "R2L", "U2R"]
+CLASS_DIST = [0.80, 0.12, 0.05, 0.02, 0.01]
+FEATURE_NAMES = [
+    "Flow_Duration", "Dst_Port", "Total_Fwd_Packets", "Flow_IAT_Mean",
+    "Pkt_Length_Mean", "Total_Bwd_Packets", "Flow_Bytes_s", "TCP_Flag_Count",
+    "Protocol_Type", "Service_Type", "Active_Mean", "Active_Std",
+    "Idle_Mean", "Idle_Std", "Count", "Same_Service_Rate",
+    "Source_Bytes", "Destination_Bytes", "Flag_Type", "Fwd_Pkt_Length_Mean",
+    "Pkt_Length_Variance", "Flow_IAT_Std", "Active_Std_2",
+]
+
+N_SAMPLES = {
+    "arquiteturas": 8000,
+    "balanceamento": 8000,
+    "informacao": 6000,
+    "otimizacao": 3000,
+}
+
+SMOTE_K = Config.BALANCING_CONFIG["smote_k_neighbors"]
+ENN_K = Config.BALANCING_CONFIG["enn_n_neighbors"]
+IG_WEIGHT = Config.FEATURE_SELECTION_CONFIG["ig_weight"]
+MI_WEIGHT = Config.FEATURE_SELECTION_CONFIG["mi_weight"]
+CV_FOLDS = 5
+ALPHA_SIGNIFICANCE = Config.EVALUATION_CONFIG["significance_alpha"]
+
+PLOT_STYLE = Config.VIZ_CONFIG["style"]
+PLOT_DPI = Config.VIZ_CONFIG["dpi"]
+FIG_TITLE_FS = 11
+PLOT_PALETTE = "deep"
+
+# Dataset cleaned realmente esperado na pasta Base/CSE-CIC-IDS2018/
+DATASET_FILES = [
+    "bot.csv",
+    "brute force -web.csv",
+    "brute force -xss.csv",
+    "ddos attack-hoic.csv",
+    "ddos attack-loic-udp.csv",
+    "ddos attacks-loic-http.csv",
+    "dos attacks-goldeneye.csv",
+    "dos attacks-hulk.csv",
+    "dos attacks-slowhttptest.csv",
+    "dos attacks-slowloris.csv",
+    "ftp-bruteforce.csv",
+    "infilteration.csv",
+    "sql injection.csv",
+    "ssh-bruteforce.csv",
+]
+
+
+def setup_environment() -> None:
+    Config.ensure_dirs()
+    for d in REPORT_DIRS.values():
+        (d / "figuras").mkdir(parents=True, exist_ok=True)
+        (d / "tabelas").mkdir(parents=True, exist_ok=True)
+
+    try:
+        import tensorflow as tf
+        tf.config.threading.set_inter_op_parallelism_threads(TF_INTER_OP_THREADS)
+        tf.config.threading.set_intra_op_parallelism_threads(TF_INTRA_OP_THREADS)
+        tf.random.set_seed(RANDOM_SEED)
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus:
+            tf.config.set_visible_devices([], "GPU")
+    except Exception:
+        pass
+
+
+def apply_plot_style() -> None:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    plt.style.use(PLOT_STYLE)
+    sns.set_palette(PLOT_PALETTE)
+    plt.rcParams.update({
+        "figure.dpi": PLOT_DPI,
+        "savefig.dpi": PLOT_DPI,
+        "axes.titlesize": FIG_TITLE_FS,
+        "axes.titleweight": "bold",
+        "axes.grid": True,
+    })
+
+
+def fig_path(analise_id: int, nome: str) -> Path:
+    path = REPORT_DIRS[analise_id] / "figuras" / f"{nome}.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def tab_path(analise_id: int, nome: str) -> Path:
+    path = REPORT_DIRS[analise_id] / "tabelas" / f"{nome}.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def print_config() -> None:
     print(Config.summary())
+
+
+def _dataset_csvs() -> list[Path]:
+    if not DATASET_DIR.exists():
+        return []
+    return sorted(p for p in DATASET_DIR.glob("*.csv") if p.is_file())
+
+
+def _dataset_presente() -> tuple[bool, list[str]]:
+    csvs = _dataset_csvs()
+    if not csvs:
+        return False, DATASET_FILES.copy()
+
+    existentes = {p.name.strip().lower() for p in csvs}
+    ausentes = [f for f in DATASET_FILES if f.lower() not in existentes]
+    return len(ausentes) == 0, ausentes
+
+
+def _instrucoes_manuais() -> None:
+    print("\n  INSTRUÇÕES DE DATASET")
+    print("  ─────────────────────")
+    print(f"  Coloque os CSVs do CSE-CIC-IDS2018 cleaned em: {DATASET_DIR}")
+    print("  Arquivos esperados:")
+    for f in DATASET_FILES:
+        print(f"    • {f}")
+    print("  Observação: o diretório fixo esperado é Base/CSE-CIC-IDS2018/.")
+
+
+def verificar_dataset(interativo: bool = True) -> bool:
+    presente, ausentes = _dataset_presente()
+    if presente:
+        csvs = _dataset_csvs()
+        print(f"  ✓ Dataset encontrado: {len(csvs)} arquivo(s) CSV em {DATASET_DIR}")
+        return True
+
+    print(f"\n  ⚠ Dataset real não encontrado em: {DATASET_DIR}")
+    if ausentes:
+        print(f"  Arquivos ausentes: {len(ausentes)} de {len(DATASET_FILES)}")
+
+    if not interativo:
+        print("  Modo não-interativo: prosseguindo com dados sintéticos.")
+        return False
+
+    _instrucoes_manuais()
+    return False
+
+
+def _resolve_label_column(df):
+    for col in ["Label", "label", " Label"]:
+        if col in df.columns:
+            return col
+    return None
+
+
+def carregar_dataset_real(n_amostras_max: int = 500_000):
+    try:
+        import numpy as np
+        import pandas as pd
+        from sklearn.preprocessing import LabelEncoder
+    except Exception as exc:
+        print(f"  ⚠ Dependência ausente para dataset real: {exc}")
+        return None
+
+    presente, _ = _dataset_presente()
+    if not presente:
+        return None
+
+    csvs = _dataset_csvs()
+    if not csvs:
+        return None
+
+    amostras_por_arquivo = max(1, n_amostras_max // max(1, len(csvs)))
+    frames = []
+
+    for csv in csvs:
+        try:
+            df = pd.read_csv(csv, low_memory=False)
+            if df.empty:
+                continue
+
+            label_col = _resolve_label_column(df)
+            if label_col is None:
+                # fallback: usa o nome do arquivo como rótulo
+                df["Label"] = csv.stem
+                label_col = "Label"
+
+            if len(df) > amostras_por_arquivo:
+                df = df.sample(amostras_por_arquivo, random_state=RANDOM_SEED)
+
+            frames.append(df)
+        except Exception as exc:
+            print(f"  ⚠ Falha ao ler {csv.name}: {exc}")
+
+    if not frames:
+        return None
+
+    df_all = pd.concat(frames, ignore_index=True)
+    label_col = _resolve_label_column(df_all) or "Label"
+
+    # Mantém apenas colunas numéricas e remove rótulo/meta textual.
+    y_raw = df_all[label_col].astype(str).fillna("unknown")
+    X_df = df_all.drop(columns=[c for c in [label_col, "Timestamp", "Flow ID", "Src IP", "Dst IP"] if c in df_all.columns], errors="ignore")
+    X_df = X_df.select_dtypes(include=["number"]).replace([float("inf"), float("-inf")], 0).fillna(0)
+
+    if X_df.empty:
+        print("  ⚠ Dataset real lido, mas sem colunas numéricas utilizáveis.")
+        return None
+
+    # Ajusta número de features para o esperado pelos testes.
+    if X_df.shape[1] >= N_FEATURES:
+        X_df = X_df.iloc[:, :N_FEATURES]
+    else:
+        for i in range(N_FEATURES - X_df.shape[1]):
+            X_df[f"pad_{i}"] = 0.0
+        X_df = X_df.iloc[:, :N_FEATURES]
+
+    le = LabelEncoder()
+    y = le.fit_transform(y_raw)
+    X = X_df.to_numpy(dtype="float32")
+
+    if len(X) > n_amostras_max:
+        idx = np.random.default_rng(RANDOM_SEED).choice(len(X), size=n_amostras_max, replace=False)
+        X = X[idx]
+        y = y[idx]
+
+    return X, y, le
+
+
+@dataclass
+class Relatorio:
+    analise_id: int
+
+    def __post_init__(self):
+        setup_environment()
+        self.id = self.analise_id
+        self.titulo = REPORT_NAMES[self.id]
+        self.dir = REPORT_DIRS[self.id]
+        self.arquivo = self.dir / f"Relatorio_{self.id}.md"
+        self.linhas: list[str] = []
+        self._cabecalho()
+
+    def _cabecalho(self):
+        self.linhas += [
+            f"# Relatório {self.id}: {self.titulo}",
+            "",
+            "**Projeto**: SecurityIA  ",
+            "**Trilha**: Testes e análises acadêmicas  ",
+            f"**Gerado em**: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}  ",
+            f"**Dataset**: {DATASET_DIR}  ",
+            f"**Ambiente**: CPU-only | Threads inter={TF_INTER_OP_THREADS} intra={TF_INTRA_OP_THREADS}",
+            "",
+        ]
+
+    def secao(self, titulo: str):
+        self.linhas += [f"## {titulo}", ""]
+        return self
+
+    def subsecao(self, titulo: str):
+        self.linhas += [f"### {titulo}", ""]
+        return self
+
+    def texto(self, texto: str):
+        bloco = textwrap.dedent(str(texto)).strip("\n")
+        if bloco:
+            self.linhas += [bloco, ""]
+        return self
+
+    def metrica(self, nome: str, valor: str):
+        self.linhas += [f"- **{nome}**: {valor}", ""]
+        return self
+
+    def tabela_df(self, df, legenda: str = ""):
+        if legenda:
+            self.linhas += [f"**{legenda}**", ""]
+        try:
+            table = df.to_markdown(index=False)
+        except Exception:
+            table = "```\n" + df.to_string(index=False) + "\n```"
+        self.linhas += [table, ""]
+        return self
+
+    def figura(self, nome: str, legenda: str = ""):
+        caption = legenda or nome
+        self.linhas += [f"![{caption}](figuras/{nome}.png)", ""]
+        return self
+
+    def salvar(self) -> Path:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.arquivo.write_text("\n".join(self.linhas).rstrip() + "\n", encoding="utf-8")
+        print(f"  ✓ Relatório salvo: {self.arquivo}")
+        return self.arquivo
+
+
+# Garante diretórios no import para evitar erro ao salvar figuras/tabelas.
+setup_environment()
