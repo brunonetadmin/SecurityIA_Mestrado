@@ -467,10 +467,12 @@ def main() -> None:
         import subprocess
         cmd = [sys.executable] + [a for a in sys.argv if a != "--background"]
         log_file = Config.LOG_COLLECTOR
+        log_fh = open(log_file, "a")
         proc = subprocess.Popen(
-            cmd, stdout=open(log_file, "a"), stderr=subprocess.STDOUT,
+            cmd, stdout=log_fh, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        log_fh.close()
         print(f"  Collector iniciado em background — PID {proc.pid}")
         print(f"  Log: {log_file}")
         return

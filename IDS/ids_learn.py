@@ -315,19 +315,34 @@ class DataHandler:
 
         log.info("Iniciando pré-processamento completo …")
 
+        # Codifica labels no dataset COMPLETO antes de amostrar
+        # (garante que todas as classes sejam vistas pelo encoder)
+        self.label_encoder.fit(df["Label"])
+        self.label_mapping = {i: lbl for i, lbl in enumerate(self.label_encoder.classes_)}
+
         # Amostra estratificada para seleção de features (eficiência)
         n_sample = min(Config.PREPROCESSING_CONFIG["sample_size_for_selection"], len(df))
-        df_s = df.sample(n=n_sample, random_state=Config.TRAINING_CONFIG["random_state"])
-        X_s  = df_s.drop(columns=["Label"]).values
-        y_s  = self.label_encoder.fit_transform(df_s["Label"])
-        feat_names = df_s.drop(columns=["Label"]).columns.tolist()
+        feat_names = [c for c in df.columns if c != "Label"]
+        y_all = self.label_encoder.transform(df["Label"])
+
+        if n_sample < len(df):
+            from sklearn.model_selection import train_test_split as _split
+            _, df_s, _, y_s = _split(
+                df, y_all,
+                test_size=n_sample / len(df),
+                random_state=Config.TRAINING_CONFIG["random_state"],
+                stratify=y_all,
+            )
+            X_s = df_s[feat_names].values
+        else:
+            X_s = df[feat_names].values
+            y_s = y_all
 
         selected, feat_scores = self.select_features(X_s, y_s, feat_names)
 
         # Aplica ao dataset completo
         X_full = df[selected].values
-        y_full = self.label_encoder.transform(df["Label"])
-        self.label_mapping = {i: lbl for i, lbl in enumerate(self.label_encoder.classes_)}
+        y_full = y_all
 
         log.info("Normalizando com StandardScaler …")
         X_scaled = self.scaler.fit_transform(X_full)
@@ -456,7 +471,7 @@ class ModelTrainer:
         self.history = self.model.fit(
             X_tr_r, y_tr,
             validation_data=(X_val_r, y_val),
-            epochs=cfg["batch_size"],
+            epochs=epochs,
             batch_size=cfg["batch_size"],
             callbacks=callbacks,
             verbose=1,

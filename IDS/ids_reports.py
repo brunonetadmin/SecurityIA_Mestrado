@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import Config
-from IDS.modules.incident_engine import ModelArtifacts, SEVERITY
+from IDS.modules.incident_engine import ModelArtifacts, SEVERITY, CONF_HIGH
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,7 +155,7 @@ def _section_incidents(incidents: List[dict], limit: int = 200) -> str:
     rows  = ""
     for inc in shown:
         sev_col = inc["sev_color"]
-        conf_color = "#28a745" if inc["confidence"] >= Config.CONF_HIGH else "#fd7e14"
+        conf_color = "#28a745" if inc["confidence"] >= CONF_HIGH else "#fd7e14"
         rows += (
             f"<tr>"
             f"<td>{_badge(inc['severity'], sev_col)}</td>"
