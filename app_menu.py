@@ -41,6 +41,37 @@ APP_NAME = "SecurityIA"
 APP_VERSION = "3.0.0"
 APP_SUBTITLE = "Unified CLI for Tests and Intelligent IDS Operations"
 
+VENV_DIR = ROOT_DIR / ".venv"
+PROJECT_PYTHON = VENV_DIR / "bin" / "python3"
+
+
+def using_project_venv() -> bool:
+    exe = Path(sys.executable).resolve()
+    try:
+        return VENV_DIR.resolve() in exe.parents
+    except FileNotFoundError:
+        return False
+
+
+def bootstrap_project_python() -> None:
+    """
+    Reexecuta o app com o Python da .venv quando disponível.
+    Evita falhas de importação dos módulos de teste/IDS quando o menu é
+    iniciado com o Python do sistema, mas as dependências estão na .venv.
+    """
+    if os.environ.get("SECURITYIA_SKIP_VENV_REEXEC") == "1":
+        return
+
+    if using_project_venv():
+        return
+
+    if PROJECT_PYTHON.exists() and os.access(PROJECT_PYTHON, os.X_OK):
+        os.environ["SECURITYIA_SKIP_VENV_REEXEC"] = "1"
+        os.execv(str(PROJECT_PYTHON), [str(PROJECT_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+bootstrap_project_python()
+
 # -----------------------------------------------------------------------------
 # ANSI / UI helpers
 # -----------------------------------------------------------------------------
@@ -133,6 +164,7 @@ def print_header(context: str = "Main Menu") -> None:
     print(hline())
     print(f"  Contexto : {color(context, 'white', 'bold')}")
     print(f"  Projeto  : {ROOT_DIR}")
+    print(f"  Python   : {sys.executable}")
     print(hline())
 
 
@@ -217,8 +249,8 @@ def ensure_tests_path() -> Path:
     tests_dir = get_tests_dir()
     if tests_dir.exists():
         resolved = str(tests_dir.resolve())
-        if resolved not in sys.path:
-            sys.path.insert(0, resolved)
+        sys.path[:] = [p for p in sys.path if p != resolved]
+        sys.path.insert(0, resolved)
     return tests_dir
 
 
@@ -349,6 +381,7 @@ def execute_test_analysis(analysis_id: int) -> bool:
     print(f"  Módulo   : {mod_name}")
     print(f"  Dataset  : {get_dataset_dir()}")
     print(f"  Relatório: {get_reports_dir()}")
+    print(f"  Python   : {sys.executable}")
 
     try:
         tests_dir = ensure_tests_path()
@@ -358,7 +391,11 @@ def execute_test_analysis(analysis_id: int) -> bool:
     except Exception as exc:
         print("\n  " + badge_err(f"Falha ao carregar o módulo {mod_name}: {exc}"))
         print(f"  Tests dir : {tests_dir if 'tests_dir' in locals() else get_tests_dir()}")
+        print(f"  Python    : {sys.executable}")
         print(f"  sys.path  : {sys.path[:6]}")
+        if isinstance(exc, ModuleNotFoundError) and getattr(exc, "name", "") in {"numpy", "pandas", "tensorflow", "matplotlib", "seaborn", "sklearn", "scipy", "imblearn"}:
+            print("  " + badge_warn("Dependência Python não encontrada no interpretador atual."))
+            print("  " + badge_info(f"O app tentará usar automaticamente a .venv do projeto quando existir: {VENV_DIR}"))
         traceback.print_exc()
         return False
 
@@ -1365,4 +1402,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\n  " + badge_warn("Execução interrompida pelo usuário."))
         print()
-
