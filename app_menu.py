@@ -4,7 +4,7 @@ app_menu.py — Frontend Unificado do projeto SecurityIA
 
 Unifica:
   - Modo de Testes/Análises acadêmicas
-  - Modo Sistema IDS
+  - Modo Sistema IDS (Collector, Detector, Treinamento, Relatórios, Status)
 
 Objetivo:
   - Centralizar a experiência CLI em um único ponto de entrada
@@ -18,12 +18,14 @@ Uso:
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import shutil
 import subprocess
 import sys
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -147,6 +149,11 @@ def pause(message: str = "Pressione ENTER para continuar...") -> None:
     input("\n" + color("  ⏎ ", "cyan", "bold") + message)
 
 
+def confirm(text: str) -> bool:
+    resp = prompt(f"{text} [s/N]: ").lower()
+    return resp in ("s", "sim", "y", "yes")
+
+
 def section(title: str, subtitle: str | None = None) -> None:
     print()
     print(line())
@@ -175,6 +182,24 @@ def menu_choice(valid: Iterable[str], title: str = "Opção: ") -> str:
         if choice in allowed:
             return choice
         print("  " + badge_err(f"Opção inválida. Escolha entre: {', '.join(sorted(allowed))}"))
+
+
+def print_simple_table(headers: list[str], rows: list[list[str]], title: str = "") -> None:
+    """Tabela ASCII simples para listagens no menu."""
+    if title:
+        print(f"\n  {color(title, 'white', 'bold')}")
+        print("  " + hline(n=72))
+    if not rows:
+        print("  " + color("(nenhum registro)", "dim"))
+        return
+    col_widths = [max(len(h), max((len(str(r[i])) for r in rows), default=0))
+                  for i, h in enumerate(headers)]
+    hdr = "  ".join(f"{h:<{col_widths[i]}}" for i, h in enumerate(headers))
+    print(f"  {color(hdr, 'cyan', 'bold')}")
+    print("  " + "─" * sum(col_widths + [2 * (len(headers) - 1)]))
+    for row in rows:
+        line_str = "  ".join(f"{str(row[i]):<{col_widths[i]}}" for i in range(len(headers)))
+        print(f"  {line_str}")
 
 
 # -----------------------------------------------------------------------------
@@ -227,7 +252,7 @@ def get_config_callable(*names: str) -> Callable[..., Any] | None:
 
 
 # -----------------------------------------------------------------------------
-# Test/analysis integration
+# Test/analysis integration (sem alterações)
 # -----------------------------------------------------------------------------
 
 TEST_MODULES: Dict[int, Tuple[str, str]] = {
@@ -589,135 +614,539 @@ def tests_menu() -> None:
             show_environment_config()
 
 
-# -----------------------------------------------------------------------------
-# IDS integration layer
-# -----------------------------------------------------------------------------
+# =============================================================================
+# IDS — CAMADA DE INTEGRAÇÃO COMPLETA
+# =============================================================================
+# Integra diretamente as funcionalidades reais de:
+#   - ids_collector.py  (captura de pacotes)
+#   - ids_detector.py   (detecção de incidentes)
+#   - ids_learn.py      (treinamento / fine-tuning)
+#   - ids_reports.py    (relatórios HTML/TXT)
+# =============================================================================
+
+# ── Helpers de processo em background ─────────────────────────────────────────
+
+_IDS_DIR = ROOT_DIR / "IDS"
 
 
-def import_ids_stack() -> Tuple[dict[str, Any], list[str]]:
-    """Importa de forma resiliente o stack do IDS."""
-    missing: list[str] = []
-    loaded: dict[str, Any] = {}
-
-    candidates = {
-        "ids_manager": "ids_manager",
-        "ids_config": "ids_config",
-    }
-    for key, mod_name in candidates.items():
-        mod = safe_import(mod_name)
-        if mod is None:
-            missing.append(mod_name)
-        else:
-            loaded[key] = mod
-
-    # atributos úteis do ids_manager, quando disponível
-    ids_manager = loaded.get("ids_manager")
-    if ids_manager:
-        for attr in [
-            "ManagerState",
-            "ModelArtifacts",
-            "scan_new_files",
-            "op_analyze",
-            "op_retrain",
-            "op_generate_report",
-            "print_terminal_summary",
-            "submenu_avaliacao",
-            "submenu_relatorios",
-            "submenu_configuracoes",
-            "menu_status",
-            "load_evaluator",
-        ]:
-            if hasattr(ids_manager, attr):
-                loaded[attr] = getattr(ids_manager, attr)
-            else:
-                missing.append(f"ids_manager.{attr}")
-
-    ids_config = loaded.get("ids_config")
-    if ids_config and hasattr(ids_config, "IDSConfig"):
-        loaded["IDSConfig"] = ids_config.IDSConfig
-    elif ids_config:
-        missing.append("ids_config.IDSConfig")
-
-    return loaded, missing
-
-
-def require_ids_stack() -> dict[str, Any] | None:
-    loaded, missing = import_ids_stack()
-    if "ids_manager" not in loaded:
-        print("\n  " + badge_warn("Stack principal do IDS ainda não está completo nesta instalação."))
-        if missing:
-            print("  Componentes ausentes:")
-            for item in missing[:10]:
-                print(f"    • {item}")
-        print("  O menu continua disponível, mas algumas operações ficarão em modo informativo.")
+def _get_config():
+    """Retorna o objeto Config do projeto, ou None."""
+    cfg = safe_import("config")
+    if cfg is None:
         return None
-    return loaded
+    return getattr(cfg, "Config", cfg)
 
 
-def show_placeholder(title: str, detail: str, tips: list[str] | None = None) -> None:
-    print_header(title)
-    section(title, "Funcionalidade prevista na arquitetura, pronta para evolução incremental")
-    print("  " + badge_info(detail))
-    if tips:
+def _get_pid_file(name: str) -> Path:
+    cfg = _get_config()
+    temp_dir = Path(cfg.TEMP_DIR) if cfg and hasattr(cfg, "TEMP_DIR") else get_temp_dir()
+    return temp_dir / f".{name}.pid"
+
+
+def _write_pid(pid_file: Path, pid: int) -> None:
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(str(pid))
+
+
+def _read_pid(pid_file: Path) -> Optional[int]:
+    try:
+        return int(pid_file.read_text().strip())
+    except Exception:
+        return None
+
+
+def _is_process_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _proc_status_str(pid_file: Path) -> str:
+    pid = _read_pid(pid_file)
+    if pid and _is_process_running(pid):
+        return badge_ok(f"ATIVO (PID {pid})")
+    return color("PARADO", "red")
+
+
+def _run_background(cmd: list[str], log_file: Path | None = None,
+                    cwd: Path | None = None) -> subprocess.Popen:
+    """Inicia processo em background com stdout/stderr redirecionados."""
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(log_file, "a", encoding="utf-8")
+    else:
+        fh = subprocess.DEVNULL
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=fh if log_file else subprocess.DEVNULL,
+        stderr=subprocess.STDOUT if log_file else subprocess.DEVNULL,
+        cwd=cwd or ROOT_DIR,
+        start_new_session=True,
+    )
+    return proc
+
+
+def _tail_log(log_file: Path, n: int = 50) -> None:
+    """Exibe as últimas n linhas de um arquivo de log."""
+    if not log_file.exists():
+        print(f"  {color('Log não encontrado.', 'dim')}")
+        return
+    try:
+        lines = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        for row in lines[-n:]:
+            print("  " + row[:140])
+    except Exception as exc:
+        print("  " + badge_warn(f"Não foi possível ler o log: {exc}"))
+
+
+# ── Resolução de caminhos IDS via Config ──────────────────────────────────────
+
+def _ids_collector_dir() -> Path:
+    cfg = _get_config()
+    if cfg and hasattr(cfg, "COLLECTOR_DIR"):
+        return Path(cfg.COLLECTOR_DIR)
+    return ROOT_DIR / "Collector"
+
+
+def _ids_reports_dir() -> Path:
+    cfg = _get_config()
+    if cfg and hasattr(cfg, "REPORTS_DIR"):
+        return Path(cfg.REPORTS_DIR)
+    return ROOT_DIR / "Reports"
+
+
+def _ids_staging_dir() -> Path:
+    cfg = _get_config()
+    if cfg and hasattr(cfg, "RETRAIN_CONFIG"):
+        return Path(cfg.RETRAIN_CONFIG.get("staging_dir", get_temp_dir() / "staging"))
+    return get_temp_dir() / "staging"
+
+
+def _ids_log(name: str) -> Path:
+    cfg = _get_config()
+    attr_map = {
+        "collector": "LOG_COLLECTOR",
+        "app": "LOG_APP",
+        "learn": "LOG_LEARN",
+    }
+    attr = attr_map.get(name)
+    if cfg and attr and hasattr(cfg, attr):
+        return Path(getattr(cfg, attr))
+    return get_logs_dir() / f"{name.capitalize()}.log"
+
+
+def _ids_capture_interface() -> str:
+    cfg = _get_config()
+    if cfg and hasattr(cfg, "CAPTURE_INTERFACE"):
+        return cfg.CAPTURE_INTERFACE
+    return "eth0"
+
+
+def _ids_collector_budget() -> float:
+    cfg = _get_config()
+    if cfg and hasattr(cfg, "COLLECTOR_BUDGET_GB"):
+        return cfg.COLLECTOR_BUDGET_GB
+    return 10.0
+
+
+def _ids_model_file() -> Path:
+    cfg = _get_config()
+    model_dir = get_model_dir()
+    if cfg and hasattr(cfg, "MODEL_FILENAME"):
+        return model_dir / cfg.MODEL_FILENAME
+    return model_dir / "ids_model.keras"
+
+
+def _ids_model_info_file() -> Path:
+    cfg = _get_config()
+    model_dir = get_model_dir()
+    if cfg and hasattr(cfg, "MODEL_INFO_FILENAME"):
+        return model_dir / cfg.MODEL_INFO_FILENAME
+    return model_dir / "model_info.json"
+
+
+def _ids_ensure_dirs() -> None:
+    cfg = _get_config()
+    if cfg and hasattr(cfg, "ensure_dirs"):
+        cfg.ensure_dirs()
+
+
+# ── Scan de arquivos pendentes ────────────────────────────────────────────────
+
+def _ids_scan_new_files() -> list[Path]:
+    """Retorna Parquets no COLLECTOR_DIR ainda não analisados."""
+    col_dir = _ids_collector_dir()
+    if not col_dir.exists():
+        return []
+
+    state_file = get_temp_dir() / "ids_state.json"
+    analyzed: set[str] = set()
+    if state_file.exists():
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+            analyzed = set(data.get("analyzed_files", []))
+        except Exception:
+            pass
+
+    files = sorted(col_dir.glob("*.parquet"))
+    return [f for f in files if f.name not in analyzed]
+
+
+# =============================================================================
+# IDS Submenu — Collector
+# =============================================================================
+
+def ids_capture_menu() -> None:
+    pid_file = _get_pid_file("collector")
+
+    while True:
+        print_header("IDS > Captura de Pacotes")
+        pid = _read_pid(pid_file)
+        running = pid is not None and _is_process_running(pid)
+
+        section("Gerenciamento do Collector")
+        print(f"  Status    : {_proc_status_str(pid_file)}")
+        print(f"  Interface : {_ids_capture_interface()}")
+        print(f"  Saída     : {_ids_collector_dir()}")
+        print(f"  Budget    : {_ids_collector_budget():.1f} GiB/dia")
+        print(hline())
+        print(f"  [1] {'Parar Collector' if running else 'Iniciar Collector'}")
+        print("  [2] Ver log do Collector")
+        print("  [3] Listar arquivos capturados")
+        print("  [4] Importar PCAP externo")
+        print("  [5] Ver estatísticas da interface")
+        print("  [0] Voltar")
         print()
-        for tip in tips:
-            print(f"  • {tip}")
-    pause()
+
+        choice = menu_choice(["0", "1", "2", "3", "4", "5"])
+
+        if choice == "0":
+            return
+
+        elif choice == "1":
+            if running:
+                if confirm("Parar o Collector?"):
+                    import signal as _signal
+                    os.kill(pid, _signal.SIGTERM)
+                    pid_file.unlink(missing_ok=True)
+                    print(f"  {color('Collector encerrado.', 'yellow')}")
+                    time.sleep(1)
+            else:
+                collector_script = _IDS_DIR / "ids_collector.py"
+                if not collector_script.exists():
+                    print("  " + badge_err(f"Script não encontrado: {collector_script}"))
+                    pause()
+                    continue
+                print("  Iniciando Collector em background …")
+                proc = _run_background(
+                    [sys.executable, str(collector_script)],
+                    log_file=_ids_log("collector"),
+                    cwd=ROOT_DIR,
+                )
+                _write_pid(pid_file, proc.pid)
+                print("  " + badge_ok(f"Collector iniciado — PID {proc.pid}"))
+                print(f"  Log: {_ids_log('collector')}")
+                pause()
+
+        elif choice == "2":
+            print()
+            _tail_log(_ids_log("collector"), n=50)
+            pause()
+
+        elif choice == "3":
+            col_dir = _ids_collector_dir()
+            files = sorted(col_dir.glob("*.parquet")) if col_dir.exists() else []
+            if files:
+                rows = [
+                    [f.name, human_size(f.stat().st_size),
+                     datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")]
+                    for f in files
+                ]
+                print_simple_table(["Arquivo", "Tamanho", "Modificado"], rows,
+                                   title="Arquivos Capturados")
+            else:
+                print("  " + color("Nenhum arquivo encontrado.", "dim"))
+            pause()
+
+        elif choice == "4":
+            src = prompt("Caminho completo do arquivo PCAP: ")
+            if not src:
+                print("  " + badge_warn("Nenhum arquivo informado."))
+                pause()
+                continue
+            src_path = Path(src).expanduser()
+            if not src_path.exists():
+                print("  " + badge_err("Arquivo não encontrado."))
+                pause()
+                continue
+            dst_dir = _IDS_DIR / "imports"
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            dst_path = dst_dir / src_path.name
+            shutil.copy2(src_path, dst_path)
+            print("  " + badge_ok(f"PCAP importado para {dst_path}"))
+            pause()
+
+        elif choice == "5":
+            _show_interface_stats()
 
 
-def run_ids_analysis(retrain_after: bool = False) -> None:
-    loaded = require_ids_stack()
-    if not loaded:
+# =============================================================================
+# IDS Submenu — Detector
+# =============================================================================
+
+def ids_detection_menu() -> None:
+    pid_file = _get_pid_file("detector")
+
+    while True:
+        print_header("IDS > Detecção")
+        new_files = _ids_scan_new_files()
+        pid = _read_pid(pid_file)
+        running = pid is not None and _is_process_running(pid)
+
+        section("Gerenciamento do Detector")
+        print(f"  Status detector : {_proc_status_str(pid_file)}")
+        print(f"  Arquivos novos  : {color(str(len(new_files)), 'yellow') if new_files else color('0', 'dim')}")
+        print(hline())
+        print("  [1] Análise em lote (todos os arquivos pendentes)")
+        print("  [2] Monitor contínuo (background)")
+        print("  [3] Analisar arquivo específico")
+        print(f"  [4] {'Parar monitor' if running else color('Monitor não ativo', 'dim')}")
+        print("  [5] Ver log de detecção")
+        print("  [0] Voltar")
+        print()
+
+        choice = menu_choice(["0", "1", "2", "3", "4", "5"])
+
+        if choice == "0":
+            return
+
+        elif choice == "1":
+            detector_script = _IDS_DIR / "ids_detector.py"
+            if not detector_script.exists():
+                print("  " + badge_err(f"Script não encontrado: {detector_script}"))
+                pause()
+                continue
+            try:
+                from IDS.ids_detector import cmd_batch
+                cmd_batch()
+            except ImportError:
+                # Fallback: executa como subprocesso
+                subprocess.run(
+                    [sys.executable, str(detector_script), "batch"],
+                    cwd=ROOT_DIR,
+                )
+            pause()
+
+        elif choice == "2":
+            interval = prompt("Intervalo de varredura em segundos [60]: ") or "60"
+            try:
+                interval_s = int(interval)
+            except ValueError:
+                print("  " + badge_err("Valor inválido."))
+                pause()
+                continue
+            detector_script = _IDS_DIR / "ids_detector.py"
+            if not detector_script.exists():
+                print("  " + badge_err(f"Script não encontrado: {detector_script}"))
+                pause()
+                continue
+            proc = _run_background(
+                [sys.executable, str(detector_script),
+                 "watch", "--interval", str(interval_s)],
+                log_file=_ids_log("app"),
+                cwd=ROOT_DIR,
+            )
+            _write_pid(pid_file, proc.pid)
+            print("  " + badge_ok(f"Monitor iniciado — PID {proc.pid}"))
+            pause()
+
+        elif choice == "3":
+            path_str = prompt("Caminho do arquivo .parquet: ")
+            if not path_str:
+                print("  " + badge_warn("Nenhum caminho informado."))
+                pause()
+                continue
+            fpath = Path(path_str).expanduser()
+            if not fpath.exists():
+                print("  " + badge_err(f"Arquivo não encontrado: {fpath}"))
+                pause()
+                continue
+            detector_script = _IDS_DIR / "ids_detector.py"
+            try:
+                from IDS.ids_detector import cmd_file
+                cmd_file(fpath)
+            except ImportError:
+                subprocess.run(
+                    [sys.executable, str(detector_script), "file", str(fpath)],
+                    cwd=ROOT_DIR,
+                )
+            pause()
+
+        elif choice == "4":
+            if running:
+                if confirm("Parar o monitor?"):
+                    import signal as _signal
+                    os.kill(pid, _signal.SIGTERM)
+                    pid_file.unlink(missing_ok=True)
+                    print(f"  {color('Monitor encerrado.', 'yellow')}")
+            else:
+                print(f"  {color('Monitor não está em execução.', 'dim')}")
+            pause()
+
+        elif choice == "5":
+            print()
+            _tail_log(_ids_log("app"), n=80)
+            pause()
+
+
+# =============================================================================
+# IDS Submenu — Treinamento
+# =============================================================================
+
+def ids_training_menu() -> None:
+    while True:
+        print_header("IDS > Treinamento")
+        section("Gerenciamento de Treinamento")
+
+        # Exibe status do modelo atual
+        model_file = _ids_model_file()
+        info_file = _ids_model_info_file()
+        if model_file.exists():
+            version, trained_at = "?", "?"
+            if info_file.exists():
+                try:
+                    info = json.loads(info_file.read_text(encoding="utf-8"))
+                    version = info.get("version", "?")
+                    trained_at = info.get("trained_at", "?")[:19]
+                except Exception:
+                    pass
+            print(f"  Modelo    : {badge_ok(f'v{version} ({trained_at})')}")
+            print(f"  Artefato  : {model_file}")
+        else:
+            print(f"  Modelo    : {color('Não treinado', 'red')}")
+
+        staging_dir = _ids_staging_dir()
+        stg_cnt = len(list(staging_dir.glob("*.parquet"))) if staging_dir.exists() else 0
+        print(f"  Staging   : {stg_cnt} arquivo(s) para fine-tuning")
+        print(hline())
+
+        print("  [1] Treinamento completo (do zero)")
+        print("  [2] Treinamento forçado (limpa cache)")
+        stg_label = f"  ({color(f'{stg_cnt} arquivo(s)', 'yellow')})" if stg_cnt else ""
+        print(f"  [3] Fine-tuning incremental{stg_label}")
+        print("  [4] Avaliar modelo (accuracy, recall, F1, ROC)")
+        print("  [5] Ver log de treinamento")
+        print("  [6] Listar modelos disponíveis")
+        print("  [0] Voltar")
+        print()
+
+        choice = menu_choice(["0", "1", "2", "3", "4", "5", "6"])
+
+        if choice == "0":
+            return
+
+        elif choice in ("1", "2"):
+            force = choice == "2"
+            msg = "Treinamento forçado" if force else "Treinamento completo"
+            if confirm(f"Iniciar {msg}? (pode demorar 30–120 min)"):
+                learn_script = _IDS_DIR / "ids_learn.py"
+                if not learn_script.exists():
+                    print("  " + badge_err(f"Script não encontrado: {learn_script}"))
+                    pause()
+                    continue
+                extra = ["--force"] if force else []
+                proc = _run_background(
+                    [sys.executable, str(learn_script), "train"] + extra,
+                    log_file=_ids_log("learn"),
+                    cwd=ROOT_DIR,
+                )
+                print("  " + badge_ok(f"Treinamento iniciado — PID {proc.pid}"))
+                print(f"  Acompanhe em: {_ids_log('learn')}")
+            pause()
+
+        elif choice == "3":
+            if stg_cnt == 0:
+                print(f"  {color('Nenhum dado de staging disponível.', 'dim')}")
+                pause()
+                continue
+            if confirm(f"Fine-tuning com {stg_cnt} arquivo(s)?"):
+                learn_script = _IDS_DIR / "ids_learn.py"
+                if not learn_script.exists():
+                    print("  " + badge_err(f"Script não encontrado: {learn_script}"))
+                    pause()
+                    continue
+                proc = _run_background(
+                    [sys.executable, str(learn_script), "finetune"],
+                    log_file=_ids_log("learn"),
+                    cwd=ROOT_DIR,
+                )
+                print("  " + badge_ok(f"Fine-tuning iniciado — PID {proc.pid}"))
+            pause()
+
+        elif choice == "4":
+            _ids_model_evaluation()
+
+        elif choice == "5":
+            print()
+            _tail_log(_ids_log("learn"), n=100)
+            pause()
+
+        elif choice == "6":
+            _list_available_models()
+
+
+def _ids_model_evaluation() -> None:
+    """Avalia modelo atual com métricas padrão do trabalho."""
+    print_header("IDS > Avaliação do Modelo")
+    section("Avaliação do modelo ativo")
+
+    model_file = _ids_model_file()
+    if not model_file.exists():
+        print("  " + badge_warn("Nenhum modelo treinado encontrado."))
         pause()
         return
 
-    ManagerState = loaded["ManagerState"]
-    ModelArtifacts = loaded["ModelArtifacts"]
-    scan_new_files = loaded["scan_new_files"]
-    op_analyze = loaded["op_analyze"]
-    op_retrain = loaded["op_retrain"]
-    op_generate_report = loaded["op_generate_report"]
-    print_terminal_summary = loaded["print_terminal_summary"]
-
+    # Tenta usar ids_learn.cmd_status para exibir métricas
     try:
-        state = ManagerState()
-        new_files = scan_new_files(state)
-        if not new_files:
-            print_header("IDS > Detection")
-            section("Detecção em tempo real")
-            print("  " + badge_warn("Nenhum arquivo novo encontrado no diretório de coleta."))
-            pause()
-            return
-
-        arts = ModelArtifacts()
-        arts.load()
-        version = arts.version_tag()
-
-        results = op_analyze(state, arts, new_files)
-        retrained = False
-
-        if retrain_after:
-            retrained = op_retrain(results, new_files, state)
-
-        if results:
-            print_terminal_summary(results, retrained)
-            op_generate_report(results, version, retrained)
-    except FileNotFoundError as exc:
-        print("\n  " + badge_err(str(exc)))
+        from IDS.ids_learn import cmd_status
+        cmd_status()
+    except ImportError:
+        print(f"  Modelo    : {model_file}")
+        print(f"  Tamanho   : {human_size(model_file.stat().st_size)}")
+        info_file = _ids_model_info_file()
+        if info_file.exists():
+            try:
+                info = json.loads(info_file.read_text(encoding="utf-8"))
+                print(f"  Versão    : {info.get('version', '?')}")
+                print(f"  Treinado  : {info.get('trained_at', '?')}")
+                metrics = info.get("metrics", {})
+                if metrics:
+                    print(hline())
+                    print("  " + color("Métricas:", "cyan", "bold"))
+                    for k, v in metrics.items():
+                        if isinstance(v, float):
+                            print(f"    {k:<30s}: {v:.4f}")
+                        else:
+                            print(f"    {k:<30s}: {v}")
+            except Exception as exc:
+                print("  " + badge_warn(f"Erro ao ler metadados: {exc}"))
     except Exception as exc:
-        print("\n  " + badge_err(f"Falha ao executar a rotina do IDS: {exc}"))
+        print("  " + badge_err(f"Erro na avaliação: {exc}"))
         traceback.print_exc()
     pause()
 
 
-def list_available_models() -> None:
-    print_header("IDS > Model Management")
-    section("Modelos disponíveis")
+def _list_available_models() -> None:
+    """Lista todos os artefatos de modelo disponíveis."""
+    print_header("IDS > Modelos Disponíveis")
+    section("Artefatos de modelo")
     model_dir = get_model_dir()
     candidates: list[Path] = []
     if model_dir.exists():
-        patterns = ["*.keras", "*.h5", "*.joblib", "*.pkl", "*.json", "*.yaml", "*.yml"]
-        for pattern in patterns:
+        for pattern in ["*.keras", "*.h5", "*.joblib", "*.pkl", "*.json", "*.yaml", "*.yml"]:
             candidates.extend(model_dir.rglob(pattern))
     candidates = sorted(set(candidates))
 
@@ -730,114 +1159,159 @@ def list_available_models() -> None:
     pause()
 
 
-def show_logs(kind: str = "all") -> None:
-    print_header("IDS > Logs & Audit")
-    section("Logs e auditoria")
-    log_dir = get_logs_dir()
-    if not log_dir.exists():
-        print("  " + badge_warn("Diretório de logs não encontrado."))
-        print(f"  Caminho esperado: {log_dir}")
-        pause()
-        return
+# =============================================================================
+# IDS Submenu — Relatórios
+# =============================================================================
 
-    patterns = {
-        "system": ["*system*.log", "*app*.log", "*.log"],
-        "detection": ["*detect*.log", "*ids*.log", "*.log"],
-        "training": ["*train*.log", "*learn*.log", "*.log"],
-        "all": ["*.log", "*.txt"],
-    }
-    files: list[Path] = []
-    for pattern in patterns.get(kind, ["*.log"]):
-        files.extend(log_dir.rglob(pattern))
-    files = sorted(set(f for f in files if f.is_file()), reverse=True)
+def ids_reports_menu() -> None:
+    while True:
+        print_header("IDS > Relatórios")
+        section("Relatórios do Sistema IDS")
 
-    if not files:
-        print("  " + badge_warn("Nenhum arquivo de log encontrado."))
-        pause()
-        return
+        reports_dir = _ids_reports_dir()
+        html_files = sorted(reports_dir.glob("*.html"), reverse=True) if reports_dir.exists() else []
+        jsonl_files = sorted(reports_dir.glob("*.jsonl"), reverse=True) if reports_dir.exists() else []
 
-    for f in files[:15]:
-        print(f"  • {f.relative_to(log_dir)}  ({human_size(f.stat().st_size)})")
-    print()
-    print("  Últimas linhas do arquivo mais recente:")
+        print(f"  Diretório : {reports_dir}")
+        print(f"  HTML      : {len(html_files)} relatório(s)")
+        print(f"  JSONL     : {len(jsonl_files)} arquivo(s) de incidentes")
+        print(hline())
+        print("  [1] Listar e abrir relatórios HTML")
+        print("  [2] Listar incidentes (JSONL)")
+        print("  [3] Exportar relatórios")
+        print("  [0] Voltar")
+        print()
+
+        choice = menu_choice(["0", "1", "2", "3"])
+
+        if choice == "0":
+            return
+
+        elif choice == "1":
+            if not html_files:
+                print(f"  {color('Nenhum relatório HTML encontrado.', 'dim')}")
+                pause()
+                continue
+            rows = [
+                [f.stem, human_size(f.stat().st_size),
+                 datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")]
+                for f in html_files[:20]
+            ]
+            print_simple_table(["Relatório", "Tamanho", "Gerado"], rows)
+            print()
+            if confirm("Abrir relatório no browser?"):
+                idx_str = prompt(f"Número (1–{min(20, len(html_files))}) [1]: ") or "1"
+                try:
+                    chosen = html_files[int(idx_str) - 1]
+                    opener = "xdg-open" if os.name != "nt" else "start"
+                    subprocess.run([opener, str(chosen)], check=False,
+                                   stderr=subprocess.DEVNULL)
+                    print(f"  Abrindo: {chosen.name}")
+                except Exception as e:
+                    print("  " + badge_err(f"Erro: {e}"))
+            pause()
+
+        elif choice == "2":
+            if not jsonl_files:
+                print(f"  {color('Nenhum arquivo JSONL encontrado.', 'dim')}")
+                pause()
+                continue
+            rows = [
+                [f.name, human_size(f.stat().st_size),
+                 datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")]
+                for f in jsonl_files[:15]
+            ]
+            print_simple_table(["Arquivo", "Tamanho", "Gerado"], rows)
+            pause()
+
+        elif choice == "3":
+            export_dir = ROOT_DIR / "Exports" / time.strftime("reports_%Y%m%d_%H%M%S")
+            export_dir.mkdir(parents=True, exist_ok=True)
+            copied = 0
+            if reports_dir.exists():
+                for f in reports_dir.rglob("*"):
+                    if f.is_file():
+                        dest = export_dir / f.name
+                        shutil.copy2(f, dest)
+                        copied += 1
+            print("  " + badge_ok(f"{copied} arquivo(s) exportados para {export_dir}"))
+            pause()
+
+
+# =============================================================================
+# IDS Submenu — Status do Sistema
+# =============================================================================
+
+def ids_system_status() -> None:
+    """Visão geral completa do sistema IDS."""
+    print_header("IDS > Status")
+    section("Status do Sistema IDS")
+
+    pid_col = _get_pid_file("collector")
+    pid_det = _get_pid_file("detector")
+
+    print(f"  {'Collector':<22s}: {_proc_status_str(pid_col)}")
+    print(f"  {'Detector':<22s}: {_proc_status_str(pid_det)}")
+
+    # Modelo
+    model_file = _ids_model_file()
+    info_file = _ids_model_info_file()
+    if model_file.exists():
+        version, trained_at = "?", "?"
+        if info_file.exists():
+            try:
+                info = json.loads(info_file.read_text(encoding="utf-8"))
+                version = info.get("version", "?")
+                trained_at = info.get("trained_at", "?")[:19]
+            except Exception:
+                pass
+        print(f"  {'Modelo':<22s}: {color(f'v{version} ({trained_at})', 'cyan')}")
+    else:
+        print(f"  {'Modelo':<22s}: {color('Não treinado', 'red')}")
+
+    # Arquivos capturados
+    col_dir = _ids_collector_dir()
+    col_files = list(col_dir.glob("*.parquet")) if col_dir.exists() else []
+    col_size = sum(f.stat().st_size for f in col_files)
+    print(f"  {'Dados capturados':<22s}: {len(col_files)} arquivo(s) | {human_size(col_size)}")
+
+    # Pendentes
+    new_files = _ids_scan_new_files()
+    pending_color = "yellow" if new_files else "dim"
+    print(f"  {'Arquivos pendentes':<22s}: {color(str(len(new_files)), pending_color)}")
+
+    # Relatórios
+    rep_dir = _ids_reports_dir()
+    rep_files = list(rep_dir.glob("*.html")) if rep_dir.exists() else []
+    print(f"  {'Relatórios gerados':<22s}: {len(rep_files)}")
+
+    # Staging
+    staging = _ids_staging_dir()
+    stg_files = list(staging.glob("*.parquet")) if staging.exists() else []
+    print(f"  {'Staging (re-treino)':<22s}: {len(stg_files)} arquivo(s)")
+
     print(hline())
-    try:
-        tail = files[0].read_text(encoding="utf-8", errors="ignore").splitlines()[-20:]
-        for row in tail:
-            print("  " + row[:120])
-    except Exception as exc:
-        print("  " + badge_warn(f"Não foi possível ler o log: {exc}"))
     pause()
 
 
-def export_logs() -> None:
-    print_header("IDS > Logs Export")
-    section("Exportar logs")
-    log_dir = get_logs_dir()
-    if not log_dir.exists():
-        print("  " + badge_warn("Diretório de logs não encontrado."))
-        pause()
-        return
+# =============================================================================
+# IDS Submenu — Diagnósticos
+# =============================================================================
 
-    target_dir = ROOT_DIR / "Exports" / time.strftime("logs_%Y%m%d_%H%M%S")
-    target_dir.mkdir(parents=True, exist_ok=True)
-    copied = 0
-    for f in log_dir.rglob("*"):
-        if f.is_file():
-            dest = target_dir / f.relative_to(log_dir)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(f, dest)
-            copied += 1
-
-    print("  " + badge_ok(f"{copied} arquivo(s) exportados para {target_dir}"))
-    pause()
-
-
-def clean_old_logs() -> None:
-    print_header("IDS > Logs Cleanup")
-    section("Limpeza de logs antigos")
-    log_dir = get_logs_dir()
-    if not log_dir.exists():
-        print("  " + badge_warn("Diretório de logs não encontrado."))
-        pause()
-        return
-
-    days = prompt("Remover logs mais antigos que quantos dias? [30]: ") or "30"
-    try:
-        max_age_days = int(days)
-    except ValueError:
-        print("  " + badge_err("Valor inválido."))
-        pause()
-        return
-
-    cutoff = time.time() - (max_age_days * 86400)
-    removed = 0
-    for f in log_dir.rglob("*"):
-        if f.is_file() and f.stat().st_mtime < cutoff:
-            f.unlink(missing_ok=True)
-            removed += 1
-
-    print("  " + badge_ok(f"{removed} arquivo(s) removidos."))
-    pause()
-
-
-def show_interface_stats() -> None:
-    print_header("IDS > Capture")
-    section("Estatísticas da interface")
+def _show_interface_stats() -> None:
     iface = prompt("Interface de rede (ex: eth0, ens18): ")
     if not iface:
         print("  " + badge_warn("Nenhuma interface informada."))
         pause()
         return
-
     cmd = shutil.which("ip")
     if not cmd:
         print("  " + badge_warn("Comando 'ip' não encontrado no sistema."))
         pause()
         return
-
     try:
-        result = subprocess.run([cmd, "-s", "link", "show", iface], capture_output=True, text=True, check=False)
+        result = subprocess.run([cmd, "-s", "link", "show", iface],
+                                capture_output=True, text=True, check=False)
         print()
         if result.returncode == 0 and result.stdout.strip():
             print(result.stdout)
@@ -851,7 +1325,6 @@ def show_interface_stats() -> None:
 def diagnostics_cpu_gpu() -> None:
     print_header("IDS > Diagnostics")
     section("Diagnóstico de CPU / GPU")
-
     print(f"  Python       : {sys.version.split()[0]}")
     print(f"  CPU cores    : {os.cpu_count()}")
     if hasattr(os, "getloadavg"):
@@ -860,11 +1333,14 @@ def diagnostics_cpu_gpu() -> None:
             print(f"  Load average : {a:.2f} | {b:.2f} | {c:.2f}")
         except Exception:
             pass
-
     nvidia_smi = shutil.which("nvidia-smi")
     if nvidia_smi:
         print("\n  GPU detectada via nvidia-smi:\n")
-        result = subprocess.run([nvidia_smi, "--query-gpu=name,driver_version,memory.total,utilization.gpu", "--format=csv,noheader"], capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            [nvidia_smi, "--query-gpu=name,driver_version,memory.total,utilization.gpu",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, check=False,
+        )
         print(result.stdout or result.stderr)
     else:
         print("\n  " + badge_info("GPU não detectada via nvidia-smi ou ambiente CPU-only."))
@@ -879,22 +1355,18 @@ def diagnostics_disk() -> None:
     test_file = temp_dir / "disk_benchmark.bin"
     size_mb = 64
     payload = os.urandom(1024 * 1024)
-
     try:
         t0 = time.perf_counter()
         with open(test_file, "wb") as fh:
             for _ in range(size_mb):
                 fh.write(payload)
         t1 = time.perf_counter()
-
         with open(test_file, "rb") as fh:
             while fh.read(1024 * 1024):
                 pass
         t2 = time.perf_counter()
-
         write_mbps = size_mb / max(t1 - t0, 1e-6)
         read_mbps = size_mb / max(t2 - t1, 1e-6)
-
         print(f"  Arquivo teste : {test_file}")
         print(f"  Tamanho       : {size_mb} MB")
         print(f"  Escrita       : {write_mbps:.1f} MB/s")
@@ -906,366 +1378,10 @@ def diagnostics_disk() -> None:
     pause()
 
 
-def diagnostics_network() -> None:
-    print_header("IDS > Diagnostics")
-    section("Throughput / counters de interface")
-    show_interface_stats()
-
-
-def diagnostics_datasets() -> None:
-    print_header("IDS > Diagnostics")
-    section("Integridade de datasets")
-    dataset_dir = get_dataset_dir()
-    print(f"  Dataset dir : {dataset_dir}")
-    if not dataset_dir.exists():
-        print("  " + badge_warn("Diretório Base não encontrado."))
-        pause()
-        return
-
-    csvs = dataset_csv_files()
-    if not csvs:
-        print("  " + badge_warn("Nenhum CSV encontrado."))
-    else:
-        print("  " + badge_ok(f"{len(csvs)} CSV(s) encontrados."))
-        for f in csvs[:25]:
-            print(f"    • {f.name:<34} {human_size(f.stat().st_size):>10}")
-        if len(csvs) > 25:
-            print(f"    ... e mais {len(csvs)-25} arquivo(s).")
-    pause()
-
-
-def diagnostics_model_benchmark() -> None:
-    loaded = require_ids_stack()
-    if not loaded:
-        pause()
-        return
-
-    load_evaluator = loaded.get("load_evaluator")
-    if not callable(load_evaluator):
-        print("  " + badge_warn("Avaliador do modelo não disponível."))
-        pause()
-        return
-
-    print_header("IDS > Diagnostics")
-    section("Benchmark do modelo atual")
-    ev = load_evaluator()
-    if ev is None:
-        print("  " + badge_warn("Avaliador indisponível."))
-        pause()
-        return
-
-    version = prompt("Identificador da versão [current]: ") or "current"
-    label = prompt("Descrição [benchmark manual]: ") or "benchmark manual"
-    notes = prompt("Notas [opcional]: ")
-    try:
-        ev.evaluate_model(version, label, notes)
-    except Exception as exc:
-        print("  " + badge_err(f"Falha ao avaliar o modelo: {exc}"))
-        traceback.print_exc()
-    pause()
-
-
-def ids_capture_menu() -> None:
-    while True:
-        print_header("IDS > Packet Capture")
-        section("🛰️  Captura de Pacotes")
-        print("  [1] Iniciar captura em interface")
-        print("  [2] Parar captura")
-        print("  [3] Captura com filtros (IP, porta, VLAN)")
-        print("  [4] Captura contínua (modo sensor)")
-        print("  [5] Importar PCAP externo")
-        print("  [6] Ver estatísticas da interface")
-        print("  [0] Voltar")
-        print()
-        choice = menu_choice(["0", "1", "2", "3", "4", "5", "6"])
-
-        if choice == "0":
-            return
-        elif choice == "1":
-            show_placeholder(
-                "IDS > Packet Capture",
-                "A captura ativa pode ser integrada ao seu coletor atual (ex.: ids_coletor.py).",
-                [
-                    "Use esta opção como ponto central do CLI para iniciar o coletor quando o script definitivo estiver consolidado.",
-                    "Sugestão: integrar subprocess.Popen com PID file em temp/capture.pid.",
-                ],
-            )
-        elif choice == "2":
-            show_placeholder(
-                "IDS > Packet Capture",
-                "Encerramento de captura ainda depende do processo definitivo do coletor.",
-                ["Sugestão: encerrar via PID file e registrar a ação em Logs/."],
-            )
-        elif choice == "3":
-            show_placeholder(
-                "IDS > Packet Capture",
-                "Captura filtrada prevista para BPF/tcpdump/scapy conforme evolução do pipeline.",
-                ["Exemplos futuros: host 10.0.0.1, port 443, vlan 200."],
-            )
-        elif choice == "4":
-            show_placeholder(
-                "IDS > Packet Capture",
-                "Modo sensor previsto para execução contínua do coletor + conversor em pipeline.",
-                ["Ideal para integração com serviço systemd ou container dedicado."],
-            )
-        elif choice == "5":
-            src = prompt("Informe o caminho completo do arquivo PCAP: ")
-            if not src:
-                print("  " + badge_warn("Nenhum arquivo informado."))
-                pause()
-                continue
-            src_path = Path(src).expanduser()
-            if not src_path.exists():
-                print("  " + badge_err("Arquivo não encontrado."))
-                pause()
-                continue
-            dst_dir = ROOT_DIR / "IDS" / "imports"
-            dst_dir.mkdir(parents=True, exist_ok=True)
-            dst_path = dst_dir / src_path.name
-            shutil.copy2(src_path, dst_path)
-            print("  " + badge_ok(f"PCAP importado para {dst_path}"))
-            pause()
-        elif choice == "6":
-            show_interface_stats()
-
-
-def ids_processing_menu() -> None:
-    while True:
-        print_header("IDS > Processing")
-        section("🧪  Processamento e Feature Engineering")
-        print("  [1] Extrair features de PCAP")
-        print("  [2] Normalizar dados")
-        print("  [3] Balancear dataset (SMOTE, undersampling)")
-        print("  [4] Gerar dataset para ML")
-        print("  [5] Visualizar amostras e estatísticas")
-        print("  [0] Voltar")
-        print()
-        choice = menu_choice(["0", "1", "2", "3", "4", "5"])
-
-        if choice == "0":
-            return
-        if choice == "5":
-            diagnostics_datasets()
-        else:
-            descriptions = {
-                "1": "Extração de features prevista para o conversor de fluxo/PCAP do pipeline IDS.",
-                "2": "Normalização deve reaproveitar o mesmo scaler/artefatos usados no treinamento.",
-                "3": "Balanceamento pode reutilizar a estratégia validada nos scripts de testes (SMOTE-ENN, etc.).",
-                "4": "Geração de dataset para ML deve alimentar a trilha de treinamento supervisionado e incremental.",
-            }
-            show_placeholder("IDS > Processing", descriptions[choice])
-
-
-def ids_training_menu() -> None:
-    while True:
-        print_header("IDS > Training")
-        section("🤖  Treinamento de Modelos")
-        print("  [1] Treinar modelo supervisionado")
-        print("  [2] Treinar modelo não supervisionado (anomaly detection)")
-        print("  [3] Treinar modelo incremental / online")
-        print("  [4] Ajustar hiperparâmetros (grid/random search)")
-        print("  [5] Avaliar modelo (accuracy, recall, F1, ROC)")
-        print("  [6] Salvar modelo treinado")
-        print("  [0] Voltar")
-        print()
-        choice = menu_choice(["0", "1", "2", "3", "4", "5", "6"])
-
-        if choice == "0":
-            return
-        elif choice == "3":
-            run_ids_analysis(retrain_after=True)
-        elif choice == "5":
-            loaded = require_ids_stack()
-            if loaded and callable(loaded.get("submenu_avaliacao")):
-                try:
-                    loaded["submenu_avaliacao"]()
-                except Exception as exc:
-                    print("  " + badge_err(f"Falha ao abrir avaliação do modelo: {exc}"))
-                    traceback.print_exc()
-                pause("Pressione ENTER para retornar ao treinamento...")
-            else:
-                show_placeholder("IDS > Training", "Submenu de avaliação ainda não disponível no ambiente atual.")
-        elif choice == "6":
-            print_header("IDS > Training")
-            section("Salvar modelo treinado")
-            print("  " + badge_info("No fluxo atual, o salvamento do modelo é gerenciado pelo pipeline de treinamento / re-treinamento."))
-            print(f"  Diretório de modelos: {get_model_dir()}")
-            pause()
-        else:
-            descriptions = {
-                "1": "Treinamento supervisionado inicial pode ser integrado ao script principal de treinamento do projeto.",
-                "2": "Trilha de anomaly detection prevista para Autoencoder, Isolation Forest, One-Class SVM ou similar.",
-                "4": "Ajuste de hiperparâmetros pode reutilizar Grid Search, Random Search ou Bayesiana dos estudos experimentais.",
-            }
-            show_placeholder("IDS > Training", descriptions[choice])
-
-
-def ids_detection_menu() -> None:
-    while True:
-        print_header("IDS > Detection")
-        section("⚡  Detecção em Tempo Real")
-        print("  [1] Iniciar motor de detecção")
-        print("  [2] Parar motor de detecção")
-        print("  [3] Modo simulação (replay de PCAP)")
-        print("  [4] Ajustar sensibilidade do modelo")
-        print("  [5] Monitorar alertas em tempo real")
-        print("  [0] Voltar")
-        print()
-        choice = menu_choice(["0", "1", "2", "3", "4", "5"])
-
-        if choice == "0":
-            return
-        elif choice == "1":
-            run_ids_analysis(retrain_after=False)
-        elif choice == "5":
-            loaded = require_ids_stack()
-            if loaded and callable(loaded.get("menu_status")):
-                print_header("IDS > Detection")
-                section("Monitor de alertas / status")
-                try:
-                    loaded["menu_status"]()
-                except Exception as exc:
-                    print("  " + badge_err(f"Falha ao abrir status do sistema: {exc}"))
-                    traceback.print_exc()
-                pause()
-            else:
-                show_placeholder("IDS > Detection", "Monitoramento contínuo previsto para dashboards e stream de alertas em tempo real.")
-        else:
-            descriptions = {
-                "2": "Parada do motor será ativada quando o processo de detecção contínua estiver desacoplado em background/service.",
-                "3": "Replay de PCAP previsto para simulação controlada de incidentes e testes de tuning.",
-                "4": "Ajuste de sensibilidade pode ser ligado a thresholds de confiança e severidade do modelo ativo.",
-            }
-            show_placeholder("IDS > Detection", descriptions[choice])
-
-
-def ids_reports_menu() -> None:
-    while True:
-        print_header("IDS > Reports")
-        section("📊  Análise e Relatórios")
-        print("  [1] Relatório de alertas")
-        print("  [2] Relatório de tráfego")
-        print("  [3] Relatório de anomalias detectadas")
-        print("  [4] Relatório de performance do modelo")
-        print("  [5] Exportar relatórios (JSON/CSV)")
-        print("  [0] Voltar")
-        print()
-        choice = menu_choice(["0", "1", "2", "3", "4", "5"])
-
-        if choice == "0":
-            return
-        loaded = require_ids_stack()
-        if loaded and callable(loaded.get("submenu_relatorios")) and choice in {"1", "2", "3", "4"}:
-            try:
-                loaded["submenu_relatorios"]()
-            except Exception as exc:
-                print("  " + badge_err(f"Falha ao abrir o submenu de relatórios: {exc}"))
-                traceback.print_exc()
-            pause("Pressione ENTER para retornar aos relatórios do IDS...")
-        elif choice == "5":
-            export_dir = ROOT_DIR / "Exports" / time.strftime("reports_%Y%m%d_%H%M%S")
-            export_dir.mkdir(parents=True, exist_ok=True)
-            source_dirs = [ROOT_DIR / "IDS" / "reports", get_reports_dir()]
-            copied = 0
-            for source in source_dirs:
-                if not source.exists():
-                    continue
-                for f in source.rglob("*"):
-                    if f.is_file():
-                        dest = export_dir / f.name
-                        shutil.copy2(f, dest)
-                        copied += 1
-            print_header("IDS > Reports")
-            section("Exportação de relatórios")
-            print("  " + badge_ok(f"{copied} arquivo(s) exportados para {export_dir}"))
-            pause()
-        else:
-            show_placeholder("IDS > Reports", "O mecanismo detalhado de relatórios ainda será consolidado com o backend do IDS.")
-
-
-def ids_model_management_menu() -> None:
-    while True:
-        print_header("IDS > Model Management")
-        section("📦  Gerenciamento de Modelos")
-        print("  [1] Listar modelos disponíveis")
-        print("  [2] Carregar modelo ativo")
-        print("  [3] Remover modelo")
-        print("  [4] Comparar modelos")
-        print("  [5] Ver metadados do modelo (dataset, métricas, data)")
-        print("  [0] Voltar")
-        print()
-        choice = menu_choice(["0", "1", "2", "3", "4", "5"])
-
-        if choice == "0":
-            return
-        elif choice == "1":
-            list_available_models()
-        elif choice == "5":
-            print_header("IDS > Model Management")
-            section("Metadados do modelo")
-            model_dir = get_model_dir()
-            info_files = sorted(model_dir.rglob("*.json")) if model_dir.exists() else []
-            if not info_files:
-                print("  " + badge_warn("Nenhum arquivo de metadados encontrado."))
-            else:
-                for f in info_files[:10]:
-                    print(f"  • {f.relative_to(model_dir)}  ({human_size(f.stat().st_size)})")
-            pause()
-        else:
-            descriptions = {
-                "2": "Ativação de modelo prevista para seleção de artefato principal e atualização de ponteiros/symlinks no diretório Model/.",
-                "3": "Remoção de modelo deve ser protegida por confirmação e retenção mínima de versões estáveis.",
-                "4": "Comparação de modelos pode combinar benchmark offline, métricas históricas e custo computacional.",
-            }
-            show_placeholder("IDS > Model Management", descriptions[choice])
-
-
-def ids_system_settings_menu() -> None:
-    while True:
-        print_header("IDS > Settings")
-        section("⚙️  Configurações do Sistema")
-        print("  [1] Configurar interface de captura")
-        print("  [2] Ajustar diretórios (pcap, modelos, logs)")
-        print("  [3] Configurar thresholds de alerta")
-        print("  [4] Configurar retenção de dados")
-        print("  [5] Atualizar dependências")
-        print("  [0] Voltar")
-        print()
-        choice = menu_choice(["0", "1", "2", "3", "4", "5"])
-
-        if choice == "0":
-            return
-        elif choice == "2":
-            loaded = require_ids_stack()
-            if loaded and callable(loaded.get("submenu_configuracoes")):
-                try:
-                    loaded["submenu_configuracoes"]()
-                except Exception as exc:
-                    print("  " + badge_err(f"Falha ao abrir o submenu de configurações: {exc}"))
-                    traceback.print_exc()
-                pause("Pressione ENTER para retornar às configurações do sistema...")
-            else:
-                show_placeholder("IDS > Settings", "Submenu de configurações ainda não está disponível no stack atual.")
-        elif choice == "5":
-            print_header("IDS > Settings")
-            section("Atualização de dependências")
-            print("  Use o instalador do projeto para atualizar o ambiente:")
-            print(f"  • {ROOT_DIR / 'install.sh'}")
-            print("  Ou execute manualmente o gerenciador de pacotes do seu ambiente virtual.")
-            pause()
-        else:
-            descriptions = {
-                "1": "A configuração da interface de captura pode ser persistida em ids_config.py ou em arquivo YAML/JSON de runtime.",
-                "3": "Thresholds de alerta devem refletir confiança mínima, criticidade e políticas de resposta.",
-                "4": "Retenção de dados prevista para capturas, parquet, relatórios e logs históricos.",
-            }
-            show_placeholder("IDS > Settings", descriptions[choice])
-
-
 def ids_diagnostics_menu() -> None:
     while True:
-        print_header("IDS > Diagnostics")
-        section("🛠️  Ferramentas de Diagnóstico")
+        print_header("IDS > Diagnósticos")
+        section("Ferramentas de Diagnóstico")
         print("  [1] Testar performance da CPU/GPU")
         print("  [2] Testar velocidade de leitura do disco")
         print("  [3] Testar throughput da interface de rede")
@@ -1282,20 +1398,38 @@ def ids_diagnostics_menu() -> None:
         elif choice == "2":
             diagnostics_disk()
         elif choice == "3":
-            diagnostics_network()
+            _show_interface_stats()
         elif choice == "4":
-            diagnostics_datasets()
+            print_header("IDS > Diagnostics")
+            section("Integridade de datasets")
+            dataset_dir = get_dataset_dir()
+            print(f"  Dataset dir : {dataset_dir}")
+            if not dataset_dir.exists():
+                print("  " + badge_warn("Diretório Base não encontrado."))
+            else:
+                csvs = dataset_csv_files()
+                if not csvs:
+                    print("  " + badge_warn("Nenhum CSV encontrado."))
+                else:
+                    print("  " + badge_ok(f"{len(csvs)} CSV(s) encontrados."))
+                    for f in csvs[:25]:
+                        print(f"    • {f.name:<34} {human_size(f.stat().st_size):>10}")
+            pause()
         elif choice == "5":
-            diagnostics_model_benchmark()
+            _ids_model_evaluation()
 
+
+# =============================================================================
+# IDS Submenu — Logs
+# =============================================================================
 
 def ids_logs_menu() -> None:
     while True:
         print_header("IDS > Logs")
-        section("📜  Logs e Auditoria")
-        print("  [1] Ver logs do sistema")
-        print("  [2] Ver logs de detecção")
-        print("  [3] Ver logs de treinamento")
+        section("Logs e Auditoria")
+        print("  [1] Ver logs do sistema (App.log)")
+        print("  [2] Ver logs do Collector")
+        print("  [3] Ver logs de treinamento (Learn.log)")
         print("  [4] Exportar logs")
         print("  [5] Limpar logs antigos")
         print("  [0] Voltar")
@@ -1305,54 +1439,143 @@ def ids_logs_menu() -> None:
         if choice == "0":
             return
         elif choice == "1":
-            show_logs("system")
+            print()
+            _tail_log(_ids_log("app"), n=60)
+            pause()
         elif choice == "2":
-            show_logs("detection")
+            print()
+            _tail_log(_ids_log("collector"), n=60)
+            pause()
         elif choice == "3":
-            show_logs("training")
+            print()
+            _tail_log(_ids_log("learn"), n=100)
+            pause()
         elif choice == "4":
-            export_logs()
+            log_dir = get_logs_dir()
+            if not log_dir.exists():
+                print("  " + badge_warn("Diretório de logs não encontrado."))
+                pause()
+                continue
+            target_dir = ROOT_DIR / "Exports" / time.strftime("logs_%Y%m%d_%H%M%S")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            copied = 0
+            for f in log_dir.rglob("*"):
+                if f.is_file():
+                    dest = target_dir / f.relative_to(log_dir)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(f, dest)
+                    copied += 1
+            print("  " + badge_ok(f"{copied} arquivo(s) exportados para {target_dir}"))
+            pause()
         elif choice == "5":
-            clean_old_logs()
+            log_dir = get_logs_dir()
+            if not log_dir.exists():
+                print("  " + badge_warn("Diretório de logs não encontrado."))
+                pause()
+                continue
+            days = prompt("Remover logs mais antigos que quantos dias? [30]: ") or "30"
+            try:
+                max_age_days = int(days)
+            except ValueError:
+                print("  " + badge_err("Valor inválido."))
+                pause()
+                continue
+            cutoff = time.time() - (max_age_days * 86400)
+            removed = 0
+            for f in log_dir.rglob("*"):
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink(missing_ok=True)
+                    removed += 1
+            print("  " + badge_ok(f"{removed} arquivo(s) removidos."))
+            pause()
 
+
+# =============================================================================
+# IDS Submenu — Configurações
+# =============================================================================
+
+def ids_settings_menu() -> None:
+    while True:
+        print_header("IDS > Configurações")
+        section("Configurações do Sistema")
+        print(f"  Interface captura : {_ids_capture_interface()}")
+        print(f"  Budget diário     : {_ids_collector_budget():.1f} GiB")
+        print(f"  Collector dir     : {_ids_collector_dir()}")
+        print(f"  Model dir         : {get_model_dir()}")
+        print(f"  Reports dir       : {_ids_reports_dir()}")
+        print(f"  Logs dir          : {get_logs_dir()}")
+        print(f"  Staging dir       : {_ids_staging_dir()}")
+        print(hline())
+        print("  [1] Atualizar dependências")
+        print("  [2] Recriar diretórios do projeto")
+        print("  [0] Voltar")
+        print()
+
+        choice = menu_choice(["0", "1", "2"])
+
+        if choice == "0":
+            return
+        elif choice == "1":
+            print("  Use o instalador do projeto para atualizar o ambiente:")
+            print(f"  • {ROOT_DIR / 'install.sh'}")
+            print("  Ou execute manualmente o gerenciador de pacotes do seu ambiente virtual.")
+            pause()
+        elif choice == "2":
+            _ids_ensure_dirs()
+            print("  " + badge_ok("Diretórios recriados/verificados."))
+            pause()
+
+
+# =============================================================================
+# IDS — Menu Principal
+# =============================================================================
 
 def ids_menu() -> None:
     while True:
         print_header("IDS")
-        section("🎯 MENU PRINCIPAL — IDS com IA/ML")
-        print("  [1] Captura de Pacotes")
-        print("  [2] Processamento e Feature Engineering")
-        print("  [3] Treinamento de Modelos")
-        print("  [4] Detecção em Tempo Real")
-        print("  [5] Análise e Relatórios")
-        print("  [6] Gerenciamento de Modelos")
-        print("  [7] Configurações do Sistema")
-        print("  [8] Ferramentas de Diagnóstico")
-        print("  [9] Logs e Auditoria")
+        section("MENU PRINCIPAL — IDS com IA/ML")
+
+        # Mini-status inline
+        pid_col = _get_pid_file("collector")
+        pid_det = _get_pid_file("detector")
+        new_files = _ids_scan_new_files()
+
+        print(f"  Collector: {_proc_status_str(pid_col)}   "
+              f"Detector: {_proc_status_str(pid_det)}")
+        if new_files:
+            print(f"  {color(f'⚠  {len(new_files)} arquivo(s) pendente(s) para análise', 'yellow', 'bold')}")
+        print(hline())
+
+        print("  [1] Captura de Pacotes       (Collector)")
+        print("  [2] Detecção de Incidentes   (Detector)")
+        print("  [3] Treinamento de Modelos   (Train / Fine-tune)")
+        print("  [4] Relatórios               (HTML / JSONL)")
+        print("  [5] Status do Sistema")
+        print("  [6] Ferramentas de Diagnóstico")
+        print("  [7] Logs e Auditoria")
+        print("  [8] Configurações")
         print("  [0] Voltar")
         print()
-        choice = menu_choice(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"])
+        choice = menu_choice(["0", "1", "2", "3", "4", "5", "6", "7", "8"])
 
         if choice == "0":
             return
         elif choice == "1":
             ids_capture_menu()
         elif choice == "2":
-            ids_processing_menu()
+            ids_detection_menu()
         elif choice == "3":
             ids_training_menu()
         elif choice == "4":
-            ids_detection_menu()
-        elif choice == "5":
             ids_reports_menu()
+        elif choice == "5":
+            ids_system_status()
         elif choice == "6":
-            ids_model_management_menu()
-        elif choice == "7":
-            ids_system_settings_menu()
-        elif choice == "8":
             ids_diagnostics_menu()
-        elif choice == "9":
+        elif choice == "7":
             ids_logs_menu()
+        elif choice == "8":
+            ids_settings_menu()
 
 
 # -----------------------------------------------------------------------------
