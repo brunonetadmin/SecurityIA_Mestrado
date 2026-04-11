@@ -168,6 +168,80 @@ def safe_import_attr(module_name: str, attr_name: str) -> Any | None:
 CONFIG = safe_import("config")
 
 
+def _config_obj() -> Any | None:
+    """Retorna o namespace mais útil do config.py, suportando formatos antigo e novo."""
+    if CONFIG is None:
+        return None
+    for attr in ("Config", "IDSConfig"):
+        obj = getattr(CONFIG, attr, None)
+        if obj is not None:
+            return obj
+    return CONFIG
+
+
+def _config_path(*names: str) -> Path | None:
+    """Obtém um Path do módulo config ou da classe Config/IDSConfig, se existir."""
+    candidates = []
+    if CONFIG is not None:
+        candidates.append(CONFIG)
+    cfg_obj = _config_obj()
+    if cfg_obj is not None and cfg_obj is not CONFIG:
+        candidates.append(cfg_obj)
+
+    for holder in candidates:
+        for name in names:
+            value = getattr(holder, name, None)
+            if value:
+                try:
+                    return Path(value)
+                except TypeError:
+                    continue
+    return None
+
+
+def _prefer_tests_reports(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    normalized = str(path).replace('\\', '/').lower()
+    if normalized.endswith('/tests/reports') or normalized.endswith('/tests/reports/'):
+        return path
+    return None
+
+
+def _normalize_dataset_dir(path: Path | None) -> Path:
+    """
+    Garante que o dataset seja sempre buscado no diretório real do projeto:
+    Base/CSE-CIC-IDS2018. Se receber a pasta Base, desce automaticamente.
+    """
+    canonical = ROOT_DIR / 'Base' / 'CSE-CIC-IDS2018'
+    if path is None:
+        return canonical
+
+    p = Path(path)
+    if p.name.lower() == 'cse-cic-ids2018':
+        return p
+
+    if p.name.lower() == 'base':
+        nested = p / 'CSE-CIC-IDS2018'
+        return nested if nested.exists() or not any(p.glob('*.csv')) else nested
+
+    nested = p / 'CSE-CIC-IDS2018'
+    if nested.exists():
+        return nested
+
+    return p
+
+
+def dataset_csv_files() -> list[Path]:
+    dataset_dir = get_dataset_dir()
+    if not dataset_dir.exists():
+        return []
+    return sorted(
+        p for p in dataset_dir.iterdir()
+        if p.is_file() and p.suffix.lower() == '.csv'
+    )
+
+
 # -----------------------------------------------------------------------------
 # Test/analysis integration
 # -----------------------------------------------------------------------------
@@ -181,37 +255,48 @@ TEST_MODULES: Dict[int, Tuple[str, str]] = {
 
 
 def get_reports_dir() -> Path:
-    if CONFIG and hasattr(CONFIG, "REPORTS_DIR"):
-        return Path(CONFIG.REPORTS_DIR)
-    return ROOT_DIR / "Tests" / "Reports"
+    report_dirs = getattr(CONFIG, 'REPORT_DIRS', None) if CONFIG else None
+    if isinstance(report_dirs, dict) and report_dirs:
+        try:
+            first = Path(next(iter(report_dirs.values())))
+            return first.parent
+        except Exception:
+            pass
+
+    for path in (
+        _prefer_tests_reports(_config_path('TEST_REPORTS_DIR')),
+        _prefer_tests_reports(_config_path('REPORTS_DIR')),
+    ):
+        if path is not None:
+            return path
+
+    return ROOT_DIR / 'Tests' / 'Reports'
 
 
 def get_dataset_dir() -> Path:
-    if CONFIG and hasattr(CONFIG, "DATASET_DIR"):
-        return Path(CONFIG.DATASET_DIR)
-    return ROOT_DIR / "Base"
+    configured = _config_path('DATA_DIR', 'DATASET_DIR')
+    return _normalize_dataset_dir(configured)
 
 
 def get_model_dir() -> Path:
-    model_dir = ROOT_DIR / "Model"
-    return model_dir
+    return _config_path('MODEL_DIR') or (ROOT_DIR / 'Model')
 
 
 def get_logs_dir() -> Path:
-    return ROOT_DIR / "Logs"
+    return _config_path('LOGS_DIR', 'LOG_DIR') or (ROOT_DIR / 'Logs')
 
 
 def dataset_available() -> bool:
-    dataset_dir = get_dataset_dir()
-    return dataset_dir.exists() and any(dataset_dir.glob("*.csv"))
+    return len(dataset_csv_files()) > 0
 
 
 def dataset_status() -> str:
     dataset_dir = get_dataset_dir()
+    csvs = dataset_csv_files()
+    if csvs:
+        return badge_ok(f"{len(csvs)} arquivo(s) CSV encontrados em {dataset_dir.name}")
     if dataset_dir.exists():
-        csvs = list(dataset_dir.glob("*.csv"))
-        if csvs:
-            return badge_ok(f"{len(csvs)} arquivo(s) CSV encontrados")
+        return badge_warn(f"Dataset real não encontrado em {dataset_dir}")
     return badge_warn("Dataset real não encontrado")
 
 
@@ -317,6 +402,11 @@ def show_environment_config() -> None:
             CONFIG.print_config()
         except Exception as exc:
             print("  " + badge_warn(f"Não foi possível exibir a configuração detalhada: {exc}"))
+    elif (cfg_obj := _config_obj()) is not None and hasattr(cfg_obj, "summary"):
+        try:
+            print(cfg_obj.summary())
+        except Exception as exc:
+            print("  " + badge_warn(f"Não foi possível exibir o resumo da configuração: {exc}"))
     else:
         print(f"  Dataset dir : {get_dataset_dir()}")
         print(f"  Reports dir : {get_reports_dir()}")
@@ -350,29 +440,32 @@ def manage_dataset() -> None:
         if choice == "0":
             return
         if choice == "1":
-            if CONFIG and hasattr(CONFIG, "verificar_dataset"):
+            verifier = getattr(CONFIG, "verificar_dataset", None) if CONFIG else None
+            if callable(verifier):
                 try:
-                    available = CONFIG.verificar_dataset(interativo=True)
+                    available = verifier(interativo=True)
                     print()
                     print("  " + (badge_ok("Dataset validado com sucesso.") if available else badge_warn("Dataset não validado.")))
                 except Exception as exc:
                     print("  " + badge_err(f"Falha ao verificar dataset: {exc}"))
                     traceback.print_exc()
             else:
-                print("  " + badge_warn("Função verificar_dataset() não encontrada em config.py."))
+                csvs = dataset_csv_files()
+                print("  " + (badge_ok(f"Dataset disponível com {len(csvs)} CSV(s).") if csvs else badge_warn("Nenhum CSV encontrado no diretório esperado.")))
             pause()
         elif choice == "2":
-            if CONFIG and hasattr(CONFIG, "_instrucoes_manuais"):
+            instructions = getattr(CONFIG, "_instrucoes_manuais", None) if CONFIG else None
+            if callable(instructions):
                 try:
-                    CONFIG._instrucoes_manuais()
+                    instructions()
                 except Exception as exc:
                     print("  " + badge_err(f"Falha ao exibir instruções: {exc}"))
             else:
-                print("  " + badge_info("Baixe o dataset correto e extraia os CSVs para a pasta Base/."))
+                print("  " + badge_info("Baixe o dataset correto e extraia os CSVs para a pasta Base/CSE-CIC-IDS2018/."))
             pause()
         elif choice == "3":
             dataset_dir = get_dataset_dir()
-            csvs = sorted(dataset_dir.glob("*.csv")) if dataset_dir.exists() else []
+            csvs = dataset_csv_files()
             if not csvs:
                 print("\n  " + badge_warn("Nenhum CSV encontrado."))
             else:
@@ -744,11 +837,11 @@ def diagnostics_datasets() -> None:
     dataset_dir = get_dataset_dir()
     print(f"  Dataset dir : {dataset_dir}")
     if not dataset_dir.exists():
-        print("  " + badge_warn("Diretório Base não encontrado."))
+        print("  " + badge_warn("Diretório do dataset não encontrado."))
         pause()
         return
 
-    csvs = sorted(dataset_dir.glob("*.csv"))
+    csvs = dataset_csv_files()
     if not csvs:
         print("  " + badge_warn("Nenhum CSV encontrado."))
     else:

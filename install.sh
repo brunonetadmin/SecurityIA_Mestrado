@@ -70,11 +70,11 @@ sep
 # § 1 — Dependências do sistema
 # ==============================================================================
 log "Atualizando índice APT …"
-apt-get update -qq
+apt-get update
 
 log "Instalando dependências do sistema …"
 apt-get install -y --no-install-recommends \
-  python3.11 python3.11-dev python3.11-venv python3-pip \
+  python3 python3-dev python3-venv python3-pip \
   build-essential gcc g++ \
   libpcap-dev libpcap0.8 \
   tcpdump net-tools ethtool \
@@ -83,8 +83,7 @@ apt-get install -y --no-install-recommends \
   git curl wget \
   logrotate \
   procps lsof \
-  numactl \
-  >/dev/null 2>&1
+  numactl
 
 ok "Dependências do sistema instaladas."
 
@@ -93,13 +92,13 @@ ok "Dependências do sistema instaladas."
 # ==============================================================================
 if $DO_VENV; then
   log "Criando ambiente virtual em '$VENV_DIR' …"
-  python3.11 -m venv "$VENV_DIR"
+  python3 -m venv "$VENV_DIR"
   PYTHON="$VENV_DIR/bin/python"
   PIP="$VENV_DIR/bin/pip"
   chown -R "$REAL_USER:$REAL_USER" "$VENV_DIR"
   ok "Ambiente virtual criado."
 else
-  PYTHON="$(which python3.11 || which python3)"
+  PYTHON="$(which python3 || which python3)"
   PIP="$(which pip3)"
   warn "--no-venv: usando Python do sistema: $PYTHON"
 fi
@@ -111,37 +110,26 @@ fi
 # ==============================================================================
 log "Instalando dependências Python …"
 
-"$PIP" install --no-deps -q \
-  numpy>=1.24.0,\<2.0.0 \
-  pandas>=2.0.0 \
-  pyarrow>=14.0.0 \
-  scipy>=1.11.0
+PY_DEPS=(
+  "numpy>=1.24.0,<2.0.0"
+  "pandas>=2.0.0"
+  "pyarrow>=14.0.0"
+  "scipy>=1.11.0"
+  "scikit-learn>=1.4.0"
+  "imbalanced-learn>=0.12.0"
+  "joblib>=1.3.0"
+  "tensorflow-cpu>=2.15.0"
+  "keras>=3.0.0"
+  "scapy>=2.5.0"
+  "matplotlib>=3.7.0"
+  "seaborn>=0.13.0"
+  "optuna>=3.5.0"
+  "shap>=0.44.0"
+  "psutil>=5.9.0"
+  "tqdm>=4.66.0"
+)
 
-"$PIP" install -q \
-  scikit-learn>=1.4.0 \
-  imbalanced-learn>=0.12.0 \
-  joblib>=1.3.0
-
-"$PIP" install -q \
-  tensorflow-cpu>=2.15.0 \
-  keras>=3.0.0
-
-"$PIP" install -q \
-  scapy>=2.5.0
-
-"$PIP" install -q \
-  matplotlib>=3.7.0 \
-  seaborn>=0.13.0
-
-"$PIP" install -q \
-  optuna>=3.5.0
-
-"$PIP" install -q \
-  shap>=0.44.0
-
-"$PIP" install -q \
-  psutil>=5.9.0 \
-  tqdm>=4.66.0
+"$PIP" install -q "${PY_DEPS[@]}"
 
 ok "Dependências Python instaladas."
 

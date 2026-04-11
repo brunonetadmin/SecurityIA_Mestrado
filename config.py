@@ -352,3 +352,24 @@ class Config:
 
 # Alias para compatibilidade com scripts antigos que importam IDSConfig
 IDSConfig = Config
+
+# Relatórios de TESTES (não usar o REPORTS_DIR do IDS aqui)
+TEST_REPORTS_DIR = Config.TESTS_DIR / "Reports"
+REPORTS_DIR      = TEST_REPORTS_DIR
+
+REPORT_DIRS = {
+    1: REPORTS_DIR / "Relatorio_1_Arquiteturas",
+    2: REPORTS_DIR / "Relatorio_2_Balanceamento",
+    3: REPORTS_DIR / "Relatorio_3_Teoria_Informacao",
+    4: REPORTS_DIR / "Relatorio_4_Otimizacao_Validacao",
+}
+
+REPORT_NAMES = {
+    1: "Análise Comparativa de Arquiteturas de Redes Neurais",
+    2: "Análise de Estratégias de Balanceamento de Classes",
+    3: "Análise da Aplicabilidade da Teoria da Informação",
+    4: "Análise de Estratégias de Otimização e Validação",
+}
+
+def print_config() -> None:
+    print(Config.summary())
