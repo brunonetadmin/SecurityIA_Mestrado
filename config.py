@@ -137,9 +137,12 @@ class Config:
         "validation_split": 0.15,
         "test_split": 0.15,
         "epochs": 50,
-        "batch_size": 1024,
+        "batch_size": 4096,
         "patience": 10,
         "force_retrain": False,
+        # Agrupa N steps em uma única chamada ao backend — reduz overhead
+        # Python entre batches. Seguro para CPU; valor conservador.
+        "steps_per_execution": 8,
     }
 
     FINE_TUNING_CONFIG = {
@@ -196,8 +199,8 @@ class Config:
     }
 
     CPU_CONFIG = {
-        "inter_op_threads": 4,
-        "intra_op_threads": 16,
+        "inter_op_threads": 2,
+        "intra_op_threads": 20,
     }
 
     VIZ_CONFIG = {

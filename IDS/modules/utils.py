@@ -58,7 +58,7 @@ def setup_logger(
     datefmt: str = "%Y-%m-%d %H:%M:%S",
     max_bytes: int = 50 * 1024 * 1024,
     backup_count: int = 5,
-    to_stdout: bool = True,
+    to_stdout: bool = _TTY,
 ) -> logging.Logger:
     """
     Cria (ou recupera) um logger com RotatingFileHandler + StreamHandler.
@@ -253,9 +253,15 @@ def run_background(
         fh = open(log_file, "a", encoding="utf-8")
         kwargs.update(stdout=fh, stderr=fh)
     else:
+        fh = None
         kwargs.update(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     proc = subprocess.Popen(cmd, **kwargs)
+
+    # Fecha o file handle no processo pai — o filho herda o fd aberto
+    if fh is not None:
+        fh.close()
+
     return proc
 
 

@@ -414,11 +414,14 @@ class ModelTrainer:
         out = Dense(n_classes, activation="softmax", name="output")(x)
 
         self.model = Model(inp, out, name="SecurityIA_BiLSTM_Bahdanau")
+        spe = Config.TRAINING_CONFIG.get("steps_per_execution", 1)
         self.model.compile(
             optimizer=Adam(learning_rate=cfg["learning_rate"]),
             loss=cfg["loss_function"],
             metrics=cfg["metrics"],
+            steps_per_execution=spe,
         )
+        log.info(f"steps_per_execution={spe}")
         self.model.summary(print_fn=log.info)
 
         # Diagrama da arquitetura
@@ -453,8 +456,9 @@ class ModelTrainer:
         X_tr_r  = X_tr.reshape(len(X_tr),   X_tr.shape[1],  1)
         X_val_r = X_val.reshape(len(X_val),  X_val.shape[1], 1)
 
-        epochs  = ft_cfg["epochs"]  if finetune else cfg["epochs"]
+        epochs   = ft_cfg["epochs"]  if finetune else cfg["epochs"]
         patience = ft_cfg["patience"] if finetune else cfg["patience"]
+        bs       = cfg["batch_size"]
 
         callbacks = [
             EarlyStopping(monitor="val_loss", patience=patience,
@@ -464,15 +468,32 @@ class ModelTrainer:
                               min_lr=1e-7, verbose=1),
         ]
 
+        # ── tf.data pipeline: prefetch sobrepõe preparação com computação ──
+        AUTOTUNE = tf.data.AUTOTUNE
+        shuffle_buf = min(len(X_tr_r), 100_000)
+
+        ds_train = (
+            tf.data.Dataset.from_tensor_slices((X_tr_r, y_tr))
+            .shuffle(shuffle_buf, seed=cfg["random_state"])
+            .batch(bs, drop_remainder=False)
+            .prefetch(AUTOTUNE)
+        )
+        ds_val = (
+            tf.data.Dataset.from_tensor_slices((X_val_r, y_val))
+            .batch(bs, drop_remainder=False)
+            .prefetch(AUTOTUNE)
+        )
+
         log.info(f"{'Fine-tuning' if finetune else 'Treinamento'} iniciado — "
-                 f"épocas={epochs} batch={cfg['batch_size']}")
+                 f"épocas={epochs} batch={bs} "
+                 f"steps/epoch={len(X_tr_r) // bs + 1} "
+                 f"prefetch=AUTOTUNE shuffle_buf={shuffle_buf:,}")
         t0 = time.time()
 
         self.history = self.model.fit(
-            X_tr_r, y_tr,
-            validation_data=(X_val_r, y_val),
+            ds_train,
+            validation_data=ds_val,
             epochs=epochs,
-            batch_size=cfg["batch_size"],
             callbacks=callbacks,
             verbose=1,
         )
@@ -481,7 +502,8 @@ class ModelTrainer:
 
     def evaluate(self, X_te: np.ndarray, y_te: np.ndarray) -> np.ndarray:
         X_r = X_te.reshape(len(X_te), X_te.shape[1], 1)
-        return np.argmax(self.model.predict(X_r, verbose=0), axis=1)
+        bs  = Config.EVALUATION_CONFIG.get("batch_size", 4096)
+        return np.argmax(self.model.predict(X_r, batch_size=bs, verbose=0), axis=1)
 
     def save(self) -> None:
         mp = Config.MODEL_DIR / Config.MODEL_FILENAME
