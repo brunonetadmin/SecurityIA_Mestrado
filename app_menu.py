@@ -168,78 +168,30 @@ def safe_import_attr(module_name: str, attr_name: str) -> Any | None:
 CONFIG = safe_import("config")
 
 
-def _config_obj() -> Any | None:
-    """Retorna o namespace mais útil do config.py, suportando formatos antigo e novo."""
+def _config_candidates() -> list[Any]:
+    candidates: list[Any] = []
     if CONFIG is None:
-        return None
+        return candidates
+
+    candidates.append(CONFIG)
     for attr in ("Config", "IDSConfig"):
         obj = getattr(CONFIG, attr, None)
-        if obj is not None:
-            return obj
-    return CONFIG
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+    return candidates
 
 
-def _config_path(*names: str) -> Path | None:
-    """Obtém um Path do módulo config ou da classe Config/IDSConfig, se existir."""
-    candidates = []
-    if CONFIG is not None:
-        candidates.append(CONFIG)
-    cfg_obj = _config_obj()
-    if cfg_obj is not None and cfg_obj is not CONFIG:
-        candidates.append(cfg_obj)
-
-    for holder in candidates:
+def get_config_attr(*names: str, default: Any = None) -> Any:
+    for candidate in _config_candidates():
         for name in names:
-            value = getattr(holder, name, None)
-            if value:
-                try:
-                    return Path(value)
-                except TypeError:
-                    continue
-    return None
+            if hasattr(candidate, name):
+                return getattr(candidate, name)
+    return default
 
 
-def _prefer_tests_reports(path: Path | None) -> Path | None:
-    if path is None:
-        return None
-    normalized = str(path).replace('\\', '/').lower()
-    if normalized.endswith('/tests/reports') or normalized.endswith('/tests/reports/'):
-        return path
-    return None
-
-
-def _normalize_dataset_dir(path: Path | None) -> Path:
-    """
-    Garante que o dataset seja sempre buscado no diretório real do projeto:
-    Base/CSE-CIC-IDS2018. Se receber a pasta Base, desce automaticamente.
-    """
-    canonical = ROOT_DIR / 'Base' / 'CSE-CIC-IDS2018'
-    if path is None:
-        return canonical
-
-    p = Path(path)
-    if p.name.lower() == 'cse-cic-ids2018':
-        return p
-
-    if p.name.lower() == 'base':
-        nested = p / 'CSE-CIC-IDS2018'
-        return nested if nested.exists() or not any(p.glob('*.csv')) else nested
-
-    nested = p / 'CSE-CIC-IDS2018'
-    if nested.exists():
-        return nested
-
-    return p
-
-
-def dataset_csv_files() -> list[Path]:
-    dataset_dir = get_dataset_dir()
-    if not dataset_dir.exists():
-        return []
-    return sorted(
-        p for p in dataset_dir.iterdir()
-        if p.is_file() and p.suffix.lower() == '.csv'
-    )
+def get_config_callable(*names: str) -> Callable[..., Any] | None:
+    value = get_config_attr(*names, default=None)
+    return value if callable(value) else None
 
 
 # -----------------------------------------------------------------------------
@@ -254,58 +206,129 @@ TEST_MODULES: Dict[int, Tuple[str, str]] = {
 }
 
 
+def get_tests_dir() -> Path:
+    tests_dir = get_config_attr("TESTS_DIR", default=None)
+    if tests_dir is not None:
+        return Path(tests_dir)
+    return ROOT_DIR / "Tests"
+
+
+def ensure_tests_path() -> Path:
+    tests_dir = get_tests_dir()
+    if tests_dir.exists():
+        resolved = str(tests_dir.resolve())
+        if resolved not in sys.path:
+            sys.path.insert(0, resolved)
+    return tests_dir
+
+
 def get_reports_dir() -> Path:
-    report_dirs = getattr(CONFIG, 'REPORT_DIRS', None) if CONFIG else None
-    if isinstance(report_dirs, dict) and report_dirs:
+    report_dirs = get_config_attr("REPORT_DIRS", default=None)
+    if report_dirs:
         try:
-            first = Path(next(iter(report_dirs.values())))
-            return first.parent
+            sample = next(iter(report_dirs.values()))
+            return Path(sample).parent
         except Exception:
             pass
 
-    for path in (
-        _prefer_tests_reports(_config_path('TEST_REPORTS_DIR')),
-        _prefer_tests_reports(_config_path('REPORTS_DIR')),
-    ):
-        if path is not None:
-            return path
+    explicit = get_config_attr("TEST_REPORTS_DIR", default=None)
+    if explicit is not None:
+        return Path(explicit)
 
-    return ROOT_DIR / 'Tests' / 'Reports'
+    tests_dir = get_config_attr("TESTS_DIR", default=None)
+    if tests_dir is not None:
+        return Path(tests_dir) / "Reports"
+
+    legacy = get_config_attr("REPORTS_DIR", default=None)
+    if legacy is not None:
+        legacy_path = Path(legacy)
+        if legacy_path.name.lower() == "reports" and legacy_path.parent.name == "Tests":
+            return legacy_path
+
+    return get_tests_dir() / "Reports"
 
 
 def get_dataset_dir() -> Path:
-    configured = _config_path('DATA_DIR', 'DATASET_DIR')
-    return _normalize_dataset_dir(configured)
+    dataset_dir = get_config_attr("DATA_DIR", "DATASET_DIR", default=None)
+    if dataset_dir is not None:
+        return Path(dataset_dir)
+    return ROOT_DIR / "Base" / "CSE-CIC-IDS2018"
 
 
 def get_model_dir() -> Path:
-    return _config_path('MODEL_DIR') or (ROOT_DIR / 'Model')
+    model_dir = get_config_attr("MODEL_DIR", default=None)
+    if model_dir is not None:
+        return Path(model_dir)
+    return ROOT_DIR / "Model"
 
 
 def get_logs_dir() -> Path:
-    return _config_path('LOGS_DIR', 'LOG_DIR') or (ROOT_DIR / 'Logs')
+    logs_dir = get_config_attr("LOGS_DIR", default=None)
+    if logs_dir is not None:
+        return Path(logs_dir)
+    return ROOT_DIR / "Logs"
+
+
+def get_temp_dir() -> Path:
+    temp_dir = get_config_attr("TEMP_DIR", default=None)
+    if temp_dir is not None:
+        return Path(temp_dir)
+    return ROOT_DIR / "Temp"
+
+
+def dataset_csv_files() -> list[Path]:
+    dataset_dir = get_dataset_dir()
+    if not dataset_dir.exists():
+        return []
+    return sorted(p for p in dataset_dir.glob("*.csv") if p.is_file())
+
+
+EXPECTED_DATASET_FILES = [
+    "bot.csv",
+    "brute force -web.csv",
+    "brute force -xss.csv",
+    "ddos attack-hoic.csv",
+    "ddos attack-loic-udp.csv",
+    "ddos attacks-loic-http.csv",
+    "dos attacks-goldeneye.csv",
+    "dos attacks-hulk.csv",
+    "dos attacks-slowhttptest.csv",
+    "dos attacks-slowloris.csv",
+    "ftp-bruteforce.csv",
+    "infilteration.csv",
+    "sql injection.csv",
+    "ssh-bruteforce.csv",
+]
+
+
+def dataset_validation() -> tuple[bool, list[str], list[Path]]:
+    csvs = dataset_csv_files()
+    names = {p.name.strip().lower() for p in csvs}
+    missing = [name for name in EXPECTED_DATASET_FILES if name not in names]
+    return len(missing) == 0, missing, csvs
 
 
 def dataset_available() -> bool:
-    return len(dataset_csv_files()) > 0
+    ok, _, csvs = dataset_validation()
+    return ok or bool(csvs)
 
 
 def dataset_status() -> str:
-    dataset_dir = get_dataset_dir()
-    csvs = dataset_csv_files()
+    ok, missing, csvs = dataset_validation()
+    if ok:
+        return badge_ok(f"Dataset validado ({len(csvs)} CSVs)")
     if csvs:
-        return badge_ok(f"{len(csvs)} arquivo(s) CSV encontrados em {dataset_dir.name}")
-    if dataset_dir.exists():
-        return badge_warn(f"Dataset real não encontrado em {dataset_dir}")
+        return badge_warn(f"Dataset parcial ({len(csvs)} CSVs, faltando {len(missing)})")
     return badge_warn("Dataset real não encontrado")
 
 
 def report_status(analysis_id: int) -> str:
     reports_dir = get_reports_dir()
+    report_dirs = get_config_attr("REPORT_DIRS", default=None)
     rdir = reports_dir / f"Relatorio_{analysis_id}_{TEST_MODULES[analysis_id][0].split('_', 2)[-1].title()}"
-    if CONFIG and hasattr(CONFIG, "REPORT_DIRS"):
+    if report_dirs:
         try:
-            rdir = Path(CONFIG.REPORT_DIRS[analysis_id])
+            rdir = Path(report_dirs[analysis_id])
         except Exception:
             pass
     md = rdir / f"Relatorio_{analysis_id}.md"
@@ -328,11 +351,14 @@ def execute_test_analysis(analysis_id: int) -> bool:
     print(f"  Relatório: {get_reports_dir()}")
 
     try:
+        tests_dir = ensure_tests_path()
         mod = importlib.import_module(mod_name)
         importlib.reload(mod)
         fn = getattr(mod, "executar")
     except Exception as exc:
         print("\n  " + badge_err(f"Falha ao carregar o módulo {mod_name}: {exc}"))
+        print(f"  Tests dir : {tests_dir if 'tests_dir' in locals() else get_tests_dir()}")
+        print(f"  sys.path  : {sys.path[:6]}")
         traceback.print_exc()
         return False
 
@@ -397,20 +423,30 @@ def show_environment_config() -> None:
     print_header("Tests > Environment")
     section("Configuração ativa do ambiente de testes")
 
-    if CONFIG and hasattr(CONFIG, "print_config"):
+    print_config_fn = get_config_callable("print_config")
+    summary_fn = get_config_callable("summary")
+
+    if print_config_fn:
         try:
-            CONFIG.print_config()
+            print_config_fn()
         except Exception as exc:
             print("  " + badge_warn(f"Não foi possível exibir a configuração detalhada: {exc}"))
-    elif (cfg_obj := _config_obj()) is not None and hasattr(cfg_obj, "summary"):
+            if summary_fn:
+                try:
+                    print(summary_fn())
+                except Exception:
+                    pass
+    elif summary_fn:
         try:
-            print(cfg_obj.summary())
+            print(summary_fn())
         except Exception as exc:
             print("  " + badge_warn(f"Não foi possível exibir o resumo da configuração: {exc}"))
     else:
+        print(f"  Tests dir   : {get_tests_dir()}")
         print(f"  Dataset dir : {get_dataset_dir()}")
         print(f"  Reports dir : {get_reports_dir()}")
         print(f"  Model dir   : {get_model_dir()}")
+        print(f"  Logs dir    : {get_logs_dir()}")
 
     print("\n  Dependências opcionais:")
     for pkg in ["scikit-optimize", "tabulate", "scipy"]:
@@ -440,31 +476,39 @@ def manage_dataset() -> None:
         if choice == "0":
             return
         if choice == "1":
-            verifier = getattr(CONFIG, "verificar_dataset", None) if CONFIG else None
-            if callable(verifier):
+            verify_fn = get_config_callable("verificar_dataset")
+            if verify_fn:
                 try:
-                    available = verifier(interativo=True)
+                    available = verify_fn(interativo=True)
                     print()
                     print("  " + (badge_ok("Dataset validado com sucesso.") if available else badge_warn("Dataset não validado.")))
                 except Exception as exc:
                     print("  " + badge_err(f"Falha ao verificar dataset: {exc}"))
                     traceback.print_exc()
             else:
-                csvs = dataset_csv_files()
-                print("  " + (badge_ok(f"Dataset disponível com {len(csvs)} CSV(s).") if csvs else badge_warn("Nenhum CSV encontrado no diretório esperado.")))
+                ok, missing, csvs = dataset_validation()
+                print()
+                if ok:
+                    print("  " + badge_ok(f"Dataset validado com sucesso. {len(csvs)} CSV(s) encontrados."))
+                elif csvs:
+                    print("  " + badge_warn(f"Dataset parcial detectado. {len(csvs)} CSV(s) encontrados."))
+                    print("  Arquivos ausentes esperados:")
+                    for name in missing:
+                        print(f"    • {name}")
+                else:
+                    print("  " + badge_warn("Nenhum CSV encontrado no dataset."))
             pause()
         elif choice == "2":
-            instructions = getattr(CONFIG, "_instrucoes_manuais", None) if CONFIG else None
-            if callable(instructions):
+            manual_fn = get_config_callable("_instrucoes_manuais")
+            if manual_fn:
                 try:
-                    instructions()
+                    manual_fn()
                 except Exception as exc:
                     print("  " + badge_err(f"Falha ao exibir instruções: {exc}"))
             else:
                 print("  " + badge_info("Baixe o dataset correto e extraia os CSVs para a pasta Base/CSE-CIC-IDS2018/."))
             pause()
         elif choice == "3":
-            dataset_dir = get_dataset_dir()
             csvs = dataset_csv_files()
             if not csvs:
                 print("\n  " + badge_warn("Nenhum CSV encontrado."))
@@ -793,7 +837,7 @@ def diagnostics_cpu_gpu() -> None:
 def diagnostics_disk() -> None:
     print_header("IDS > Diagnostics")
     section("Teste simples de escrita/leitura em disco")
-    temp_dir = ROOT_DIR / "temp"
+    temp_dir = get_temp_dir()
     temp_dir.mkdir(exist_ok=True)
     test_file = temp_dir / "disk_benchmark.bin"
     size_mb = 64
@@ -837,7 +881,7 @@ def diagnostics_datasets() -> None:
     dataset_dir = get_dataset_dir()
     print(f"  Dataset dir : {dataset_dir}")
     if not dataset_dir.exists():
-        print("  " + badge_warn("Diretório do dataset não encontrado."))
+        print("  " + badge_warn("Diretório Base não encontrado."))
         pause()
         return
 
@@ -1321,3 +1365,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\n  " + badge_warn("Execução interrompida pelo usuário."))
         print()
+
