@@ -316,5 +316,10 @@ def main():
         print("=" * 62)
 
 
+def executar(dataset_disponivel: bool = True, **kwargs) -> None:
+    """Entry-point usado pelo app_menu.py."""
+    main()
+
+
 if __name__ == "__main__":
     main()
