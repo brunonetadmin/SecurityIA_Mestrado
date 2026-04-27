@@ -67,7 +67,7 @@ def build_model(n_feat, n_cls, optimizer):
     x = Dense(LSTM_DENSE_UNITS, activation="relu")(x)
     out = Dense(n_cls, activation="softmax")(x)
     m = Model(inp, out)
-    m.compile(optimizer, "sparse_categorical_crossentropy", ["accuracy"])
+    m.compile(optimizer=optimizer, loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     return m
 
 

@@ -77,7 +77,7 @@ def build_lstm(n_feat, n_cls):
     x = Dropout(DROPOUT_RATE)(x)
     out = Dense(n_cls, activation="softmax")(x)
     m = Model(inp, out, name="LSTM")
-    m.compile(Adam(LEARNING_RATE_INITIAL), "sparse_categorical_crossentropy",
+    m.compile(optimizer=Adam(LEARNING_RATE_INITIAL), loss="sparse_categorical_crossentropy", metrics=
               ["accuracy"])
     return m
 
@@ -89,7 +89,7 @@ def build_bilstm(n_feat, n_cls):
     x = Dropout(DROPOUT_RATE)(x)
     out = Dense(n_cls, activation="softmax")(x)
     m = Model(inp, out, name="Bi-LSTM")
-    m.compile(Adam(LEARNING_RATE_INITIAL), "sparse_categorical_crossentropy",
+    m.compile(optimizer=Adam(LEARNING_RATE_INITIAL), loss="sparse_categorical_crossentropy", metrics=
               ["accuracy"])
     return m
 
@@ -103,7 +103,7 @@ def build_bilstm_attention(n_feat, n_cls):
     x = Dense(LSTM_DENSE_UNITS, activation="relu")(x)
     out = Dense(n_cls, activation="softmax")(x)
     m = Model(inp, out, name="Bi-LSTM+Atencao")
-    m.compile(Adam(LEARNING_RATE_INITIAL), "sparse_categorical_crossentropy",
+    m.compile(optimizer=Adam(LEARNING_RATE_INITIAL), loss="sparse_categorical_crossentropy", metrics=
               ["accuracy"])
     return m
 
@@ -120,7 +120,7 @@ def build_transformer(n_feat, n_cls):
     x = Dense(LSTM_DENSE_UNITS, activation="relu")(x)
     out = Dense(n_cls, activation="softmax")(x)
     m = Model(inp, out, name="Transformer")
-    m.compile(Adam(LEARNING_RATE_INITIAL), "sparse_categorical_crossentropy",
+    m.compile(optimizer=Adam(LEARNING_RATE_INITIAL), loss="sparse_categorical_crossentropy", metrics=
               ["accuracy"])
     return m
 

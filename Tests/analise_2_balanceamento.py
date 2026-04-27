@@ -94,7 +94,7 @@ def build_model(n_feat, n_cls, class_counts):
     x = Dropout(0.25)(x)
     out = Dense(n_cls, activation="softmax")(x)
     m = Model(inp, out)
-    m.compile(Adam(1e-3), focal_loss(class_counts), ["accuracy"])
+    m.compile(optimizer=Adam(1e-3), loss=focal_loss(class_counts), metrics=["accuracy"])
     return m
 
 
