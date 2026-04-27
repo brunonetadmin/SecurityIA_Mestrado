@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-SecurityIA — Configuração central compatível com:
-  - nova arquitetura do projeto (Base/CSE-CIC-IDS2018, Model, IDS, Reports, Temp)
-  - scripts legados de testes em Tests/
-  - app_menu.py
+SecurityIA — Configuração central (atualizada)
 
-Este arquivo mantém uma API moderna via Config/IDSConfig e, ao mesmo tempo,
-expõe aliases legados em nível de módulo para evitar quebrar os scripts de
-análise acadêmica.
+Inclui:
+  - Particionamento ANTES do balanceamento (correção D1: leakage)
+  - Focal Loss reponderada (correção D2)
+  - Balanceamento adaptativo Borderline-SMOTE-2 (correção D3)
+  - Configuração para baseline RF
+  - Métricas operacionais ampliadas (FPR, MCC, AUC-PR, alarmes/h)
+  - Compatibilidade total com scripts legados (Tests/, app_menu.py)
 """
 
 from __future__ import annotations
@@ -41,15 +42,12 @@ class Config:
     LOGS_DIR = BASE_DIR / "Logs"
     TEMP_DIR = BASE_DIR / "Temp"
 
-    # Relatórios do IDS (HTML / operação)
     IDS_REPORTS_DIR = BASE_DIR / "Reports"
     REPORTS_DIR = IDS_REPORTS_DIR
-
-    # Relatórios dos testes acadêmicos
     TEST_REPORTS_DIR = TESTS_DIR / "Reports"
 
     # ------------------------------------------------------------------
-    # Configuração de logs / operação IDS
+    # Logs
     # ------------------------------------------------------------------
     LOG_APP = LOGS_DIR / "App.log"
     LOG_COLLECTOR = LOGS_DIR / "Collector.log"
@@ -118,6 +116,9 @@ class Config:
         "ig_discretization_bins": 10,
     }
 
+    # ------------------------------------------------------------------
+    # MODEL_CONFIG — agora com Focal Loss reponderada
+    # ------------------------------------------------------------------
     MODEL_CONFIG = {
         "lstm_units_1": 128,
         "lstm_units_2": 64,
@@ -126,12 +127,19 @@ class Config:
         "dropout_rate": 0.5,
         "recurrent_dropout_rate": 0.0,
         "learning_rate": 1e-3,
-        "loss_function": "sparse_categorical_crossentropy",
+        # Função de perda: 'focal_loss_cb' aciona reponderação por número
+        # efetivo de amostras (Cui et al., 2019); 'sparse_ce' usa
+        # sparse_categorical_crossentropy clássico.
+        "loss_function": "focal_loss_cb",
+        "focal_gamma": 2.0,
+        "focal_class_balanced_beta": 0.9999,
         "metrics": ["accuracy"],
-        # Mantemos 100 para compatibilidade com os testes acadêmicos
         "sequence_length": 100,
     }
 
+    # ------------------------------------------------------------------
+    # TRAINING_CONFIG — particionamento antes do balanceamento (D1)
+    # ------------------------------------------------------------------
     TRAINING_CONFIG = {
         "random_state": 42,
         "validation_split": 0.15,
@@ -140,9 +148,11 @@ class Config:
         "batch_size": 4096,
         "patience": 10,
         "force_retrain": False,
-        # Agrupa N steps em uma única chamada ao backend — reduz overhead
-        # Python entre batches. Seguro para CPU; valor conservador.
         "steps_per_execution": 8,
+        # Correções de protocolo:
+        "split_before_balancing": True,   # OBRIGATÓRIO — corrige leakage
+        "use_class_weight": True,         # ativa class_weight no fit
+        "balance_only_train": True,       # balanceia somente o treino
     }
 
     FINE_TUNING_CONFIG = {
@@ -152,9 +162,26 @@ class Config:
         "patience": 5,
     }
 
+    # ------------------------------------------------------------------
+    # BALANCING_CONFIG — Borderline-SMOTE-2 adaptativo (D3)
+    # ------------------------------------------------------------------
     BALANCING_CONFIG = {
-        "smote_k_neighbors": 5,
+        # 'adaptive_borderline' | 'classic_smote_enn' | 'none'
+        "strategy": "adaptive_borderline",
+        # Borderline-SMOTE-2 (Han et al., 2005)
+        "borderline_kind": "borderline-2",
+        "smote_k_neighbors_max": 11,
+        "smote_k_alpha": 0.25,
+        # ENN
         "enn_n_neighbors": 3,
+        "enn_kind_sel": "mode",
+        # Proporção-alvo por classe minoritária
+        "target_ratio_per_class": 5,
+        "max_fraction_of_majority": 0.10,
+        # Undersampling da majoritária
+        "majority_undersample_factor": 1.5,
+        # Compatibilidade legada (consumida pelo método balance() antigo)
+        "smote_k_neighbors": 5,
         "n_samples_minority": 50_000,
         "n_samples_majority": 150_000,
     }
@@ -190,12 +217,37 @@ class Config:
         "flag_file": TEMP_DIR / "RETRAIN_READY.flag",
     }
 
+    # ------------------------------------------------------------------
+    # EVALUATION_CONFIG — métricas operacionais ampliadas (L2)
+    # ------------------------------------------------------------------
     EVALUATION_CONFIG = {
         "eval_dir": TEMP_DIR / "evaluation",
         "benchmark_fraction": 0.10,
         "history_file": TEMP_DIR / "evaluation" / "eval_history.json",
         "significance_alpha": 0.001,
         "batch_size": 4096,
+        # Métricas estendidas
+        "compute_fpr_per_class": True,
+        "compute_mcc": True,
+        "compute_auc_pr": True,
+        "compute_alarm_rate": True,
+        "lambda_benign_per_hour": 1_000_000,
+        # Comparação contra baseline
+        "compare_against_baseline": True,
+    }
+
+    # ------------------------------------------------------------------
+    # BASELINE_CONFIG — Random Forest (M0)
+    # ------------------------------------------------------------------
+    BASELINE_CONFIG = {
+        "model_filename": "baseline_rf.pkl",
+        "n_estimators": 500,
+        "max_depth": 20,
+        "min_samples_split": 5,
+        "min_samples_leaf": 2,
+        "class_weight": "balanced_subsample",
+        "n_jobs": -1,
+        "random_state": 42,
     }
 
     CPU_CONFIG = {
@@ -223,16 +275,12 @@ class Config:
     @classmethod
     def ensure_dirs(cls) -> None:
         dirs = [
-            cls.DATA_DIR,
-            cls.MODEL_DIR,
-            cls.LOGS_DIR,
-            cls.TEMP_DIR,
-            cls.IDS_REPORTS_DIR,
-            cls.TESTS_DIR,
-            cls.TEST_REPORTS_DIR,
+            cls.DATA_DIR, cls.MODEL_DIR, cls.LOGS_DIR, cls.TEMP_DIR,
+            cls.IDS_REPORTS_DIR, cls.TESTS_DIR, cls.TEST_REPORTS_DIR,
             cls.COLLECTOR_DIR,
             cls.RETRAIN_CONFIG["staging_dir"],
             cls.EVALUATION_CONFIG["eval_dir"],
+            cls.MODEL_DIR / "registry",
         ]
         for d in dirs:
             Path(d).mkdir(parents=True, exist_ok=True)
@@ -293,6 +341,10 @@ class Config:
             f"  LSTM units           : {cls.MODEL_CONFIG['lstm_units_1']} / {cls.MODEL_CONFIG['lstm_units_2']}",
             f"  Dropout              : {cls.MODEL_CONFIG['dropout_rate']}",
             f"  Atenção              : {cls.MODEL_CONFIG['attention_units']}",
+            f"  Função de perda      : {cls.MODEL_CONFIG['loss_function']}",
+            f"  Estratégia balanc.   : {cls.BALANCING_CONFIG['strategy']}",
+            f"  Split antes balanc.  : {cls.TRAINING_CONFIG['split_before_balancing']}",
+            f"  class_weight no fit  : {cls.TRAINING_CONFIG['use_class_weight']}",
             sep,
         ])
 
@@ -300,7 +352,7 @@ class Config:
 IDSConfig = Config
 
 # =============================================================================
-# API LEGADA PARA OS TESTES ACADÊMICOS
+# API LEGADA PARA OS TESTES ACADÊMICOS (Tests/analise_*.py)
 # =============================================================================
 
 ROOT_DIR = Config.ROOT_DIR
@@ -313,7 +365,6 @@ LOGS_DIR = Config.LOGS_DIR
 TEMP_DIR = Config.TEMP_DIR
 IDS_REPORTS_DIR = Config.IDS_REPORTS_DIR
 TEST_REPORTS_DIR = Config.TEST_REPORTS_DIR
-# Para scripts legados, REPORTS_DIR deve apontar para os relatórios de testes.
 REPORTS_DIR = TEST_REPORTS_DIR
 
 REPORT_NAMES = {
@@ -382,7 +433,14 @@ PLOT_DPI = Config.VIZ_CONFIG["dpi"]
 FIG_TITLE_FS = 11
 PLOT_PALETTE = "deep"
 
-# Dataset cleaned realmente esperado na pasta Base/CSE-CIC-IDS2018/
+# Aliases novos
+FOCAL_GAMMA = Config.MODEL_CONFIG["focal_gamma"]
+FOCAL_CB_BETA = Config.MODEL_CONFIG["focal_class_balanced_beta"]
+SMOTE_K_MAX = Config.BALANCING_CONFIG["smote_k_neighbors_max"]
+SMOTE_K_ALPHA = Config.BALANCING_CONFIG["smote_k_alpha"]
+TARGET_RATIO = Config.BALANCING_CONFIG["target_ratio_per_class"]
+BASELINE_FILENAME = Config.BASELINE_CONFIG["model_filename"]
+
 DATASET_FILES = [
     "bot.csv",
     "brute force -web.csv",
@@ -435,15 +493,34 @@ def apply_plot_style() -> None:
 
 
 def fig_path(analise_id: int, nome: str) -> Path:
-    path = REPORT_DIRS[analise_id] / "figuras" / f"{nome}.png"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+    """
+    Caminho VERSIONADO para figuras dos testes acadêmicos.
+    O nome é gerado com sufixo _YYYYMMDD-N pelo módulo
+    IDS.modules.versioning, permitindo comparar execuções consecutivas.
+    """
+    base = REPORT_DIRS[analise_id] / "figuras"
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        from IDS.modules.versioning import versioned_path
+        return versioned_path(base, nome, "png")
+    except ImportError:
+        # Fallback caso o módulo de versionamento ainda não exista
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+        return base / f"{nome}_{ts}.png"
 
 
 def tab_path(analise_id: int, nome: str) -> Path:
-    path = REPORT_DIRS[analise_id] / "tabelas" / f"{nome}.csv"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+    """Caminho VERSIONADO para tabelas dos testes acadêmicos."""
+    base = REPORT_DIRS[analise_id] / "tabelas"
+    base.mkdir(parents=True, exist_ok=True)
+    try:
+        from IDS.modules.versioning import versioned_path
+        return versioned_path(base, nome, "csv")
+    except ImportError:
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime("%Y%m%d-%H%M%S")
+        return base / f"{nome}_{ts}.csv"
 
 
 def print_config() -> None:
@@ -460,7 +537,6 @@ def _dataset_presente() -> tuple[bool, list[str]]:
     csvs = _dataset_csvs()
     if not csvs:
         return False, DATASET_FILES.copy()
-
     existentes = {p.name.strip().lower() for p in csvs}
     ausentes = [f for f in DATASET_FILES if f.lower() not in existentes]
     return len(ausentes) == 0, ausentes
@@ -482,15 +558,12 @@ def verificar_dataset(interativo: bool = True) -> bool:
         csvs = _dataset_csvs()
         print(f"  ✓ Dataset encontrado: {len(csvs)} arquivo(s) CSV em {DATASET_DIR}")
         return True
-
     print(f"\n  ⚠ Dataset real não encontrado em: {DATASET_DIR}")
     if ausentes:
         print(f"  Arquivos ausentes: {len(ausentes)} de {len(DATASET_FILES)}")
-
     if not interativo:
         print("  Modo não-interativo: prosseguindo com dados sintéticos.")
         return False
-
     _instrucoes_manuais()
     return False
 
@@ -527,16 +600,12 @@ def carregar_dataset_real(n_amostras_max: int = 500_000):
             df = pd.read_csv(csv, low_memory=False)
             if df.empty:
                 continue
-
             label_col = _resolve_label_column(df)
             if label_col is None:
-                # fallback: usa o nome do arquivo como rótulo
                 df["Label"] = csv.stem
                 label_col = "Label"
-
             if len(df) > amostras_por_arquivo:
                 df = df.sample(amostras_por_arquivo, random_state=RANDOM_SEED)
-
             frames.append(df)
         except Exception as exc:
             print(f"  ⚠ Falha ao ler {csv.name}: {exc}")
@@ -547,16 +616,15 @@ def carregar_dataset_real(n_amostras_max: int = 500_000):
     df_all = pd.concat(frames, ignore_index=True)
     label_col = _resolve_label_column(df_all) or "Label"
 
-    # Mantém apenas colunas numéricas e remove rótulo/meta textual.
     y_raw = df_all[label_col].astype(str).fillna("unknown")
-    X_df = df_all.drop(columns=[c for c in [label_col, "Timestamp", "Flow ID", "Src IP", "Dst IP"] if c in df_all.columns], errors="ignore")
+    X_df = df_all.drop(columns=[c for c in [label_col, "Timestamp", "Flow ID", "Src IP", "Dst IP"]
+                                if c in df_all.columns], errors="ignore")
     X_df = X_df.select_dtypes(include=["number"]).replace([float("inf"), float("-inf")], 0).fillna(0)
 
     if X_df.empty:
         print("  ⚠ Dataset real lido, mas sem colunas numéricas utilizáveis.")
         return None
 
-    # Ajusta número de features para o esperado pelos testes.
     if X_df.shape[1] >= N_FEATURES:
         X_df = X_df.iloc[:, :N_FEATURES]
     else:
@@ -585,7 +653,13 @@ class Relatorio:
         self.id = self.analise_id
         self.titulo = REPORT_NAMES[self.id]
         self.dir = REPORT_DIRS[self.id]
-        self.arquivo = self.dir / f"Relatorio_{self.id}.md"
+        # Arquivo do relatório também versionado
+        try:
+            from IDS.modules.versioning import versioned_path
+            self.arquivo = versioned_path(self.dir, f"Relatorio_{self.id}", "md")
+        except ImportError:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            self.arquivo = self.dir / f"Relatorio_{self.id}_{ts}.md"
         self.linhas: list[str] = []
         self._cabecalho()
 
@@ -631,6 +705,7 @@ class Relatorio:
 
     def figura(self, nome: str, legenda: str = ""):
         caption = legenda or nome
+        # Para evitar referência inválida, mantém apenas o nome curto
         self.linhas += [f"![{caption}](figuras/{nome}.png)", ""]
         return self
 
@@ -641,5 +716,5 @@ class Relatorio:
         return self.arquivo
 
 
-# Garante diretórios no import para evitar erro ao salvar figuras/tabelas.
+# Garante diretórios no import
 setup_environment()
