@@ -1,33 +1,30 @@
 """
-analise_3_teoria_informacao.py
-==============================
-Compara 6 estratégias de seleção de features sobre dados reais
-(CSE-CIC-IDS2018), com Bi-LSTM+Atenção+Focal Loss+Borderline-SMOTE-2 Adapt.
-fixos. Justifica IG+MI ponderado (60/40) com 23 features no IDS.
-
-Saída: TESTES → RESULTADOS → IDS  (IG+MI 60/40, k=23)
+analise_3_teoria_informacao.py — Seleção de Features sobre dados reais
 """
-
 import os, sys, time, math, warnings
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from collections import Counter
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-warnings.filterwarnings("ignore")
-
 from config import (
     RANDOM_SEED, BATCH_SIZE,
     fig_path, tab_path, Relatorio, apply_plot_style,
     verificar_dataset, carregar_dataset_real,
 )
+from _test_logging import get_logger, log_exception
 
 import tensorflow as tf
+from tensorflow.keras import backend as K
 from tensorflow.keras.layers import Input, LSTM, Bidirectional, Dense, Dropout
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
@@ -54,9 +51,8 @@ ANALISE_ID = 3
 EPOCHS = 10
 PATIENCE = 4
 K_SELECT = 23
+log = get_logger(ANALISE_ID, "analise_3")
 
-
-# ─── Bi-LSTM+Atenção+Focal (idêntica ao IDS) ───────────────────────────────
 
 class BahdanauAttention(tf.keras.layers.Layer):
     def __init__(self, units=64, **kw):
@@ -93,14 +89,14 @@ def build_model(n_feat, n_cls, class_counts):
     x = Dense(32, activation="relu")(x)
     x = Dropout(0.25)(x)
     out = Dense(n_cls, activation="softmax")(x)
-    m = Model(inp, out)
-    m.compile(optimizer=Adam(1e-3), loss=focal_loss(class_counts), metrics=["accuracy"])
+    m = Model(inp, out, name="BiLSTM_Atencao")
+    m.compile(optimizer=Adam(1e-3),
+              loss=focal_loss(class_counts), metrics=["accuracy"])
     return m
 
 
-# ─── Balanceamento adaptativo (igual ao IDS) ───────────────────────────────
-
 def balance_adaptive(X, y):
+    """Borderline-SMOTE-2 adaptativo (IDS). Sem n_jobs."""
     dist = Counter(y)
     n_maj = max(dist.values())
     maj = max(dist, key=dist.get)
@@ -114,15 +110,13 @@ def balance_adaptive(X, y):
     k_med = max(1, int(np.median(ks)))
     Xr, yr = BorderlineSMOTE(sampling_strategy=strat, k_neighbors=k_med,
                               kind="borderline-2",
-                              random_state=RANDOM_SEED, n_jobs=-1).fit_resample(X, y)
+                              random_state=RANDOM_SEED).fit_resample(X, y)
     t_maj = min(int(1.5 * max(strat.values())), dist[maj])
     Xr, yr = RandomUnderSampler(sampling_strategy={maj: t_maj},
                                  random_state=RANDOM_SEED).fit_resample(Xr, yr)
-    Xr, yr = EditedNearestNeighbours(n_neighbors=3, n_jobs=-1).fit_resample(Xr, yr)
+    Xr, yr = EditedNearestNeighbours(n_neighbors=3).fit_resample(Xr, yr)
     return Xr, yr
 
-
-# ─── Estratégias de seleção ────────────────────────────────────────────────
 
 def information_gain(X, y, n_bins=10):
     counts = np.bincount(y.astype(int))
@@ -131,6 +125,8 @@ def information_gain(X, y, n_bins=10):
     ig = np.zeros(X.shape[1])
     for i in range(X.shape[1]):
         col = X[:, i]
+        if col.max() == col.min():
+            continue
         bins = np.linspace(col.min(), col.max(), n_bins + 1)
         digi = np.clip(np.digitize(col, bins[:-1]) - 1, 0, n_bins - 1)
         h_c = 0.0
@@ -151,20 +147,21 @@ def sel_none(X, y, k):
 
 def sel_ig(X, y, k):
     ig = information_gain(X, y)
-    return np.argsort(ig)[::-1][:k]
+    return np.argsort(ig)[::-1][:min(k, X.shape[1])]
 
 def sel_mi(X, y, k):
     mi = mutual_info_classif(X, y, random_state=RANDOM_SEED)
-    return np.argsort(mi)[::-1][:k]
+    return np.argsort(mi)[::-1][:min(k, X.shape[1])]
 
 def sel_chi2(X, y, k):
     Xp = MinMaxScaler().fit_transform(X)
     sk = SelectKBest(chi2, k=min(k, X.shape[1])).fit(Xp, y)
-    return np.argsort(sk.scores_)[::-1][:k]
+    return np.argsort(sk.scores_)[::-1][:min(k, X.shape[1])]
 
 def sel_anova(X, y, k):
     sk = SelectKBest(f_classif, k=min(k, X.shape[1])).fit(X, y)
-    return np.argsort(sk.scores_)[::-1][:k]
+    scores = np.nan_to_num(sk.scores_, nan=0.0)
+    return np.argsort(scores)[::-1][:min(k, X.shape[1])]
 
 def sel_ig_mi_60_40(X, y, k):
     """Estratégia oficial do IDS — IG+MI ponderado 60/40."""
@@ -174,7 +171,7 @@ def sel_ig_mi_60_40(X, y, k):
     ig_n = (ig - ig.min()) / (ig.max() - ig.min() + eps)
     mi_n = (mi - mi.min()) / (mi.max() - mi.min() + eps)
     s = 0.6 * ig_n + 0.4 * mi_n
-    return np.argsort(s)[::-1][:k]
+    return np.argsort(s)[::-1][:min(k, X.shape[1])]
 
 
 ESTRATEGIAS = {
@@ -183,11 +180,9 @@ ESTRATEGIAS = {
     "MI_puro":           sel_mi,
     "Chi2":              sel_chi2,
     "ANOVA_F":           sel_anova,
-    "IG+MI_60/40":       sel_ig_mi_60_40,
+    "IG+MI_60_40":       sel_ig_mi_60_40,
 }
 
-
-# ─── Avaliação ─────────────────────────────────────────────────────────────
 
 def metricas(y_true, y_pred):
     cm = confusion_matrix(y_true, y_pred)
@@ -197,26 +192,31 @@ def metricas(y_true, y_pred):
         tn = cm.sum() - cm[c, :].sum() - cm[:, c].sum() + cm[c, c]
         fpr_pc.append(fp / (fp + tn) if (fp + tn) else 0.0)
     return {
-        "acuracia": accuracy_score(y_true, y_pred),
-        "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
-        "f1_weighted": f1_score(y_true, y_pred, average="weighted", zero_division=0),
-        "precision_macro": precision_score(y_true, y_pred, average="macro", zero_division=0),
-        "recall_macro": recall_score(y_true, y_pred, average="macro", zero_division=0),
-        "mcc": matthews_corrcoef(y_true, y_pred),
+        "acuracia": float(accuracy_score(y_true, y_pred)),
+        "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "f1_weighted": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
+        "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
+        "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+        "mcc": float(matthews_corrcoef(y_true, y_pred)),
         "fpr_macro": float(np.mean(fpr_pc)),
     }
 
 
 def avaliar(X_tr, X_te, y_tr, y_te, n_cls, nome, fn_sel, k):
+    K.clear_session()
+    tf.random.set_seed(RANDOM_SEED)
     t0 = time.time()
+    log.info(f"  selecionando features ({nome})…")
     idx = fn_sel(X_tr, y_tr, k)
+    log.info(f"  selecionadas {len(idx)} features de {X_tr.shape[1]}")
     Xs_tr = X_tr[:, idx]; Xs_te = X_te[:, idx]
     Xb, yb = balance_adaptive(Xs_tr, y_tr)
     cc = np.maximum(np.bincount(yb.astype(int), minlength=n_cls), 1)
     m = build_model(Xb.shape[1], n_cls, cc)
     Xt = Xb.reshape(-1, Xb.shape[1], 1)
     Xv = Xs_te.reshape(-1, Xs_te.shape[1], 1)
-    m.fit(Xt, yb, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0,
+    log.info(f"  fit {nome}: epochs<={EPOCHS} batch={BATCH_SIZE}")
+    m.fit(Xt, yb, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=2,
           validation_split=0.15,
           callbacks=[EarlyStopping(patience=PATIENCE, restore_best_weights=True)])
     yp = np.argmax(m.predict(Xv, verbose=0), axis=1)
@@ -227,94 +227,107 @@ def avaliar(X_tr, X_te, y_tr, y_te, n_cls, nome, fn_sel, k):
     return r
 
 
-# ─── Main ──────────────────────────────────────────────────────────────────
-
 def main():
     Relatorio(ANALISE_ID)
-    print(f"\n  ANÁLISE 3 — Seleção de Features (dados reais, IDS-stack fixa, k={K_SELECT})")
+    log.info(f"ANÁLISE 3 — Seleção de Features (k={K_SELECT})")
 
     if not verificar_dataset(interativo=False):
-        print("  ⚠ Dataset real ausente — análise abortada.")
+        log.error("Dataset real ausente — análise abortada.")
         return
-    dados = carregar_dataset_real(n_amostras_max=120_000)
+    try:
+        dados = carregar_dataset_real(n_amostras_max=120_000)
+    except Exception as e:
+        log_exception(log, "carregar_dataset_real", e); return
     if dados is None:
-        print("  ⚠ Falha ao carregar dataset real.")
-        return
+        log.error("Falha ao carregar dataset real."); return
     X, y, _ = dados
+
     sc = StandardScaler()
     X = sc.fit_transform(X)
     X_tr, X_te, y_tr, y_te = train_test_split(
         X, y, test_size=0.2, stratify=y, random_state=RANDOM_SEED)
     n_cls = len(np.unique(y))
-    print(f"  Treino={len(X_tr)} Teste={len(X_te)} Classes={n_cls} "
-          f"Features_disponiveis={X.shape[1]}")
+    log.info(f"Treino={len(X_tr)} Teste={len(X_te)} Classes={n_cls} "
+             f"Features={X.shape[1]}")
 
     res = []
     for nome, fn in ESTRATEGIAS.items():
-        print(f"\n    [{nome}]")
+        log.info(f">>> {nome}")
         try:
             r = avaliar(X_tr, X_te, y_tr, y_te, n_cls, nome, fn, K_SELECT)
             res.append(r)
-            print(f"      F1={r['f1_macro']:.4f}  Recall={r['recall_macro']:.4f}  "
-                  f"FPR={r['fpr_macro']:.4f}  MCC={r['mcc']:.4f}  t={r['tempo_s']:.1f}s")
+            log.info(f"{nome} OK F1={r['f1_macro']:.4f} Recall={r['recall_macro']:.4f} "
+                     f"FPR={r['fpr_macro']:.4f} MCC={r['mcc']:.4f} t={r['tempo_s']:.1f}s")
         except Exception as e:
-            print(f"      ✗ falhou: {e}")
+            log_exception(log, nome, e)
+            res.append({"estrategia": nome, "erro": str(e)})
 
-    print(f"\n    [Baseline_RF — referência (todas as features)]")
-    rf = RandomForestClassifier(n_estimators=300, n_jobs=-1,
-                                 random_state=RANDOM_SEED,
-                                 class_weight="balanced_subsample")
-    rf.fit(X_tr, y_tr)
-    yp_rf = rf.predict(X_te)
-    r_rf = metricas(y_te, yp_rf); r_rf["estrategia"] = "Baseline_RF"
-    res.append(r_rf)
-    print(f"      F1={r_rf['f1_macro']:.4f}  Recall={r_rf['recall_macro']:.4f}  "
-          f"FPR={r_rf['fpr_macro']:.4f}")
+    log.info(">>> Baseline_RF (referência, todas as features)")
+    try:
+        rf = RandomForestClassifier(n_estimators=300, n_jobs=-1,
+                                     random_state=RANDOM_SEED,
+                                     class_weight="balanced_subsample")
+        rf.fit(X_tr, y_tr)
+        yp_rf = rf.predict(X_te)
+        r_rf = metricas(y_te, yp_rf); r_rf["estrategia"] = "Baseline_RF"
+        res.append(r_rf)
+        log.info(f"Baseline_RF F1={r_rf['f1_macro']:.4f} Recall={r_rf['recall_macro']:.4f} "
+                 f"FPR={r_rf['fpr_macro']:.4f}")
+    except Exception as e:
+        log_exception(log, "Baseline_RF", e)
+        r_rf = None
 
     df = pd.DataFrame(res)
     csv_path = tab_path(ANALISE_ID, "metricas_selecao")
     df.to_csv(csv_path, index=False)
-    print(f"\n  Tabela: {csv_path}")
+    log.info(f"Tabela: {csv_path}")
 
-    # Figura
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    for ax, (col, lbl) in zip(axes.flat,
-                              [("recall_macro", "Recall-macro (PRIMÁRIO)"),
-                               ("f1_macro", "F1-macro"),
-                               ("fpr_macro", "FPR-macro"),
-                               ("mcc", "MCC")]):
-        sns.barplot(data=df, x="estrategia", y=col, ax=ax, palette="rocket")
-        ax.set_title(lbl); ax.set_xlabel("")
-        ax.tick_params(axis="x", rotation=30)
-        for c in ax.containers:
-            ax.bar_label(c, fmt="%.3f", fontsize=8)
-    fig.suptitle(f"Análise 3 — Seleção de Features (k={K_SELECT})",
-                 fontsize=12, fontweight="bold")
-    fig.tight_layout()
-    p = fig_path(ANALISE_ID, "comparativo_selecao")
-    fig.savefig(p, dpi=300); plt.close(fig)
-    print(f"  Figura: {p}")
+    try:
+        df_v = df[df.get("erro", pd.Series([np.nan]*len(df))).isna()] if "erro" in df.columns else df
+        if not df_v.empty and "f1_macro" in df_v.columns:
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            for ax, (col, lbl) in zip(axes.flat,
+                                      [("recall_macro", "Recall-macro (PRIMÁRIO)"),
+                                       ("f1_macro", "F1-macro"),
+                                       ("fpr_macro", "FPR-macro"),
+                                       ("mcc", "MCC")]):
+                sns.barplot(data=df_v, x="estrategia", y=col, ax=ax, palette="rocket")
+                ax.set_title(lbl); ax.set_xlabel("")
+                ax.tick_params(axis="x", rotation=30)
+                for c in ax.containers:
+                    ax.bar_label(c, fmt="%.3f", fontsize=8)
+            fig.suptitle(f"Análise 3 — Seleção de Features (k={K_SELECT})",
+                         fontsize=12, fontweight="bold")
+            fig.tight_layout()
+            p = fig_path(ANALISE_ID, "comparativo_selecao")
+            fig.savefig(p, dpi=300); plt.close(fig)
+            log.info(f"Figura: {p}")
+    except Exception as e:
+        log_exception(log, "plot", e)
 
-    # Veredito
-    cands = [r for r in res if r["estrategia"] != "Baseline_RF" and "recall_macro" in r]
+    cands = [r for r in res if r.get("estrategia") != "Baseline_RF"
+             and "recall_macro" in r]
     if cands:
         venc = max(cands, key=lambda r: r["recall_macro"])
-        print("\n" + "=" * 62)
-        print(f"  VENCEDOR (por recall): {venc['estrategia']}")
-        print(f"    F1={venc['f1_macro']:.4f}  Recall={venc['recall_macro']:.4f}  "
-              f"FPR={venc['fpr_macro']:.4f}")
-        print(f"  vs Baseline RF: F1={r_rf['f1_macro']:.4f}  "
-              f"Recall={r_rf['recall_macro']:.4f}")
-        if venc["estrategia"] == "IG+MI_60/40":
-            print(f"  ✓ Justifica IG+MI 60/40 com k={K_SELECT} no IDS.")
+        log.info("=" * 62)
+        log.info(f"VENCEDOR (recall): {venc['estrategia']}  "
+                 f"F1={venc['f1_macro']:.4f} Recall={venc['recall_macro']:.4f} "
+                 f"FPR={venc['fpr_macro']:.4f}")
+        if r_rf:
+            log.info(f"Baseline RF: F1={r_rf['f1_macro']:.4f} "
+                     f"Recall={r_rf['recall_macro']:.4f}")
+        if venc["estrategia"] == "IG+MI_60_40":
+            log.info(f"✓ Justifica IG+MI 60/40 com k={K_SELECT} no IDS.")
         else:
-            print(f"  ⚠ Vencedor difere do IDS — revisar.")
-        print("=" * 62)
+            log.warning(f"Vencedor difere do IDS — revisar.")
+        log.info("=" * 62)
 
 
 def executar(dataset_disponivel: bool = True, **kwargs) -> None:
-    """Entry-point usado pelo app_menu.py."""
-    main()
+    try:
+        main()
+    except Exception as e:
+        log_exception(log, "main", e); raise
 
 
 if __name__ == "__main__":

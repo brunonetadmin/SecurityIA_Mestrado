@@ -1,23 +1,19 @@
 """
-analise_4_otimizacao_validacao.py
-=================================
-Compara 4 otimizadores (SGD, Adam, AdamW, RMSprop) com e sem ReduceLROnPlateau,
-sobre dados sintéticos. Justifica Adam+ReduceLROnPlateau+EarlyStopping no IDS.
-
-Saída: TESTES → RESULTADOS → IDS  (Adam, lr=1e-3, ReduceLROnPlateau)
+analise_4_otimizacao_validacao.py — Otimização e Validação (sintético)
 """
-
 import os, sys, time, warnings
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-warnings.filterwarnings("ignore")
 
 from config import (
     RANDOM_SEED, N_FEATURES, CLASS_NAMES, CLASS_DIST,
@@ -25,8 +21,10 @@ from config import (
     BATCH_SIZE, ATTENTION_UNITS,
     fig_path, tab_path, Relatorio, apply_plot_style,
 )
+from _test_logging import get_logger, log_exception
 
 import tensorflow as tf
+from tensorflow.keras import backend as K
 from tensorflow.keras.layers import Input, LSTM, Bidirectional, Dense, Dropout
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam, AdamW, SGD, RMSprop
@@ -45,6 +43,7 @@ apply_plot_style()
 ANALISE_ID = 4
 EPOCHS = 25
 PATIENCE = 5
+log = get_logger(ANALISE_ID, "analise_4")
 
 
 class BahdanauAttention(tf.keras.layers.Layer):
@@ -66,8 +65,9 @@ def build_model(n_feat, n_cls, optimizer):
     x = BahdanauAttention()(x)
     x = Dense(LSTM_DENSE_UNITS, activation="relu")(x)
     out = Dense(n_cls, activation="softmax")(x)
-    m = Model(inp, out)
-    m.compile(optimizer=optimizer, loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    m = Model(inp, out, name="BiLSTM_Atencao")
+    m.compile(optimizer=optimizer,
+              loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     return m
 
 
@@ -100,15 +100,17 @@ def metricas(y_true, y_pred):
         tn = cm.sum() - cm[c, :].sum() - cm[:, c].sum() + cm[c, c]
         fpr_pc.append(fp / (fp + tn) if (fp + tn) else 0.0)
     return {
-        "acuracia": accuracy_score(y_true, y_pred),
-        "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
-        "recall_macro": recall_score(y_true, y_pred, average="macro", zero_division=0),
-        "mcc": matthews_corrcoef(y_true, y_pred),
+        "acuracia": float(accuracy_score(y_true, y_pred)),
+        "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+        "mcc": float(matthews_corrcoef(y_true, y_pred)),
         "fpr_macro": float(np.mean(fpr_pc)),
     }
 
 
 def avaliar(X_tr, X_te, y_tr, y_te, n_cls, opt_name, opt_fn, use_lr_sched):
+    K.clear_session()
+    tf.random.set_seed(RANDOM_SEED)
     t0 = time.time()
     m = build_model(X_tr.shape[1], n_cls, opt_fn())
     cbs = [EarlyStopping(patience=PATIENCE, restore_best_weights=True,
@@ -118,20 +120,21 @@ def avaliar(X_tr, X_te, y_tr, y_te, n_cls, opt_name, opt_fn, use_lr_sched):
                                       monitor="val_loss"))
     Xt = X_tr.reshape(-1, X_tr.shape[1], 1)
     Xv = X_te.reshape(-1, X_te.shape[1], 1)
-    h = m.fit(Xt, y_tr, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0,
+    log.info(f"  fit {opt_name} lr_sched={use_lr_sched} epochs<={EPOCHS}")
+    h = m.fit(Xt, y_tr, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=2,
                validation_split=0.15, callbacks=cbs)
     yp = np.argmax(m.predict(Xv, verbose=0), axis=1)
     r = metricas(y_te, yp)
     r["otimizador"] = opt_name
     r["lr_schedule"] = "ReduceLROnPlateau" if use_lr_sched else "Nenhum"
-    r["epocas_executadas"] = len(h.history["loss"])
+    r["epocas_executadas"] = int(len(h.history["loss"]))
     r["tempo_s"] = time.time() - t0
     return r
 
 
 def main():
     Relatorio(ANALISE_ID)
-    print(f"\n  ANÁLISE 4 — Otimização e Validação (sintético)")
+    log.info("ANÁLISE 4 — Otimização e Validação (sintético)")
 
     X, y = gerar_sintetico(4000)
     sc = StandardScaler()
@@ -139,70 +142,85 @@ def main():
     X_tr, X_te, y_tr, y_te = train_test_split(
         X, y, test_size=0.2, stratify=y, random_state=RANDOM_SEED)
     n_cls = len(np.unique(y))
-    print(f"  Treino={len(X_tr)} Teste={len(X_te)} Classes={n_cls}")
+    log.info(f"Treino={len(X_tr)} Teste={len(X_te)} Classes={n_cls}")
 
     res = []
     for opt_name, opt_fn in OPTIMIZERS.items():
         for use_lr in (False, True):
             tag = f"{opt_name}_{'LR' if use_lr else 'noLR'}"
-            print(f"\n    [{tag}]")
+            log.info(f">>> {tag}")
             try:
                 r = avaliar(X_tr, X_te, y_tr, y_te, n_cls,
                             opt_name, opt_fn, use_lr)
                 res.append(r)
-                print(f"      F1={r['f1_macro']:.4f}  Recall={r['recall_macro']:.4f}  "
-                      f"MCC={r['mcc']:.4f}  ep={r['epocas_executadas']}  "
-                      f"t={r['tempo_s']:.1f}s")
+                log.info(f"{tag} OK F1={r['f1_macro']:.4f} Recall={r['recall_macro']:.4f} "
+                         f"MCC={r['mcc']:.4f} ep={r['epocas_executadas']} "
+                         f"t={r['tempo_s']:.1f}s")
             except Exception as e:
-                print(f"      ✗ falhou: {e}")
+                log_exception(log, tag, e)
+                res.append({"otimizador": opt_name,
+                            "lr_schedule": "ReduceLROnPlateau" if use_lr else "Nenhum",
+                            "erro": str(e)})
 
     df = pd.DataFrame(res)
-    df["config"] = df["otimizador"] + " (" + df["lr_schedule"] + ")"
+
+    # config column — SOMENTE para linhas válidas (corrige KeyError)
+    if "otimizador" in df.columns and "lr_schedule" in df.columns:
+        df["config"] = df["otimizador"].fillna("?") + " (" + df["lr_schedule"].fillna("?") + ")"
+    else:
+        df["config"] = "?"
+        log.warning("Nenhuma execução produziu resultado válido — todas falharam.")
+
     csv_path = tab_path(ANALISE_ID, "metricas_otimizacao")
     df.to_csv(csv_path, index=False)
-    print(f"\n  Tabela: {csv_path}")
+    log.info(f"Tabela: {csv_path}")
 
-    # Figura
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    for ax, (col, lbl) in zip(axes.flat,
-                              [("f1_macro", "F1-macro"),
-                               ("recall_macro", "Recall-macro"),
-                               ("mcc", "MCC"),
-                               ("epocas_executadas", "Épocas até convergência")]):
-        sns.barplot(data=df, x="config", y=col, ax=ax, palette="cubehelix")
-        ax.set_title(lbl); ax.set_xlabel("")
-        ax.tick_params(axis="x", rotation=35)
-        for c in ax.containers:
-            fmt = "%.3f" if col != "epocas_executadas" else "%d"
-            ax.bar_label(c, fmt=fmt, fontsize=8)
-    fig.suptitle("Análise 4 — Otimização e Validação",
-                 fontsize=12, fontweight="bold")
-    fig.tight_layout()
-    p = fig_path(ANALISE_ID, "comparativo_otimizacao")
-    fig.savefig(p, dpi=300); plt.close(fig)
-    print(f"  Figura: {p}")
+    try:
+        df_v = df[df.get("erro", pd.Series([np.nan]*len(df))).isna()] if "erro" in df.columns else df
+        if not df_v.empty and "f1_macro" in df_v.columns:
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            for ax, (col, lbl) in zip(axes.flat,
+                                      [("f1_macro", "F1-macro"),
+                                       ("recall_macro", "Recall-macro"),
+                                       ("mcc", "MCC"),
+                                       ("epocas_executadas", "Épocas até convergência")]):
+                if col not in df_v.columns: continue
+                sns.barplot(data=df_v, x="config", y=col, ax=ax, palette="cubehelix")
+                ax.set_title(lbl); ax.set_xlabel("")
+                ax.tick_params(axis="x", rotation=35)
+                for c in ax.containers:
+                    fmt = "%.3f" if col != "epocas_executadas" else "%d"
+                    ax.bar_label(c, fmt=fmt, fontsize=8)
+            fig.suptitle("Análise 4 — Otimização e Validação",
+                         fontsize=12, fontweight="bold")
+            fig.tight_layout()
+            p = fig_path(ANALISE_ID, "comparativo_otimizacao")
+            fig.savefig(p, dpi=300); plt.close(fig)
+            log.info(f"Figura: {p}")
+    except Exception as e:
+        log_exception(log, "plot", e)
 
-    # Veredito — composto: alto F1 com poucas épocas
-    if res:
-        # score = f1 - 0.005*epocas (pequena penalidade por custo)
-        for r in res:
+    cands = [r for r in res if "f1_macro" in r and "epocas_executadas" in r]
+    if cands:
+        for r in cands:
             r["score_composto"] = r["f1_macro"] - 0.005 * r["epocas_executadas"]
-        venc = max(res, key=lambda r: r["score_composto"])
-        print("\n" + "=" * 62)
-        print(f"  VENCEDOR (F1 com penalidade por épocas):")
-        print(f"    {venc['otimizador']} + {venc['lr_schedule']}")
-        print(f"    F1={venc['f1_macro']:.4f}  Recall={venc['recall_macro']:.4f}  "
-              f"épocas={venc['epocas_executadas']}")
+        venc = max(cands, key=lambda r: r["score_composto"])
+        log.info("=" * 62)
+        log.info(f"VENCEDOR: {venc['otimizador']} + {venc['lr_schedule']}  "
+                 f"F1={venc['f1_macro']:.4f} Recall={venc['recall_macro']:.4f} "
+                 f"épocas={venc['epocas_executadas']}")
         if venc["otimizador"] == "Adam" and venc["lr_schedule"] == "ReduceLROnPlateau":
-            print(f"  ✓ Justifica Adam+ReduceLROnPlateau no IDS.")
+            log.info("✓ Justifica Adam+ReduceLROnPlateau no IDS.")
         else:
-            print(f"  ⚠ Vencedor difere do IDS — revisar.")
-        print("=" * 62)
+            log.warning("Vencedor difere do IDS — revisar.")
+        log.info("=" * 62)
 
 
 def executar(dataset_disponivel: bool = True, **kwargs) -> None:
-    """Entry-point usado pelo app_menu.py."""
-    main()
+    try:
+        main()
+    except Exception as e:
+        log_exception(log, "main", e); raise
 
 
 if __name__ == "__main__":
