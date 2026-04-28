@@ -32,8 +32,9 @@ def _safe_print(*args, **kwargs):
     """Print que NUNCA estoura quando stdout foi fechado pelo subprocess do menu.
     Tenta imprimir; em qualquer falha de I/O, silencia."""
     try:
-        _safe_print(*args, **kwargs)
-    except (OSError, ValueError, BrokenPipeError):
+        __builtins__["print"](*args, **kwargs) if isinstance(__builtins__, dict) \
+            else __builtins__.print(*args, **kwargs)
+    except (OSError, ValueError, BrokenPipeError, AttributeError):
         pass
 
 
