@@ -1,5 +1,7 @@
 """
-analise_4_otimizacao_validacao.py — Otimização e Validação (sintético)
+analise_4_otimizacao_validacao.py — Otimização e Validação (sintético).
+Versão blindada: verbose=0+EpochLogger (corrige OSError do app_menu),
+KeyError corrigido, executar() à prova de exceção.
 """
 import os, sys, time, warnings
 from pathlib import Path
@@ -8,10 +10,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -21,7 +26,9 @@ from config import (
     BATCH_SIZE, ATTENTION_UNITS,
     fig_path, tab_path, Relatorio, apply_plot_style,
 )
-from _test_logging import get_logger, log_exception
+from _test_logging import get_logger, log_exception, EpochLogger, silence_tensorflow
+
+silence_tensorflow()
 
 import tensorflow as tf
 from tensorflow.keras import backend as K
@@ -36,14 +43,20 @@ from sklearn.metrics import (
     confusion_matrix, recall_score,
 )
 
-np.random.seed(RANDOM_SEED)
-tf.random.set_seed(RANDOM_SEED)
+tf.keras.utils.set_random_seed(RANDOM_SEED)
 apply_plot_style()
 
 ANALISE_ID = 4
-EPOCHS = 25
-PATIENCE = 5
+EPOCHS = 40
+PATIENCE = 8
 log = get_logger(ANALISE_ID, "analise_4")
+
+
+def sanitize(X):
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    p99 = np.percentile(np.abs(X), 99.9, axis=0)
+    p99 = np.where(p99 < 1e-9, 1.0, p99)
+    return np.clip(X, -p99 * 10, p99 * 10).astype(np.float32)
 
 
 class BahdanauAttention(tf.keras.layers.Layer):
@@ -82,6 +95,7 @@ OPTIMIZERS = {
 def gerar_sintetico(n=4000):
     rng = np.random.default_rng(RANDOM_SEED)
     counts = (np.array(CLASS_DIST) * n).astype(int)
+    counts[counts < 10] = 10
     Xs, ys = [], []
     for c, k in enumerate(counts):
         center = rng.normal(c * 1.5, 0.3, N_FEATURES)
@@ -110,24 +124,25 @@ def metricas(y_true, y_pred):
 
 def avaliar(X_tr, X_te, y_tr, y_te, n_cls, opt_name, opt_fn, use_lr_sched):
     K.clear_session()
-    tf.random.set_seed(RANDOM_SEED)
+    tf.keras.utils.set_random_seed(RANDOM_SEED)
     t0 = time.time()
     m = build_model(X_tr.shape[1], n_cls, opt_fn())
-    cbs = [EarlyStopping(patience=PATIENCE, restore_best_weights=True,
-                          monitor="val_loss")]
+    cb = [EarlyStopping(patience=PATIENCE, restore_best_weights=True,
+                         monitor="val_loss"),
+          EpochLogger(log, prefix=f"{opt_name}/{('LR' if use_lr_sched else 'noLR')} ")]
     if use_lr_sched:
-        cbs.append(ReduceLROnPlateau(factor=0.5, patience=3, min_lr=1e-7,
-                                      monitor="val_loss"))
+        cb.append(ReduceLROnPlateau(factor=0.5, patience=3, min_lr=1e-7,
+                                     monitor="val_loss"))
     Xt = X_tr.reshape(-1, X_tr.shape[1], 1)
     Xv = X_te.reshape(-1, X_te.shape[1], 1)
     log.info(f"  fit {opt_name} lr_sched={use_lr_sched} epochs<={EPOCHS}")
-    h = m.fit(Xt, y_tr, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=2,
-               validation_split=0.15, callbacks=cbs)
-    yp = np.argmax(m.predict(Xv, verbose=0), axis=1)
+    h = m.fit(Xt, y_tr, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0,
+               validation_split=0.15, callbacks=cb)
+    yp = np.argmax(m.predict(Xv, verbose=0, batch_size=BATCH_SIZE), axis=1)
     r = metricas(y_te, yp)
     r["otimizador"] = opt_name
     r["lr_schedule"] = "ReduceLROnPlateau" if use_lr_sched else "Nenhum"
-    r["epocas_executadas"] = int(len(h.history["loss"]))
+    r["epocas_executadas"] = int(len(h.history.get("loss", [])))
     r["tempo_s"] = time.time() - t0
     return r
 
@@ -137,11 +152,16 @@ def main():
     log.info("ANÁLISE 4 — Otimização e Validação (sintético)")
 
     X, y = gerar_sintetico(4000)
+    X = sanitize(X)
     sc = StandardScaler()
-    X = sc.fit_transform(X)
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=RANDOM_SEED)
-    n_cls = len(np.unique(y))
+    X = sc.fit_transform(X).astype(np.float32)
+    try:
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=0.2, stratify=y, random_state=RANDOM_SEED)
+    except ValueError:
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=0.2, random_state=RANDOM_SEED)
+    n_cls = int(np.max(y) + 1)
     log.info(f"Treino={len(X_tr)} Teste={len(X_te)} Classes={n_cls}")
 
     res = []
@@ -163,20 +183,22 @@ def main():
                             "erro": str(e)})
 
     df = pd.DataFrame(res)
-
-    # config column — SOMENTE para linhas válidas (corrige KeyError)
     if "otimizador" in df.columns and "lr_schedule" in df.columns:
         df["config"] = df["otimizador"].fillna("?") + " (" + df["lr_schedule"].fillna("?") + ")"
     else:
         df["config"] = "?"
-        log.warning("Nenhuma execução produziu resultado válido — todas falharam.")
-
-    csv_path = tab_path(ANALISE_ID, "metricas_otimizacao")
-    df.to_csv(csv_path, index=False)
-    log.info(f"Tabela: {csv_path}")
+        log.warning("Nenhuma execução produziu resultado válido.")
 
     try:
-        df_v = df[df.get("erro", pd.Series([np.nan]*len(df))).isna()] if "erro" in df.columns else df
+        csv_path = tab_path(ANALISE_ID, "metricas_otimizacao")
+        df.to_csv(csv_path, index=False)
+        log.info(f"Tabela: {csv_path}")
+    except Exception as e:
+        log_exception(log, "salvar CSV", e)
+
+    try:
+        df_v = df[df.get("erro", pd.Series([np.nan]*len(df))).isna()] \
+               if "erro" in df.columns else df
         if not df_v.empty and "f1_macro" in df_v.columns:
             fig, axes = plt.subplots(2, 2, figsize=(14, 10))
             for ax, (col, lbl) in zip(axes.flat,
@@ -186,8 +208,7 @@ def main():
                                        ("epocas_executadas", "Épocas até convergência")]):
                 if col not in df_v.columns: continue
                 sns.barplot(data=df_v, x="config", y=col, ax=ax, palette="cubehelix")
-                ax.set_title(lbl); ax.set_xlabel("")
-                ax.tick_params(axis="x", rotation=35)
+                ax.set_title(lbl); ax.set_xlabel(""); ax.tick_params(axis="x", rotation=35)
                 for c in ax.containers:
                     fmt = "%.3f" if col != "epocas_executadas" else "%d"
                     ax.bar_label(c, fmt=fmt, fontsize=8)
@@ -220,8 +241,12 @@ def executar(dataset_disponivel: bool = True, **kwargs) -> None:
     try:
         main()
     except Exception as e:
-        log_exception(log, "main", e); raise
+        log_exception(log, "executar", e)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log_exception(log, "main", e)
+        sys.exit(0)

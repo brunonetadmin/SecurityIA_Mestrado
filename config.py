@@ -569,20 +569,73 @@ def verificar_dataset(interativo: bool = True) -> bool:
 
 
 def _resolve_label_column(df):
-    for col in ["Label", "label", " Label"]:
-        if col in df.columns:
+    """Resolve coluna de rótulo, normalizando espaços. Retorna nome real."""
+    for col in df.columns:
+        if col.strip().lower() == "label":
             return col
     return None
 
 
-def carregar_dataset_real(n_amostras_max: int = 500_000):
+# Colunas tipicamente NÃO discriminantes em CSE-CIC-IDS2018 que causam leakage
+# ou ruído (timestamps, IDs, portas como números absolutos).
+_DROP_PATTERNS = (
+    "timestamp", "flow id", "src ip", "dst ip", "source ip", "destination ip",
+    "src port", "dst port", "source port", "destination port",
+    "fwd header length.1",  # coluna duplicada conhecida
+)
+
+
+def _drop_meta_cols(df):
+    drop = []
+    for c in df.columns:
+        cl = c.strip().lower()
+        for p in _DROP_PATTERNS:
+            if cl == p:
+                drop.append(c); break
+    return df.drop(columns=drop, errors="ignore")
+
+
+def carregar_dataset_real(n_amostras_max: int = 500_000,
+                           force_reload: bool = False):
+    """
+    Carrega CSE-CIC-IDS2018 com:
+      - normalização de nomes de coluna (strip)
+      - filtro de meta-colunas (timestamp, IPs, portas)
+      - seleção das k=N_FEATURES MELHORES via Information Gain ranqueado
+        sobre TODAS as features numéricas disponíveis
+      - LabelEncoder consistente persistido em cache
+      - sample estratificado por classe (preserva distribuição)
+      - cache em Temp/cse_real_cache.npz para reuso entre análises
+
+    Retorna (X, y, label_encoder) ou None.
+    """
     try:
         import numpy as np
         import pandas as pd
         from sklearn.preprocessing import LabelEncoder
+        from sklearn.model_selection import train_test_split
+        from sklearn.feature_selection import mutual_info_classif
     except Exception as exc:
         print(f"  ⚠ Dependência ausente para dataset real: {exc}")
         return None
+
+    cache_dir = Config.TEMP_DIR
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_npz = cache_dir / f"cse_real_cache_{n_amostras_max}.npz"
+    cache_le  = cache_dir / f"cse_real_le_{n_amostras_max}.pkl"
+
+    if cache_npz.exists() and cache_le.exists() and not force_reload:
+        try:
+            import joblib
+            data = np.load(cache_npz, allow_pickle=False)
+            X = data["X"].astype("float32")
+            y = data["y"].astype("int64")
+            le = joblib.load(cache_le)
+            print(f"  ✓ Cache carregado: {cache_npz.name} "
+                  f"X={X.shape}, classes={len(le.classes_)}")
+            return X, y, le
+        except Exception as exc:
+            print(f"  ⚠ Cache inválido ({exc}); regenerando…")
 
     presente, _ = _dataset_presente()
     if not presente:
@@ -594,18 +647,33 @@ def carregar_dataset_real(n_amostras_max: int = 500_000):
 
     amostras_por_arquivo = max(1, n_amostras_max // max(1, len(csvs)))
     frames = []
+    print(f"  Carregando {len(csvs)} CSV(s) (até {amostras_por_arquivo:,}/arquivo)…")
 
     for csv in csvs:
         try:
             df = pd.read_csv(csv, low_memory=False)
             if df.empty:
                 continue
+            df.columns = [c.strip() for c in df.columns]
             label_col = _resolve_label_column(df)
             if label_col is None:
-                df["Label"] = csv.stem
+                # Fallback determinístico: rótulo derivado do nome do arquivo
+                stem = csv.stem.lower()
+                if "benign" in stem or "normal" in stem:
+                    df["Label"] = "Benign"
+                else:
+                    df["Label"] = csv.stem.replace("_", " ").title()
                 label_col = "Label"
+            elif label_col != "Label":
+                df = df.rename(columns={label_col: "Label"})
+            # Sample estratificado quando possível
             if len(df) > amostras_por_arquivo:
-                df = df.sample(amostras_por_arquivo, random_state=RANDOM_SEED)
+                try:
+                    df, _ = train_test_split(
+                        df, train_size=amostras_por_arquivo,
+                        stratify=df["Label"], random_state=RANDOM_SEED)
+                except Exception:
+                    df = df.sample(amostras_por_arquivo, random_state=RANDOM_SEED)
             frames.append(df)
         except Exception as exc:
             print(f"  ⚠ Falha ao ler {csv.name}: {exc}")
@@ -614,32 +682,67 @@ def carregar_dataset_real(n_amostras_max: int = 500_000):
         return None
 
     df_all = pd.concat(frames, ignore_index=True)
-    label_col = _resolve_label_column(df_all) or "Label"
+    df_all = _drop_meta_cols(df_all)
 
-    y_raw = df_all[label_col].astype(str).fillna("unknown")
-    X_df = df_all.drop(columns=[c for c in [label_col, "Timestamp", "Flow ID", "Src IP", "Dst IP"]
-                                if c in df_all.columns], errors="ignore")
-    X_df = X_df.select_dtypes(include=["number"]).replace([float("inf"), float("-inf")], 0).fillna(0)
+    y_raw = df_all["Label"].astype(str).fillna("Unknown").str.strip()
+    X_df = df_all.drop(columns=["Label"], errors="ignore")
+    X_df = X_df.select_dtypes(include=["number"]).replace(
+        [float("inf"), float("-inf")], 0).fillna(0)
 
     if X_df.empty:
-        print("  ⚠ Dataset real lido, mas sem colunas numéricas utilizáveis.")
+        print("  ⚠ Dataset sem colunas numéricas utilizáveis.")
         return None
 
-    if X_df.shape[1] >= N_FEATURES:
-        X_df = X_df.iloc[:, :N_FEATURES]
-    else:
-        for i in range(N_FEATURES - X_df.shape[1]):
-            X_df[f"pad_{i}"] = 0.0
-        X_df = X_df.iloc[:, :N_FEATURES]
+    print(f"  Universo de features numéricas: {X_df.shape[1]} colunas, "
+          f"{len(X_df):,} amostras totais")
 
     le = LabelEncoder()
     y = le.fit_transform(y_raw)
-    X = X_df.to_numpy(dtype="float32")
+    print(f"  Classes detectadas ({len(le.classes_)}): {list(le.classes_)}")
 
+    X_full = X_df.to_numpy(dtype="float32")
+
+    # Seleção REAL das k=N_FEATURES melhores via MI (rápido e determinístico)
+    k_target = min(N_FEATURES, X_full.shape[1])
+    if X_full.shape[1] > k_target:
+        # Subamostra para acelerar MI
+        n_mi = min(50_000, len(X_full))
+        rng = np.random.default_rng(RANDOM_SEED)
+        idx_mi = rng.choice(len(X_full), size=n_mi, replace=False)
+        print(f"  Calculando MI sobre {n_mi:,} amostras para selecionar {k_target} features…")
+        scores = mutual_info_classif(X_full[idx_mi], y[idx_mi],
+                                      random_state=RANDOM_SEED)
+        top_idx = np.argsort(scores)[::-1][:k_target]
+        top_idx = np.sort(top_idx)
+        X = X_full[:, top_idx]
+        feature_names = X_df.columns[top_idx].tolist()
+        print(f"  Features selecionadas: {feature_names}")
+    else:
+        X = X_full
+        print(f"  Usando todas as {X.shape[1]} features disponíveis.")
+
+    # Sample final estratificado
     if len(X) > n_amostras_max:
-        idx = np.random.default_rng(RANDOM_SEED).choice(len(X), size=n_amostras_max, replace=False)
-        X = X[idx]
-        y = y[idx]
+        try:
+            from sklearn.model_selection import train_test_split as _tts
+            _, X, _, y = _tts(X, y, test_size=n_amostras_max,
+                              stratify=y, random_state=RANDOM_SEED)
+        except Exception:
+            idx = np.random.default_rng(RANDOM_SEED).choice(
+                len(X), size=n_amostras_max, replace=False)
+            X = X[idx]; y = y[idx]
+
+    X = X.astype("float32")
+    y = y.astype("int64")
+
+    # Persiste cache
+    try:
+        import joblib
+        np.savez(cache_npz, X=X, y=y)
+        joblib.dump(le, cache_le)
+        print(f"  ✓ Cache salvo: {cache_npz.name}")
+    except Exception as exc:
+        print(f"  ⚠ Falha ao salvar cache: {exc}")
 
     return X, y, le
 

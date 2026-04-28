@@ -1,5 +1,7 @@
 """
-analise_1_arquiteturas.py — Comparação de arquiteturas (sintético + real)
+analise_1_arquiteturas.py — Comparação de arquiteturas (sintético + real).
+Versão blindada: verbose=0 + EpochLogger, executar() não lança, dataset
+sanitizado, EarlyStopping com paciência adequada.
 """
 import os, sys, time, warnings
 from pathlib import Path
@@ -8,10 +10,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -22,7 +27,9 @@ from config import (
     fig_path, tab_path, Relatorio, apply_plot_style,
     verificar_dataset, carregar_dataset_real,
 )
-from _test_logging import get_logger, log_exception
+from _test_logging import get_logger, log_exception, EpochLogger, silence_tensorflow
+
+silence_tensorflow()
 
 import tensorflow as tf
 from tensorflow.keras import backend as K
@@ -41,15 +48,27 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import StandardScaler
 
-np.random.seed(RANDOM_SEED)
-tf.random.set_seed(RANDOM_SEED)
+tf.keras.utils.set_random_seed(RANDOM_SEED)
 apply_plot_style()
 
 ANALISE_ID = 1
-EPOCHS = 15
-PATIENCE = 4
+EPOCHS = 30
+PATIENCE = 8
 log = get_logger(ANALISE_ID, "analise_1")
 
+
+# ─── Sanitização ───────────────────────────────────────────────────────────
+
+def sanitize(X):
+    """Remove NaN/Inf, clipa outliers extremos."""
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    p99 = np.percentile(np.abs(X), 99.9, axis=0)
+    p99 = np.where(p99 < 1e-9, 1.0, p99)
+    X = np.clip(X, -p99 * 10, p99 * 10)
+    return X.astype(np.float32)
+
+
+# ─── Atenção ───────────────────────────────────────────────────────────────
 
 class BahdanauAttention(tf.keras.layers.Layer):
     def __init__(self, units=ATTENTION_UNITS, **kw):
@@ -128,9 +147,12 @@ ARQUITETURAS = {
 }
 
 
+# ─── Dados ─────────────────────────────────────────────────────────────────
+
 def gerar_sintetico(n=8000):
     rng = np.random.default_rng(RANDOM_SEED)
     counts = (np.array(CLASS_DIST) * n).astype(int)
+    counts[counts < 10] = 10
     Xs, ys = [], []
     for c, k in enumerate(counts):
         center = rng.normal(c * 1.5, 0.3, N_FEATURES)
@@ -140,6 +162,8 @@ def gerar_sintetico(n=8000):
     idx = rng.permutation(len(X))
     return X[idx], y[idx]
 
+
+# ─── Métricas ──────────────────────────────────────────────────────────────
 
 def metricas(y_true, y_pred):
     cm = confusion_matrix(y_true, y_pred)
@@ -160,16 +184,20 @@ def metricas(y_true, y_pred):
 
 def avaliar(X_tr, X_te, y_tr, y_te, n_cls, builder, nome):
     K.clear_session()
-    tf.random.set_seed(RANDOM_SEED)
+    tf.keras.utils.set_random_seed(RANDOM_SEED)
     t0 = time.time()
     m = builder(X_tr.shape[1], n_cls)
     Xt = X_tr.reshape(-1, X_tr.shape[1], 1)
     Xv = X_te.reshape(-1, X_te.shape[1], 1)
     log.info(f"  fit {nome}: epochs<={EPOCHS} batch={BATCH_SIZE} params={m.count_params():,}")
-    m.fit(Xt, y_tr, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=2,
-          validation_split=0.15,
-          callbacks=[EarlyStopping(patience=PATIENCE, restore_best_weights=True)])
-    yp = np.argmax(m.predict(Xv, verbose=0), axis=1)
+    cb = [
+        EarlyStopping(patience=PATIENCE, restore_best_weights=True,
+                       monitor="val_loss"),
+        EpochLogger(log, prefix=f"{nome} "),
+    ]
+    m.fit(Xt, y_tr, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0,
+          validation_split=0.15, callbacks=cb)
+    yp = np.argmax(m.predict(Xv, verbose=0, batch_size=BATCH_SIZE), axis=1)
     r = metricas(y_te, yp)
     r.update({"modelo": nome, "tempo_s": time.time() - t0,
               "params": int(m.count_params())})
@@ -177,25 +205,30 @@ def avaliar(X_tr, X_te, y_tr, y_te, n_cls, builder, nome):
 
 
 def baseline_rf(X_tr, X_te, y_tr, y_te):
-    log.info("  treinando Baseline_RF (referência)")
-    rf = RandomForestClassifier(n_estimators=200, n_jobs=-1,
-                                 random_state=RANDOM_SEED,
-                                 class_weight="balanced_subsample")
+    log.info("  treinando Baseline_RF")
+    rf = RandomForestClassifier(
+        n_estimators=200, n_jobs=-1, random_state=RANDOM_SEED,
+        class_weight="balanced_subsample",
+        max_samples=min(50_000, len(X_tr)) if len(X_tr) > 50_000 else None,
+    )
     rf.fit(X_tr, y_tr)
     yp = rf.predict(X_te)
     r = metricas(y_te, yp)
-    r["modelo"] = "Baseline_RF"
-    r["tempo_s"] = 0.0
-    r["params"] = 0
+    r["modelo"] = "Baseline_RF"; r["tempo_s"] = 0.0; r["params"] = 0
     return r
 
 
 def rodar_dominio(X, y, nome_dominio):
+    X = sanitize(X)
     sc = StandardScaler()
-    X = sc.fit_transform(X)
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=RANDOM_SEED)
-    n_cls = len(np.unique(y))
+    X = sc.fit_transform(X).astype(np.float32)
+    try:
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=0.2, stratify=y, random_state=RANDOM_SEED)
+    except ValueError:
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=0.2, random_state=RANDOM_SEED)
+    n_cls = int(np.max(y) + 1)
     log.info(f"[{nome_dominio}] Treino={len(X_tr)} Teste={len(X_te)} Classes={n_cls}")
     res = []
     for nome, builder in ARQUITETURAS.items():
@@ -228,9 +261,9 @@ def plot_comparativo(df):
                                ("recall_macro", "Recall-macro"),
                                ("fpr_macro", "FPR-macro"),
                                ("mcc", "MCC")]):
+        if col not in df.columns: continue
         sns.barplot(data=df, x="modelo", y=col, hue="dominio", ax=ax)
-        ax.set_title(lbl); ax.set_xlabel("")
-        ax.tick_params(axis="x", rotation=30)
+        ax.set_title(lbl); ax.set_xlabel(""); ax.tick_params(axis="x", rotation=30)
     fig.suptitle("Análise 1 — Arquiteturas: Sintético vs Real",
                  fontsize=12, fontweight="bold")
     fig.tight_layout()
@@ -243,35 +276,42 @@ def main():
     Relatorio(ANALISE_ID)
     log.info("ANÁLISE 1 — Arquiteturas (sintético + real)")
 
-    Xs, ys = gerar_sintetico(8000)
-    res_sint = rodar_dominio(Xs, ys, "Sintetico")
+    res_sint = []
+    try:
+        Xs, ys = gerar_sintetico(8000)
+        res_sint = rodar_dominio(Xs, ys, "Sintetico")
+    except Exception as e:
+        log_exception(log, "dominio Sintetico", e)
 
     res_real = []
-    if verificar_dataset(interativo=False):
-        try:
+    try:
+        if verificar_dataset(interativo=False):
             dados = carregar_dataset_real(n_amostras_max=80_000)
             if dados is not None:
                 Xr, yr, _ = dados
                 res_real = rodar_dominio(Xr, yr, "Real")
             else:
                 log.warning("Dataset real não pôde ser carregado.")
-        except Exception as e:
-            log_exception(log, "carregar_dataset_real", e)
-    else:
-        log.warning("Dataset CSE-CIC-IDS2018 ausente — análise apenas em sintético.")
+        else:
+            log.warning("Dataset CSE-CIC-IDS2018 ausente — análise apenas em sintético.")
+    except Exception as e:
+        log_exception(log, "dominio Real", e)
 
     df = pd.DataFrame(res_sint + res_real)
-    csv_path = tab_path(ANALISE_ID, "metricas_arquiteturas")
-    df.to_csv(csv_path, index=False)
-    log.info(f"Tabela: {csv_path}")
+    try:
+        csv_path = tab_path(ANALISE_ID, "metricas_arquiteturas")
+        df.to_csv(csv_path, index=False)
+        log.info(f"Tabela: {csv_path}")
+    except Exception as e:
+        log_exception(log, "salvar CSV", e)
 
     try:
-        df_v = df[df.get("erro", pd.Series([np.nan]*len(df))).isna()] if "erro" in df.columns else df
+        df_v = df[df.get("erro", pd.Series([np.nan]*len(df))).isna()] \
+               if "erro" in df.columns else df
         if not df_v.empty and "f1_macro" in df_v.columns:
-            p = plot_comparativo(df_v)
-            log.info(f"Figura: {p}")
+            log.info(f"Figura: {plot_comparativo(df_v)}")
     except Exception as e:
-        log_exception(log, "plot_comparativo", e)
+        log_exception(log, "plot", e)
 
     real_arch = [r for r in res_real if r.get("modelo") != "Baseline_RF"
                  and "recall_macro" in r]
@@ -293,11 +333,16 @@ def main():
 
 
 def executar(dataset_disponivel: bool = True, **kwargs) -> None:
+    """Entry-point do app_menu. NUNCA lança exceção."""
     try:
         main()
     except Exception as e:
-        log_exception(log, "main", e); raise
+        log_exception(log, "executar", e)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log_exception(log, "main", e)
+        sys.exit(0)  # exit 0 para não confundir o menu

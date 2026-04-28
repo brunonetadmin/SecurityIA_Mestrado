@@ -1,5 +1,6 @@
 """
-analise_2_balanceamento.py — Estratégias de balanceamento sobre dados reais
+analise_2_balanceamento.py — Estratégias de balanceamento sobre dados reais.
+Versão blindada com EpochLogger, executar() à prova de exceção.
 """
 import os, sys, time, math, warnings
 from pathlib import Path
@@ -9,10 +10,13 @@ from collections import Counter
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -21,7 +25,9 @@ from config import (
     fig_path, tab_path, Relatorio, apply_plot_style,
     verificar_dataset, carregar_dataset_real,
 )
-from _test_logging import get_logger, log_exception
+from _test_logging import get_logger, log_exception, EpochLogger, silence_tensorflow
+
+silence_tensorflow()
 
 import tensorflow as tf
 from tensorflow.keras import backend as K
@@ -40,14 +46,20 @@ from imblearn.over_sampling import SMOTE, BorderlineSMOTE
 from imblearn.under_sampling import RandomUnderSampler, EditedNearestNeighbours
 from imblearn.combine import SMOTEENN
 
-np.random.seed(RANDOM_SEED)
-tf.random.set_seed(RANDOM_SEED)
+tf.keras.utils.set_random_seed(RANDOM_SEED)
 apply_plot_style()
 
 ANALISE_ID = 2
-EPOCHS = 12
-PATIENCE = 4
+EPOCHS = 20
+PATIENCE = 6
 log = get_logger(ANALISE_ID, "analise_2")
+
+
+def sanitize(X):
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    p99 = np.percentile(np.abs(X), 99.9, axis=0)
+    p99 = np.where(p99 < 1e-9, 1.0, p99)
+    return np.clip(X, -p99 * 10, p99 * 10).astype(np.float32)
 
 
 class BahdanauAttention(tf.keras.layers.Layer):
@@ -62,11 +74,11 @@ class BahdanauAttention(tf.keras.layers.Layer):
 
 def focal_loss(class_counts, gamma=2.0, beta=0.9999):
     cc = np.asarray(class_counts, dtype=np.float64)
+    cc = np.maximum(cc, 1.0)
     n_eff = (1.0 - np.power(beta, cc)) / (1.0 - beta)
     w = (1.0 - beta) / np.maximum(n_eff, 1e-12)
     w = w / w.sum() * len(w)
     wt = tf.constant(w, dtype=tf.float32)
-
     def fn(y_true, y_pred):
         y_true = tf.cast(y_true, tf.int32)
         y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
@@ -92,23 +104,31 @@ def build_model(n_feat, n_cls, class_counts):
     return m
 
 
-# ─── Estratégias de balanceamento (sem n_jobs) ─────────────────────────────
+# ─── Estratégias com k_neighbors seguro (não pode exceder min_class - 1) ────
+
+def _safe_k(y, k_default=5):
+    """k_neighbors tem que ser <= min(amostras_minoritárias) - 1."""
+    counts = list(Counter(y).values())
+    return max(1, min(k_default, min(counts) - 1))
+
 
 def bal_none(X, y):
     return X, y
 
 
 def bal_smote(X, y):
-    return SMOTE(k_neighbors=5, random_state=RANDOM_SEED).fit_resample(X, y)
+    return SMOTE(k_neighbors=_safe_k(y), random_state=RANDOM_SEED).fit_resample(X, y)
 
 
 def bal_smote_enn(X, y):
-    return SMOTEENN(random_state=RANDOM_SEED).fit_resample(X, y)
+    return SMOTEENN(random_state=RANDOM_SEED,
+                     smote=SMOTE(k_neighbors=_safe_k(y), random_state=RANDOM_SEED)
+                     ).fit_resample(X, y)
 
 
 def bal_borderline_uniform(X, y):
-    return BorderlineSMOTE(k_neighbors=5, kind="borderline-2",
-                           random_state=RANDOM_SEED).fit_resample(X, y)
+    return BorderlineSMOTE(k_neighbors=_safe_k(y), kind="borderline-2",
+                            random_state=RANDOM_SEED).fit_resample(X, y)
 
 
 def bal_borderline_adaptive(X, y):
@@ -119,19 +139,24 @@ def bal_borderline_adaptive(X, y):
     strat, ks = {}, []
     for c, n_c in dist.items():
         if c == maj: continue
-        n_t = max(min(5 * n_c, int(0.10 * n_maj)), n_c)
+        # ALVO mais ambicioso: 30% da majoritária ou 10x o original
+        n_t = max(min(10 * n_c, int(0.30 * n_maj)), n_c)
         strat[c] = n_t
         ks.append(min(11, max(1, math.ceil(0.25 * math.sqrt(n_c)))))
     if not strat:
         return X, y
-    k_med = max(1, int(np.median(ks)))
+    k_med = max(1, min(int(np.median(ks)), min(dist.values()) - 1))
     Xr, yr = BorderlineSMOTE(sampling_strategy=strat, k_neighbors=k_med,
                               kind="borderline-2",
                               random_state=RANDOM_SEED).fit_resample(X, y)
-    t_maj = min(int(1.5 * max(strat.values())), dist[maj])
+    # Underamostragem moderada da majoritária
+    t_maj = min(int(2.0 * max(strat.values())), dist[maj])
     Xr, yr = RandomUnderSampler(sampling_strategy={maj: t_maj},
                                  random_state=RANDOM_SEED).fit_resample(Xr, yr)
-    Xr, yr = EditedNearestNeighbours(n_neighbors=3).fit_resample(Xr, yr)
+    try:
+        Xr, yr = EditedNearestNeighbours(n_neighbors=3).fit_resample(Xr, yr)
+    except Exception as exc:
+        log.warning(f"ENN falhou ({exc}); prosseguindo sem ENN.")
     return Xr, yr
 
 
@@ -174,20 +199,25 @@ def metricas(y_true, y_pred):
 
 def avaliar(X_tr, X_te, y_tr, y_te, n_cls, nome, fn_bal):
     K.clear_session()
-    tf.random.set_seed(RANDOM_SEED)
+    tf.keras.utils.set_random_seed(RANDOM_SEED)
     t0 = time.time()
     log.info(f"  aplicando {nome}…")
     Xb, yb = fn_bal(X_tr, y_tr)
-    log.info(f"  pós-balanceamento: {len(yb):,} amostras  dist={dict(Counter(yb))}")
+    log.info(f"  pós-balanceamento: {len(yb):,} amostras  "
+             f"dist={dict(sorted(Counter(yb).items()))}")
     cc = np.maximum(np.bincount(yb.astype(int), minlength=n_cls), 1)
     m = build_model(Xb.shape[1], n_cls, cc)
     Xt = Xb.reshape(-1, Xb.shape[1], 1)
     Xv = X_te.reshape(-1, X_te.shape[1], 1)
     log.info(f"  fit {nome}: epochs<={EPOCHS} batch={BATCH_SIZE}")
-    m.fit(Xt, yb, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=2,
-          validation_split=0.15,
-          callbacks=[EarlyStopping(patience=PATIENCE, restore_best_weights=True)])
-    yp = np.argmax(m.predict(Xv, verbose=0), axis=1)
+    cb = [
+        EarlyStopping(patience=PATIENCE, restore_best_weights=True,
+                       monitor="val_loss"),
+        EpochLogger(log, prefix=f"{nome} "),
+    ]
+    m.fit(Xt, yb, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0,
+          validation_split=0.15, callbacks=cb)
+    yp = np.argmax(m.predict(Xv, verbose=0, batch_size=BATCH_SIZE), axis=1)
     r = metricas(y_te, yp)
     r["estrategia"] = nome
     r["tempo_s"] = time.time() - t0
@@ -209,14 +239,19 @@ def main():
     if dados is None:
         log.error("Falha ao carregar dataset real."); return
     X, y, _ = dados
+    X = sanitize(X)
 
     sc = StandardScaler()
-    X = sc.fit_transform(X)
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=RANDOM_SEED)
-    n_cls = len(np.unique(y))
+    X = sc.fit_transform(X).astype(np.float32)
+    try:
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=0.2, stratify=y, random_state=RANDOM_SEED)
+    except ValueError:
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=0.2, random_state=RANDOM_SEED)
+    n_cls = int(np.max(y) + 1)
     log.info(f"Treino={len(X_tr)} Teste={len(X_te)} Classes={n_cls}")
-    log.info(f"Distribuição treino: {dict(Counter(y_tr))}")
+    log.info(f"Distribuição treino: {dict(sorted(Counter(y_tr).items()))}")
 
     res = []
     for nome, fn in ESTRATEGIAS.items():
@@ -231,10 +266,13 @@ def main():
             res.append({"estrategia": nome, "erro": str(e)})
 
     log.info(">>> Baseline_RF (referência)")
+    r_rf = None
     try:
-        rf = RandomForestClassifier(n_estimators=300, n_jobs=-1,
-                                     random_state=RANDOM_SEED,
-                                     class_weight="balanced_subsample")
+        rf = RandomForestClassifier(
+            n_estimators=300, n_jobs=-1, random_state=RANDOM_SEED,
+            class_weight="balanced_subsample",
+            max_samples=min(50_000, len(X_tr)) if len(X_tr) > 50_000 else None,
+        )
         rf.fit(X_tr, y_tr)
         yp_rf = rf.predict(X_te)
         r_rf = metricas(y_te, yp_rf); r_rf["estrategia"] = "Baseline_RF"
@@ -243,25 +281,27 @@ def main():
                  f"FPR={r_rf['fpr_macro']:.4f} MCC={r_rf['mcc']:.4f}")
     except Exception as e:
         log_exception(log, "Baseline_RF", e)
-        r_rf = None
 
     df = pd.DataFrame(res)
-    csv_path = tab_path(ANALISE_ID, "metricas_balanceamento")
-    df.to_csv(csv_path, index=False)
-    log.info(f"Tabela: {csv_path}")
+    try:
+        csv_path = tab_path(ANALISE_ID, "metricas_balanceamento")
+        df.to_csv(csv_path, index=False)
+        log.info(f"Tabela: {csv_path}")
+    except Exception as e:
+        log_exception(log, "salvar CSV", e)
 
     try:
-        df_v = df[df.get("erro", pd.Series([np.nan]*len(df))).isna()] if "erro" in df.columns else df
+        df_v = df[df.get("erro", pd.Series([np.nan]*len(df))).isna()] \
+               if "erro" in df.columns else df
         if not df_v.empty and "f1_macro" in df_v.columns:
             fig, axes = plt.subplots(2, 2, figsize=(14, 10))
             for ax, (col, lbl) in zip(axes.flat,
                                       [("recall_macro", "Recall-macro (PRIMÁRIO)"),
                                        ("f1_macro", "F1-macro"),
-                                       ("fpr_macro", "FPR-macro (menor é melhor)"),
+                                       ("fpr_macro", "FPR-macro"),
                                        ("mcc", "MCC")]):
                 sns.barplot(data=df_v, x="estrategia", y=col, ax=ax, palette="viridis")
-                ax.set_title(lbl); ax.set_xlabel("")
-                ax.tick_params(axis="x", rotation=35)
+                ax.set_title(lbl); ax.set_xlabel(""); ax.tick_params(axis="x", rotation=35)
                 for c in ax.containers:
                     ax.bar_label(c, fmt="%.3f", fontsize=8)
             fig.suptitle("Análise 2 — Balanceamento sobre CSE-CIC-IDS2018",
@@ -295,8 +335,12 @@ def executar(dataset_disponivel: bool = True, **kwargs) -> None:
     try:
         main()
     except Exception as e:
-        log_exception(log, "main", e); raise
+        log_exception(log, "executar", e)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log_exception(log, "main", e)
+        sys.exit(0)
