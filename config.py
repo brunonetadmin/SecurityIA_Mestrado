@@ -28,6 +28,15 @@ os.environ.setdefault("PYTHONHASHSEED", "42")
 warnings.filterwarnings("ignore")
 
 
+def _safe_print(*args, **kwargs):
+    """Print que NUNCA estoura quando stdout foi fechado pelo subprocess do menu.
+    Tenta imprimir; em qualquer falha de I/O, silencia."""
+    try:
+        _safe_print(*args, **kwargs)
+    except (OSError, ValueError, BrokenPipeError):
+        pass
+
+
 class Config:
     # ------------------------------------------------------------------
     # Diretórios principais
@@ -524,7 +533,7 @@ def tab_path(analise_id: int, nome: str) -> Path:
 
 
 def print_config() -> None:
-    print(Config.summary())
+    _safe_print(Config.summary())
 
 
 def _dataset_csvs() -> list[Path]:
@@ -543,26 +552,26 @@ def _dataset_presente() -> tuple[bool, list[str]]:
 
 
 def _instrucoes_manuais() -> None:
-    print("\n  INSTRUÇÕES DE DATASET")
-    print("  ─────────────────────")
-    print(f"  Coloque os CSVs do CSE-CIC-IDS2018 cleaned em: {DATASET_DIR}")
-    print("  Arquivos esperados:")
+    _safe_print("\n  INSTRUÇÕES DE DATASET")
+    _safe_print("  ─────────────────────")
+    _safe_print(f"  Coloque os CSVs do CSE-CIC-IDS2018 cleaned em: {DATASET_DIR}")
+    _safe_print("  Arquivos esperados:")
     for f in DATASET_FILES:
-        print(f"    • {f}")
-    print("  Observação: o diretório fixo esperado é Base/CSE-CIC-IDS2018/.")
+        _safe_print(f"    • {f}")
+    _safe_print("  Observação: o diretório fixo esperado é Base/CSE-CIC-IDS2018/.")
 
 
 def verificar_dataset(interativo: bool = True) -> bool:
     presente, ausentes = _dataset_presente()
     if presente:
         csvs = _dataset_csvs()
-        print(f"  ✓ Dataset encontrado: {len(csvs)} arquivo(s) CSV em {DATASET_DIR}")
+        _safe_print(f"  ✓ Dataset encontrado: {len(csvs)} arquivo(s) CSV em {DATASET_DIR}")
         return True
-    print(f"\n  ⚠ Dataset real não encontrado em: {DATASET_DIR}")
+    _safe_print(f"\n  ⚠ Dataset real não encontrado em: {DATASET_DIR}")
     if ausentes:
-        print(f"  Arquivos ausentes: {len(ausentes)} de {len(DATASET_FILES)}")
+        _safe_print(f"  Arquivos ausentes: {len(ausentes)} de {len(DATASET_FILES)}")
     if not interativo:
-        print("  Modo não-interativo: prosseguindo com dados sintéticos.")
+        _safe_print("  Modo não-interativo: prosseguindo com dados sintéticos.")
         return False
     _instrucoes_manuais()
     return False
@@ -616,7 +625,7 @@ def carregar_dataset_real(n_amostras_max: int = 500_000,
         from sklearn.model_selection import train_test_split
         from sklearn.feature_selection import mutual_info_classif
     except Exception as exc:
-        print(f"  ⚠ Dependência ausente para dataset real: {exc}")
+        _safe_print(f"  ⚠ Dependência ausente para dataset real: {exc}")
         return None
 
     cache_dir = Config.TEMP_DIR
@@ -631,11 +640,11 @@ def carregar_dataset_real(n_amostras_max: int = 500_000,
             X = data["X"].astype("float32")
             y = data["y"].astype("int64")
             le = joblib.load(cache_le)
-            print(f"  ✓ Cache carregado: {cache_npz.name} "
+            _safe_print(f"  ✓ Cache carregado: {cache_npz.name} "
                   f"X={X.shape}, classes={len(le.classes_)}")
             return X, y, le
         except Exception as exc:
-            print(f"  ⚠ Cache inválido ({exc}); regenerando…")
+            _safe_print(f"  ⚠ Cache inválido ({exc}); regenerando…")
 
     presente, _ = _dataset_presente()
     if not presente:
@@ -647,7 +656,7 @@ def carregar_dataset_real(n_amostras_max: int = 500_000,
 
     amostras_por_arquivo = max(1, n_amostras_max // max(1, len(csvs)))
     frames = []
-    print(f"  Carregando {len(csvs)} CSV(s) (até {amostras_por_arquivo:,}/arquivo)…")
+    _safe_print(f"  Carregando {len(csvs)} CSV(s) (até {amostras_por_arquivo:,}/arquivo)…")
 
     for csv in csvs:
         try:
@@ -676,7 +685,7 @@ def carregar_dataset_real(n_amostras_max: int = 500_000,
                     df = df.sample(amostras_por_arquivo, random_state=RANDOM_SEED)
             frames.append(df)
         except Exception as exc:
-            print(f"  ⚠ Falha ao ler {csv.name}: {exc}")
+            _safe_print(f"  ⚠ Falha ao ler {csv.name}: {exc}")
 
     if not frames:
         return None
@@ -690,15 +699,15 @@ def carregar_dataset_real(n_amostras_max: int = 500_000,
         [float("inf"), float("-inf")], 0).fillna(0)
 
     if X_df.empty:
-        print("  ⚠ Dataset sem colunas numéricas utilizáveis.")
+        _safe_print("  ⚠ Dataset sem colunas numéricas utilizáveis.")
         return None
 
-    print(f"  Universo de features numéricas: {X_df.shape[1]} colunas, "
+    _safe_print(f"  Universo de features numéricas: {X_df.shape[1]} colunas, "
           f"{len(X_df):,} amostras totais")
 
     le = LabelEncoder()
     y = le.fit_transform(y_raw)
-    print(f"  Classes detectadas ({len(le.classes_)}): {list(le.classes_)}")
+    _safe_print(f"  Classes detectadas ({len(le.classes_)}): {list(le.classes_)}")
 
     X_full = X_df.to_numpy(dtype="float32")
 
@@ -709,17 +718,17 @@ def carregar_dataset_real(n_amostras_max: int = 500_000,
         n_mi = min(50_000, len(X_full))
         rng = np.random.default_rng(RANDOM_SEED)
         idx_mi = rng.choice(len(X_full), size=n_mi, replace=False)
-        print(f"  Calculando MI sobre {n_mi:,} amostras para selecionar {k_target} features…")
+        _safe_print(f"  Calculando MI sobre {n_mi:,} amostras para selecionar {k_target} features…")
         scores = mutual_info_classif(X_full[idx_mi], y[idx_mi],
                                       random_state=RANDOM_SEED)
         top_idx = np.argsort(scores)[::-1][:k_target]
         top_idx = np.sort(top_idx)
         X = X_full[:, top_idx]
         feature_names = X_df.columns[top_idx].tolist()
-        print(f"  Features selecionadas: {feature_names}")
+        _safe_print(f"  Features selecionadas: {feature_names}")
     else:
         X = X_full
-        print(f"  Usando todas as {X.shape[1]} features disponíveis.")
+        _safe_print(f"  Usando todas as {X.shape[1]} features disponíveis.")
 
     # Sample final estratificado
     if len(X) > n_amostras_max:
@@ -740,9 +749,9 @@ def carregar_dataset_real(n_amostras_max: int = 500_000,
         import joblib
         np.savez(cache_npz, X=X, y=y)
         joblib.dump(le, cache_le)
-        print(f"  ✓ Cache salvo: {cache_npz.name}")
+        _safe_print(f"  ✓ Cache salvo: {cache_npz.name}")
     except Exception as exc:
-        print(f"  ⚠ Falha ao salvar cache: {exc}")
+        _safe_print(f"  ⚠ Falha ao salvar cache: {exc}")
 
     return X, y, le
 
@@ -815,7 +824,13 @@ class Relatorio:
     def salvar(self) -> Path:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.arquivo.write_text("\n".join(self.linhas).rstrip() + "\n", encoding="utf-8")
-        print(f"  ✓ Relatório salvo: {self.arquivo}")
+        # Cria também cópia com nome canônico Relatorio_N.md (esperado pelo app_menu)
+        try:
+            canonico = self.dir / f"Relatorio_{self.id}.md"
+            canonico.write_text(self.arquivo.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            pass
+        _safe_print(f"  ✓ Relatório salvo: {self.arquivo}")
         return self.arquivo
 
 

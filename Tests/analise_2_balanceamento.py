@@ -226,7 +226,7 @@ def avaliar(X_tr, X_te, y_tr, y_te, n_cls, nome, fn_bal):
 
 
 def main():
-    Relatorio(ANALISE_ID)
+    rel = Relatorio(ANALISE_ID)
     log.info("ANÁLISE 2 — Balanceamento (dados reais)")
 
     if not verificar_dataset(interativo=False):
@@ -329,6 +329,20 @@ def main():
         else:
             log.warning(f"Vencedor difere do IDS — revisar.")
         log.info("=" * 62)
+
+    # Persistir relatório markdown (cria Relatorio_N.md, sinalizando "gerado" ao menu)
+    try:
+        try:
+            rel.secao("Resumo dos Resultados")
+            if "df" in locals() and not df.empty:
+                rel.tabela_df(df, "Métricas consolidadas")
+            rel.secao("Log de execução")
+            rel.texto(f"Log completo em: `Tests/Logs/analise_{ANALISE_ID}_*.log`")
+        except Exception:
+            pass
+        rel.salvar()
+    except Exception as e:
+        log_exception(log, "rel.salvar", e)
 
 
 def executar(dataset_disponivel: bool = True, **kwargs) -> None:
