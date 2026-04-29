@@ -324,8 +324,9 @@ def main():
         if r_rf:
             log.info(f"Baseline RF: F1={r_rf['f1_macro']:.4f} "
                      f"Recall={r_rf['recall_macro']:.4f} FPR={r_rf['fpr_macro']:.4f}")
-        if venc["estrategia"] == "Borderline-SMOTE2_Adapt":
-            log.info("✓ Justifica Borderline-SMOTE-2 adaptativo no IDS.")
+        if venc["estrategia"] == "Sem_Balanceamento":
+            log.info("✓ Justifica adoção de NENHUM balanceamento sintético no IDS.")
+            log.info("  Tratamento de desbalanceamento delegado a Focal Loss + class_weight.")
         else:
             log.warning(f"Vencedor difere do IDS — revisar.")
         log.info("=" * 62)

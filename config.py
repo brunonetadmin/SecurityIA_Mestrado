@@ -173,11 +173,17 @@ class Config:
     }
 
     # ------------------------------------------------------------------
-    # BALANCING_CONFIG — Borderline-SMOTE-2 adaptativo (D3)
+    # BALANCING_CONFIG — Sem balanceamento sintético (decisão fundamentada
+    # pela Análise 2, que demonstrou empiricamente que estratégias de
+    # oversampling agressivo prejudicam o desempenho em CSE-CIC-IDS2018
+    # multiclasse. O tratamento de desbalanceamento é feito via Focal Loss
+    # reponderada (Cui et al. 2019) + class_weight no fit.
     # ------------------------------------------------------------------
     BALANCING_CONFIG = {
-        # 'adaptive_borderline' | 'classic_smote_enn' | 'none'
-        "strategy": "adaptive_borderline",
+        # 'none' | 'adaptive_borderline' | 'classic_smote_enn'
+        # 'none' é a estratégia VALIDADA pela Análise 2 (recall macro 0.71
+        # contra 0.14 do adaptativo). Mantida como padrão do framework.
+        "strategy": "none",
         # Borderline-SMOTE-2 (Han et al., 2005)
         "borderline_kind": "borderline-2",
         "smote_k_neighbors_max": 11,

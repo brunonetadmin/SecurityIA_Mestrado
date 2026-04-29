@@ -234,7 +234,9 @@ def avaliar(X_tr, X_te, y_tr, y_te, n_cls, nome, fn_sel, k):
     idx = fn_sel(X_tr, y_tr, k)
     log.info(f"  selecionadas {len(idx)} features de {X_tr.shape[1]}")
     Xs_tr = X_tr[:, idx]; Xs_te = X_te[:, idx]
-    Xb, yb = balance_adaptive(Xs_tr, y_tr)
+    # Stack-IDS atualizado: SEM balanceamento sintético (decisão da Análise 2).
+    # Desbalanceamento tratado apenas via Focal Loss + class_weight.
+    Xb, yb = Xs_tr, y_tr
     cc = np.maximum(np.bincount(yb.astype(int), minlength=n_cls), 1)
     m = build_model(Xb.shape[1], n_cls, cc)
     Xt = Xb.reshape(-1, Xb.shape[1], 1)
