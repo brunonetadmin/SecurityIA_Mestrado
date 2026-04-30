@@ -304,16 +304,28 @@ ESTRATEGIAS = [
 def executar(dataset_disponivel: bool = True) -> None:
     log.info(f"ANÁLISE 2 — Tratamento de Desbalanceamento ({len(ESTRATEGIAS)} estratégias)")
 
-    dataset = safe_run(log, "carregar_dataset_real", carregar_dataset_real)
-    if dataset is None:
+    # Carregamento direto (sem safe_run): a função pode retornar
+    # (X, y) ou (X, y, label_encoder). O safe_run anterior embrulhava o
+    # resultado em uma estrutura aninhada que quebrava np.asarray(y).
+    log.info(">>> carregar_dataset_real")
+    try:
+        _t0 = time.time()
+        _ds = carregar_dataset_real()
+        log.info(f"<<< carregar_dataset_real OK ({time.time()-_t0:.1f}s)")
+    except Exception as _e:
+        log_exception(log, "carregar_dataset_real", _e)
         log.error("Sem dataset real. Abortando."); return
-    # carregar_dataset_real() retorna (X, y) ou (X, y, label_encoder)
-    if isinstance(dataset, tuple) and len(dataset) >= 2:
-        Xfull, yfull = dataset[0], dataset[1]
-    else:
-        log.error(f"Formato inesperado de dataset: {type(dataset)}"); return
-    Xfull = np.asarray(Xfull, dtype=np.float32)
-    yfull = np.asarray(yfull).astype(np.int64).ravel()
+    if _ds is None:
+        log.error("carregar_dataset_real retornou None. Abortando."); return
+    if not isinstance(_ds, (tuple, list)) or len(_ds) < 2:
+        log.error(f"Formato inesperado do dataset: type={type(_ds).__name__}, "
+                  f"len={len(_ds) if hasattr(_ds, '__len__') else 'N/A'}. Abortando.")
+        return
+    Xfull, yfull = _ds[0], _ds[1]
+    # Garantir tipos antes de QUALQUER operação numérica
+    Xfull = np.ascontiguousarray(Xfull, dtype=np.float32)
+    yfull = np.ascontiguousarray(yfull).astype(np.int64).ravel()
+    log.info(f"Dataset coerido: X={Xfull.shape} y={yfull.shape}")
     n_cls = int(np.max(yfull) + 1)
     log.info(f"Dataset: {Xfull.shape[0]:,} amostras × {Xfull.shape[1]} features × {n_cls} classes")
 
