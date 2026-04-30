@@ -50,7 +50,7 @@ class Config:
     MODEL_DIR = BASE_DIR / "Model"
     IDS_DIR = BASE_DIR / "IDS"
     LOGS_DIR = BASE_DIR / "Logs"
-    TEMP_DIR = BASE_DIR / "Temp"
+    TEMP_DIR = BASE_DIR / "temp"
 
     IDS_REPORTS_DIR = BASE_DIR / "Reports"
     REPORTS_DIR = IDS_REPORTS_DIR
@@ -159,10 +159,12 @@ class Config:
         "patience": 10,
         "force_retrain": False,
         "steps_per_execution": 8,
-        # Correções de protocolo:
-        "split_before_balancing": True,   # OBRIGATÓRIO — corrige leakage
-        "use_class_weight": True,         # ativa class_weight no fit
-        "balance_only_train": True,       # balanceia somente o treino
+        # >>> Tratamento de desbalanceamento: APENAS via Focal Loss reponderada
+        # (Cui et al. 2019). Class_weight no fit DESLIGADO para evitar dupla
+        # penalização. Decisão validada empiricamente pela Análise 2.
+        "split_before_balancing": True,
+        "use_class_weight": False,
+        "balance_only_train": True,
     }
 
     FINE_TUNING_CONFIG = {
@@ -612,18 +614,20 @@ def _drop_meta_cols(df):
 
 
 def carregar_dataset_real(n_amostras_max: int = 500_000,
-                           force_reload: bool = False):
+                           force_reload: bool = False,
+                           select_features: bool = False):
     """
-    Carrega CSE-CIC-IDS2018 com:
-      - normalização de nomes de coluna (strip)
-      - filtro de meta-colunas (timestamp, IPs, portas)
-      - seleção das k=N_FEATURES MELHORES via Information Gain ranqueado
-        sobre TODAS as features numéricas disponíveis
-      - LabelEncoder consistente persistido em cache
-      - sample estratificado por classe (preserva distribuição)
-      - cache em Temp/cse_real_cache.npz para reuso entre análises
+    Carrega CSE-CIC-IDS2018.
 
-    Retorna (X, y, label_encoder) ou None.
+    Parâmetros
+    ----------
+    n_amostras_max  : máximo de amostras retornadas (sample estratificado).
+    force_reload    : ignora cache e relê todos os CSVs.
+    select_features : se True, aplica seleção MI das k=N_FEATURES melhores
+                      (compatibilidade legada). Se False (default), retorna
+                      TODAS as features numéricas — recomendado para
+                      experimentos científicos honestos (a Análise 3 precisa
+                      ver o universo completo de atributos).
     """
     try:
         import numpy as np
@@ -637,8 +641,9 @@ def carregar_dataset_real(n_amostras_max: int = 500_000,
 
     cache_dir = Config.TEMP_DIR
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_npz = cache_dir / f"cse_real_cache_{n_amostras_max}.npz"
-    cache_le  = cache_dir / f"cse_real_le_{n_amostras_max}.pkl"
+    sel_tag = "sel" if select_features else "full"
+    cache_npz = cache_dir / f"cse_real_cache_{n_amostras_max}_{sel_tag}.npz"
+    cache_le  = cache_dir / f"cse_real_le_{n_amostras_max}_{sel_tag}.pkl"
 
     if cache_npz.exists() and cache_le.exists() and not force_reload:
         try:
@@ -718,24 +723,28 @@ def carregar_dataset_real(n_amostras_max: int = 500_000,
 
     X_full = X_df.to_numpy(dtype="float32")
 
-    # Seleção REAL das k=N_FEATURES melhores via MI (rápido e determinístico)
-    k_target = min(N_FEATURES, X_full.shape[1])
-    if X_full.shape[1] > k_target:
-        # Subamostra para acelerar MI
-        n_mi = min(50_000, len(X_full))
-        rng = np.random.default_rng(RANDOM_SEED)
-        idx_mi = rng.choice(len(X_full), size=n_mi, replace=False)
-        _safe_print(f"  Calculando MI sobre {n_mi:,} amostras para selecionar {k_target} features…")
-        scores = mutual_info_classif(X_full[idx_mi], y[idx_mi],
-                                      random_state=RANDOM_SEED)
-        top_idx = np.argsort(scores)[::-1][:k_target]
-        top_idx = np.sort(top_idx)
-        X = X_full[:, top_idx]
-        feature_names = X_df.columns[top_idx].tolist()
-        _safe_print(f"  Features selecionadas: {feature_names}")
+    # Seleção de features: opcional (compatibilidade legada).
+    # Por padrão (select_features=False) retorna TODAS as features numéricas.
+    if select_features:
+        from sklearn.feature_selection import mutual_info_classif
+        k_target = min(N_FEATURES, X_full.shape[1])
+        if X_full.shape[1] > k_target:
+            n_mi = min(50_000, len(X_full))
+            rng = np.random.default_rng(RANDOM_SEED)
+            idx_mi = rng.choice(len(X_full), size=n_mi, replace=False)
+            _safe_print(f"  Calculando MI sobre {n_mi:,} amostras para selecionar {k_target} features…")
+            scores = mutual_info_classif(X_full[idx_mi], y[idx_mi],
+                                          random_state=RANDOM_SEED)
+            top_idx = np.argsort(scores)[::-1][:k_target]
+            top_idx = np.sort(top_idx)
+            X = X_full[:, top_idx]
+            feature_names = X_df.columns[top_idx].tolist()
+            _safe_print(f"  Features selecionadas: {feature_names}")
+        else:
+            X = X_full
     else:
         X = X_full
-        _safe_print(f"  Usando todas as {X.shape[1]} features disponíveis.")
+        _safe_print(f"  Retornando TODAS as {X.shape[1]} features numéricas (sem seleção).")
 
     # Sample final estratificado
     if len(X) > n_amostras_max:

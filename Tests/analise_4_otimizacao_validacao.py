@@ -1,7 +1,17 @@
 """
-analise_4_otimizacao_validacao.py — Otimização e Validação (sintético).
-Versão blindada: verbose=0+EpochLogger (corrige OSError do app_menu),
-KeyError corrigido, executar() à prova de exceção.
+analise_4_otimizacao_validacao.py
+=================================
+Compara estratégias de otimização sobre DADOS REAIS (CSE-CIC-IDS2018),
+usando MLP+BN fixo e mesmo split estratificado.
+
+Otimizadores: Adam, AdamW, RMSprop, SGD-Momentum
+Schedulers:   none, ReduceLROnPlateau, CosineDecay
+Validação:    via val_loss em conjunto de validação separado (sem leakage)
+
+Critério primário: macro_recall + MCC. Tempo de convergência (épocas) e
+estabilidade (variância de val_loss nas últimas 5 épocas) reportados.
+
+Cada combinação em safe_run() — falhas individuais não interrompem.
 """
 import os, sys, time, warnings
 from pathlib import Path
@@ -21,231 +31,199 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from config import (
-    RANDOM_SEED, N_FEATURES, CLASS_NAMES, CLASS_DIST,
-    LSTM_UNITS_L1, LSTM_UNITS_L2, LSTM_DENSE_UNITS, DROPOUT_RATE,
-    BATCH_SIZE, ATTENTION_UNITS,
+    RANDOM_SEED, BATCH_SIZE,
     fig_path, tab_path, Relatorio, apply_plot_style,
+    verificar_dataset, carregar_dataset_real,
 )
-from _test_logging import get_logger, log_exception, EpochLogger, silence_tensorflow
+from _test_logging import (
+    get_logger, log_exception, safe_run, EpochLogger, silence_tensorflow,
+    stratified_split_3way, fit_scaler_no_leakage, metricas_completas,
+)
 
 silence_tensorflow()
 
 import tensorflow as tf
 from tensorflow.keras import backend as K
-from tensorflow.keras.layers import Input, LSTM, Bidirectional, Dense, Dropout
+from tensorflow.keras.layers import Input, Dense, Dropout, BatchNormalization, Activation
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam, AdamW, SGD, RMSprop
+from tensorflow.keras.optimizers.schedules import CosineDecay
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    accuracy_score, f1_score, matthews_corrcoef,
-    confusion_matrix, recall_score,
-)
 
 tf.keras.utils.set_random_seed(RANDOM_SEED)
 apply_plot_style()
 
 ANALISE_ID = 4
-EPOCHS = 40
-PATIENCE = 8
+EPOCHS = 30
+PATIENCE = 6
 log = get_logger(ANALISE_ID, "analise_4")
 
 
-def sanitize(X):
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    p99 = np.percentile(np.abs(X), 99.9, axis=0)
-    p99 = np.where(p99 < 1e-9, 1.0, p99)
-    return np.clip(X, -p99 * 10, p99 * 10).astype(np.float32)
-
-
-class BahdanauAttention(tf.keras.layers.Layer):
-    def __init__(self, units=ATTENTION_UNITS, **kw):
-        super().__init__(**kw)
-        self.W = Dense(units); self.V = Dense(1)
-    def call(self, x):
-        s = self.V(tf.nn.tanh(self.W(x)))
-        w = tf.nn.softmax(s, axis=1)
-        return tf.reduce_sum(w * x, axis=1)
-
-
-def build_model(n_feat, n_cls, optimizer):
-    inp = Input(shape=(n_feat, 1))
-    x = Bidirectional(LSTM(LSTM_UNITS_L1, return_sequences=True))(inp)
-    x = Dropout(DROPOUT_RATE)(x)
-    x = Bidirectional(LSTM(LSTM_UNITS_L2, return_sequences=True))(x)
-    x = Dropout(DROPOUT_RATE)(x)
-    x = BahdanauAttention()(x)
-    x = Dense(LSTM_DENSE_UNITS, activation="relu")(x)
+def build_mlp_bn(n_feat, n_cls, optimizer):
+    inp = Input(shape=(n_feat,))
+    x = Dense(256)(inp); x = BatchNormalization()(x); x = Activation("relu")(x); x = Dropout(0.3)(x)
+    x = Dense(128)(x);   x = BatchNormalization()(x); x = Activation("relu")(x); x = Dropout(0.3)(x)
+    x = Dense(64)(x);    x = BatchNormalization()(x); x = Activation("relu")(x); x = Dropout(0.2)(x)
     out = Dense(n_cls, activation="softmax")(x)
-    m = Model(inp, out, name="BiLSTM_Atencao")
+    m = Model(inp, out, name="MLP_BN")
     m.compile(optimizer=optimizer,
               loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     return m
 
 
-OPTIMIZERS = {
-    "SGD":     lambda: SGD(learning_rate=1e-2, momentum=0.9),
-    "Adam":    lambda: Adam(learning_rate=1e-3),
-    "AdamW":   lambda: AdamW(learning_rate=1e-3, weight_decay=1e-4),
-    "RMSprop": lambda: RMSprop(learning_rate=1e-3),
-}
+def opt_adam(scheduler):
+    if scheduler == "cosine":
+        return Adam(learning_rate=CosineDecay(1e-3, decay_steps=EPOCHS * 10))
+    return Adam(learning_rate=1e-3)
+
+def opt_adamw(scheduler):
+    if scheduler == "cosine":
+        return AdamW(learning_rate=CosineDecay(1e-3, decay_steps=EPOCHS * 10),
+                     weight_decay=1e-4)
+    return AdamW(learning_rate=1e-3, weight_decay=1e-4)
+
+def opt_rmsprop(scheduler):
+    if scheduler == "cosine":
+        return RMSprop(learning_rate=CosineDecay(1e-3, decay_steps=EPOCHS * 10))
+    return RMSprop(learning_rate=1e-3)
+
+def opt_sgd(scheduler):
+    if scheduler == "cosine":
+        return SGD(learning_rate=CosineDecay(1e-2, decay_steps=EPOCHS * 10), momentum=0.9)
+    return SGD(learning_rate=1e-2, momentum=0.9)
 
 
-def gerar_sintetico(n=4000):
-    rng = np.random.default_rng(RANDOM_SEED)
-    counts = (np.array(CLASS_DIST) * n).astype(int)
-    counts[counts < 10] = 10
-    Xs, ys = [], []
-    for c, k in enumerate(counts):
-        center = rng.normal(c * 1.5, 0.3, N_FEATURES)
-        Xs.append(rng.normal(center, 1.0, (k, N_FEATURES)))
-        ys.append(np.full(k, c))
-    X = np.vstack(Xs); y = np.concatenate(ys)
-    idx = rng.permutation(len(X))
-    return X[idx], y[idx]
+CONFIGS = [
+    ("Adam_none",            opt_adam,    "none"),
+    ("Adam_ReduceLR",        opt_adam,    "reduce"),
+    ("Adam_Cosine",          opt_adam,    "cosine"),
+    ("AdamW_none",           opt_adamw,   "none"),
+    ("AdamW_ReduceLR",       opt_adamw,   "reduce"),
+    ("AdamW_Cosine",         opt_adamw,   "cosine"),
+    ("RMSprop_none",         opt_rmsprop, "none"),
+    ("RMSprop_ReduceLR",     opt_rmsprop, "reduce"),
+    ("SGD_Momentum_none",    opt_sgd,     "none"),
+    ("SGD_Momentum_ReduceLR", opt_sgd,    "reduce"),
+]
 
 
-def metricas(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred)
-    fpr_pc = []
-    for c in range(cm.shape[0]):
-        fp = cm[:, c].sum() - cm[c, c]
-        tn = cm.sum() - cm[c, :].sum() - cm[:, c].sum() + cm[c, c]
-        fpr_pc.append(fp / (fp + tn) if (fp + tn) else 0.0)
-    return {
-        "acuracia": float(accuracy_score(y_true, y_pred)),
-        "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
-        "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
-        "mcc": float(matthews_corrcoef(y_true, y_pred)),
-        "fpr_macro": float(np.mean(fpr_pc)),
-    }
-
-
-def avaliar(X_tr, X_te, y_tr, y_te, n_cls, opt_name, opt_fn, use_lr_sched):
+def avaliar(label, opt_factory, scheduler,
+            X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls):
     K.clear_session()
     tf.keras.utils.set_random_seed(RANDOM_SEED)
     t0 = time.time()
-    m = build_model(X_tr.shape[1], n_cls, opt_fn())
-    cb = [EarlyStopping(patience=PATIENCE, restore_best_weights=True,
-                         monitor="val_loss"),
-          EpochLogger(log, prefix=f"{opt_name}/{('LR' if use_lr_sched else 'noLR')} ")]
-    if use_lr_sched:
+    m = build_mlp_bn(X_tr.shape[1], n_cls, opt_factory(scheduler))
+
+    cb = [
+        EarlyStopping(patience=PATIENCE, restore_best_weights=True, monitor="val_loss"),
+        EpochLogger(log, prefix=f"{label} "),
+    ]
+    if scheduler == "reduce":
         cb.append(ReduceLROnPlateau(factor=0.5, patience=3, min_lr=1e-7,
                                      monitor="val_loss"))
-    Xt = X_tr.reshape(-1, X_tr.shape[1], 1)
-    Xv = X_te.reshape(-1, X_te.shape[1], 1)
-    log.info(f"  fit {opt_name} lr_sched={use_lr_sched} epochs<={EPOCHS}")
-    h = m.fit(Xt, y_tr, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0,
-               validation_split=0.15, callbacks=cb)
-    yp = np.argmax(m.predict(Xv, verbose=0, batch_size=BATCH_SIZE), axis=1)
-    r = metricas(y_te, yp)
-    r["otimizador"] = opt_name
-    r["lr_schedule"] = "ReduceLROnPlateau" if use_lr_sched else "Nenhum"
-    r["epocas_executadas"] = int(len(h.history.get("loss", [])))
-    r["tempo_s"] = time.time() - t0
+
+    log.info(f"  fit {label}: epochs<={EPOCHS} batch={BATCH_SIZE}")
+    h = m.fit(X_tr, y_tr, validation_data=(X_val, y_val),
+              epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0, callbacks=cb)
+
+    yp = np.argmax(m.predict(X_te, verbose=0, batch_size=BATCH_SIZE), axis=1)
+    r = metricas_completas(y_te, yp, n_classes=n_cls)
+
+    val_losses = h.history.get("val_loss", [])
+    estabilidade = float(np.std(val_losses[-5:])) if len(val_losses) >= 5 else float("nan")
+
+    r.update({
+        "config": label,
+        "epocas_executadas": int(len(val_losses)),
+        "estabilidade_val_loss": estabilidade,
+        "tempo_s": time.time() - t0,
+    })
     return r
+
+
+def plot_comparativo(df):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    metr = [("recall_macro", "Recall-macro (PRIMÁRIO)"),
+            ("mcc", "MCC"),
+            ("f1_macro", "F1-macro"),
+            ("epocas_executadas", "Épocas até convergência")]
+    for ax, (col, lbl) in zip(axes.flat, metr):
+        if col not in df.columns: continue
+        sns.barplot(data=df, x="config", y=col, ax=ax, palette="cubehelix")
+        ax.set_title(lbl); ax.set_xlabel("")
+        ax.tick_params(axis="x", rotation=40)
+        for c in ax.containers:
+            fmt = "%.3f" if col != "epocas_executadas" else "%d"
+            ax.bar_label(c, fmt=fmt, fontsize=7)
+    fig.suptitle("Análise 4 — Otimização e Validação (dados reais)",
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    p = fig_path(ANALISE_ID, "comparativo_otimizacao")
+    fig.savefig(p, dpi=300); plt.close(fig)
+    return p
 
 
 def main():
     rel = Relatorio(ANALISE_ID)
-    log.info("ANÁLISE 4 — Otimização e Validação (sintético)")
+    log.info("ANÁLISE 4 — Otimização e Validação (dados reais)")
 
-    X, y = gerar_sintetico(4000)
-    X = sanitize(X)
-    sc = StandardScaler()
-    X = sc.fit_transform(X).astype(np.float32)
-    try:
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X, y, test_size=0.2, stratify=y, random_state=RANDOM_SEED)
-    except ValueError:
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X, y, test_size=0.2, random_state=RANDOM_SEED)
+    if not verificar_dataset(interativo=False):
+        log.error("Dataset real ausente — análise abortada.")
+        return
+
+    ok, dados = safe_run(log, "carregar_dataset_real",
+                         carregar_dataset_real,
+                         n_amostras_max=80_000, select_features=False)
+    if not ok or dados is None:
+        log.error("Falha ao carregar dataset.")
+        return
+    X_raw, y, _ = dados
     n_cls = int(np.max(y) + 1)
-    log.info(f"Treino={len(X_tr)} Teste={len(X_te)} Classes={n_cls}")
+    log.info(f"Dataset: {X_raw.shape[0]:,} amostras × {X_raw.shape[1]} features × {n_cls} classes")
+
+    X_tr_r, X_val_r, X_te_r, y_tr, y_val, y_te = stratified_split_3way(
+        X_raw, y, val_frac=0.15, test_frac=0.15, seed=RANDOM_SEED, logger=log,
+    )
+    X_tr, X_val, X_te, _ = fit_scaler_no_leakage(X_tr_r, X_val_r, X_te_r)
 
     res = []
-    for opt_name, opt_fn in OPTIMIZERS.items():
-        for use_lr in (False, True):
-            tag = f"{opt_name}_{'LR' if use_lr else 'noLR'}"
-            log.info(f">>> {tag}")
-            try:
-                r = avaliar(X_tr, X_te, y_tr, y_te, n_cls,
-                            opt_name, opt_fn, use_lr)
-                res.append(r)
-                log.info(f"{tag} OK F1={r['f1_macro']:.4f} Recall={r['recall_macro']:.4f} "
-                         f"MCC={r['mcc']:.4f} ep={r['epocas_executadas']} "
-                         f"t={r['tempo_s']:.1f}s")
-            except Exception as e:
-                log_exception(log, tag, e)
-                res.append({"otimizador": opt_name,
-                            "lr_schedule": "ReduceLROnPlateau" if use_lr else "Nenhum",
-                            "erro": str(e)})
+    for label, opt_factory, sched in CONFIGS:
+        ok, r = safe_run(log, label,
+                         avaliar, label, opt_factory, sched,
+                         X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls)
+        if ok and r:
+            res.append(r)
+            log.info(f"{label}: recall={r['recall_macro']:.4f} "
+                     f"mcc={r['mcc']:.4f} f1={r['f1_macro']:.4f} "
+                     f"epocas={r['epocas_executadas']} "
+                     f"estab={r['estabilidade_val_loss']:.4f}")
+
+    if not res:
+        log.error("Nenhuma configuração produziu resultado válido.")
+        return
 
     df = pd.DataFrame(res)
-    if "otimizador" in df.columns and "lr_schedule" in df.columns:
-        df["config"] = df["otimizador"].fillna("?") + " (" + df["lr_schedule"].fillna("?") + ")"
-    else:
-        df["config"] = "?"
-        log.warning("Nenhuma execução produziu resultado válido.")
+    csv_path = tab_path(ANALISE_ID, "metricas_otimizacao")
+    safe_run(log, "salvar CSV", df.to_csv, csv_path, index=False)
+    log.info(f"Tabela: {csv_path}")
+
+    safe_run(log, "plot_comparativo", plot_comparativo, df)
+
+    venc = max(res, key=lambda r: (r["recall_macro"], r["mcc"], -r["epocas_executadas"]))
+    log.info("=" * 62)
+    log.info(f"VENCEDOR: {venc['config']}  "
+             f"recall={venc['recall_macro']:.4f} mcc={venc['mcc']:.4f} "
+             f"f1={venc['f1_macro']:.4f} épocas={venc['epocas_executadas']}")
+    log.info("=" * 62)
 
     try:
-        csv_path = tab_path(ANALISE_ID, "metricas_otimizacao")
-        df.to_csv(csv_path, index=False)
-        log.info(f"Tabela: {csv_path}")
-    except Exception as e:
-        log_exception(log, "salvar CSV", e)
-
-    try:
-        df_v = df[df.get("erro", pd.Series([np.nan]*len(df))).isna()] \
-               if "erro" in df.columns else df
-        if not df_v.empty and "f1_macro" in df_v.columns:
-            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-            for ax, (col, lbl) in zip(axes.flat,
-                                      [("f1_macro", "F1-macro"),
-                                       ("recall_macro", "Recall-macro"),
-                                       ("mcc", "MCC"),
-                                       ("epocas_executadas", "Épocas até convergência")]):
-                if col not in df_v.columns: continue
-                sns.barplot(data=df_v, x="config", y=col, ax=ax, palette="cubehelix")
-                ax.set_title(lbl); ax.set_xlabel(""); ax.tick_params(axis="x", rotation=35)
-                for c in ax.containers:
-                    fmt = "%.3f" if col != "epocas_executadas" else "%d"
-                    ax.bar_label(c, fmt=fmt, fontsize=8)
-            fig.suptitle("Análise 4 — Otimização e Validação",
-                         fontsize=12, fontweight="bold")
-            fig.tight_layout()
-            p = fig_path(ANALISE_ID, "comparativo_otimizacao")
-            fig.savefig(p, dpi=300); plt.close(fig)
-            log.info(f"Figura: {p}")
-    except Exception as e:
-        log_exception(log, "plot", e)
-
-    cands = [r for r in res if "f1_macro" in r and "epocas_executadas" in r]
-    if cands:
-        for r in cands:
-            r["score_composto"] = r["f1_macro"] - 0.005 * r["epocas_executadas"]
-        venc = max(cands, key=lambda r: r["score_composto"])
-        log.info("=" * 62)
-        log.info(f"VENCEDOR: {venc['otimizador']} + {venc['lr_schedule']}  "
-                 f"F1={venc['f1_macro']:.4f} Recall={venc['recall_macro']:.4f} "
-                 f"épocas={venc['epocas_executadas']}")
-        if venc["otimizador"] == "Adam" and venc["lr_schedule"] == "ReduceLROnPlateau":
-            log.info("✓ Justifica Adam+ReduceLROnPlateau no IDS.")
-        else:
-            log.warning("Vencedor difere do IDS — revisar.")
-        log.info("=" * 62)
-
-    # Persistir relatório markdown (cria Relatorio_N.md, sinalizando "gerado" ao menu)
-    try:
-        try:
-            rel.secao("Resumo dos Resultados")
-            if "df" in locals() and not df.empty:
-                rel.tabela_df(df, "Métricas consolidadas")
-            rel.secao("Log de execução")
-            rel.texto(f"Log completo em: `Tests/Logs/analise_{ANALISE_ID}_*.log`")
-        except Exception:
-            pass
+        rel.secao("Resumo dos Resultados")
+        rel.tabela_df(df, "Métricas das configurações de otimização")
+        rel.secao("Veredito")
+        rel.texto(f"Configuração vencedora: **{venc['config']}**.\n\n"
+                  f"recall_macro = {venc['recall_macro']:.4f}, "
+                  f"MCC = {venc['mcc']:.4f}, "
+                  f"épocas = {venc['epocas_executadas']}.")
         rel.salvar()
     except Exception as e:
         log_exception(log, "rel.salvar", e)
