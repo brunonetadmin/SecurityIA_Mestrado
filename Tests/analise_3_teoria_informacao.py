@@ -1,27 +1,33 @@
 """
 analise_3_teoria_informacao.py
 ==============================
-Compara 5 métodos de seleção de features sobre TODAS as features numéricas
-brutas do CSE-CIC-IDS2018 (~80 atributos), usando MLP+BN com perda padrão
-(decisão da Análise 2: tratamento de desbalanceamento delegado à perda).
+Análise da aplicabilidade da Teoria da Informação à seleção de atributos
+para detecção de intrusões sobre o CSE-CIC-IDS2018.
 
-Métodos:
-  1. Information_Gain      — Shannon (1948)
-  2. Mutual_Information    — sklearn mutual_info_classif (Peng et al., 2005)
-  3. ANOVA_F               — F-test linear (controle clássico)
-  4. RF_Feature_Importance — impureza Gini sobre Random Forest (Breiman, 2001)
-  5. IG_MI_60_40           — combinação ponderada (estratégia oficial do IDS)
+A versão anterior comparava apenas critérios de RELEVÂNCIA (IG, MI puros).
+Esta versão amplia a investigação para métodos que tratam REDUNDÂNCIA entre
+atributos — limitação conhecida de IG/MI univariados (Brown et al., 2012).
 
-Para cada método, varremos uma grade de k = [10, 15, 23, 32, 48, 'all'].
+MÉTODOS AVALIADOS:
+  Baselines (relevância univariada):
+    1. Information_Gain      — Shannon (1948)
+    2. Mutual_Information    — sklearn mutual_info_classif
+    3. ANOVA_F               — F-test linear (controle clássico)
+    4. RF_Feature_Importance — impureza Gini sobre RF (Breiman, 2001)
+    5. IG_MI_60_40           — combinação ponderada (estratégia anterior)
+  Critérios multivariados (relevância + redundância):
+    6. mRMR                  — Min Redundancy, Max Relevance (Peng et al., 2005)
+    7. JMI                   — Joint Mutual Information (Yang & Moody, 1999;
+                                                          Brown et al., 2012)
+    8. CMIM                  — Conditional MI Maximisation (Fleuret, 2004)
 
-Critério: macro_recall (PRIMÁRIO) e MCC.
-Cada (método, k) em safe_run() — falhas individuais não interrompem.
+Grade de k: [10, 15, 23, 32, 48, 'all']  → 8 métodos × 6 valores = 48 combos.
+Critério primário: macro_recall. Cada combinação em safe_run().
 """
 import os, sys, time, warnings
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from collections import Counter
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -54,10 +60,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.feature_selection import (
-    mutual_info_classif, f_classif, SelectKBest,
-)
-from scipy.stats import entropy as scipy_entropy
+from sklearn.feature_selection import mutual_info_classif, f_classif
 
 tf.keras.utils.set_random_seed(RANDOM_SEED)
 apply_plot_style()
@@ -69,7 +72,9 @@ K_GRID = [10, 15, 23, 32, 48, "all"]
 log = get_logger(ANALISE_ID, "analise_3")
 
 
-# ─── Modelo fixo (MLP+BN) ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#   MODELO FIXO (MLP+BN) — mantém comparabilidade entre métodos
+# ═══════════════════════════════════════════════════════════════════════════
 
 def build_mlp_bn(n_feat, n_cls):
     inp = Input(shape=(n_feat,))
@@ -83,51 +88,61 @@ def build_mlp_bn(n_feat, n_cls):
     return m
 
 
-# ─── Métodos de seleção ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#   ESCORES UNIVARIADOS  (baselines)
+# ═══════════════════════════════════════════════════════════════════════════
 
-def information_gain(X, y, n_bins=10):
-    counts = np.bincount(y.astype(int))
-    p = counts[counts > 0] / counts.sum()
-    h_y = scipy_entropy(p, base=2)
-    ig = np.zeros(X.shape[1])
-    for i in range(X.shape[1]):
-        col = X[:, i]
-        if col.max() == col.min():
-            continue
-        bins = np.linspace(col.min(), col.max(), n_bins + 1)
-        digi = np.clip(np.digitize(col, bins[:-1]) - 1, 0, n_bins - 1)
-        h_c = 0.0
-        for b in range(n_bins):
-            mask = digi == b
-            nb = mask.sum()
-            if nb == 0: continue
-            yb = y[mask].astype(int)
-            pb_y = np.bincount(yb, minlength=len(counts)) / nb
-            pb_y = pb_y[pb_y > 0]
-            h_c += (nb / len(y)) * scipy_entropy(pb_y, base=2)
-        ig[i] = h_y - h_c
-    return ig
+def _discretize_quantile(X, n_bins=10):
+    """Discretiza X (n×d) em bins por quantil para estimadores baseados em entropia."""
+    n, d = X.shape
+    Xd = np.empty_like(X, dtype=np.int32)
+    for j in range(d):
+        col = X[:, j]
+        try:
+            bins = np.unique(np.quantile(col, np.linspace(0, 1, n_bins + 1)))
+            if bins.size < 2:
+                Xd[:, j] = 0
+            else:
+                Xd[:, j] = np.clip(np.digitize(col, bins[1:-1]), 0, n_bins - 1)
+        except Exception:
+            Xd[:, j] = 0
+    return Xd
 
 
-def score_ig(X, y):
-    return information_gain(X, y)
+def _entropy(p):
+    p = p[p > 0]
+    return -float(np.sum(p * np.log2(p)))
+
+
+def information_gain(X, y):
+    Xd = _discretize_quantile(X)
+    n = len(y)
+    py = np.bincount(y) / n
+    Hy = _entropy(py)
+    igs = np.zeros(X.shape[1])
+    for j in range(X.shape[1]):
+        col = Xd[:, j]
+        Hyx = 0.0
+        for v in np.unique(col):
+            mask = col == v
+            p_v = mask.mean()
+            sub = y[mask]
+            Hyx += p_v * _entropy(np.bincount(sub) / sub.size)
+        igs[j] = Hy - Hyx
+    return igs
 
 
 def score_mi(X, y):
-    # Subamostra para acelerar
-    n_mi = min(20_000, len(X))
-    rng = np.random.default_rng(RANDOM_SEED)
-    idx = rng.choice(len(X), size=n_mi, replace=False)
-    return mutual_info_classif(X[idx], y[idx], random_state=RANDOM_SEED)
+    return mutual_info_classif(X, y, random_state=RANDOM_SEED, n_neighbors=3)
 
 
 def score_anova(X, y):
-    sk = SelectKBest(f_classif, k="all").fit(X, y)
-    return np.nan_to_num(sk.scores_, nan=0.0)
+    f, _ = f_classif(X, y)
+    return np.nan_to_num(f, nan=0.0)
 
 
-def score_rf_importance(X, y):
-    n_sub = min(30_000, len(X))
+def score_rf_importance(X, y, n_sub=20000):
+    n_sub = min(n_sub, len(X))
     rng = np.random.default_rng(RANDOM_SEED)
     idx = rng.choice(len(X), size=n_sub, replace=False)
     rf = RandomForestClassifier(
@@ -147,12 +162,103 @@ def score_ig_mi_60_40(X, y):
     return 0.6 * ig_n + 0.4 * mi_n
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#   CRITÉRIOS MULTIVARIADOS (relevância + redundância)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#   IMPORTANTE: estes métodos são GULOSOS e dependentes de k. Não devolvem um
+#   vetor de escores ordenável — devolvem diretamente uma SEQUÊNCIA ORDENADA
+#   de índices selecionados. Por consistência com a interface dos demais
+#   métodos, retornamos um "ranking score" sintético = 1/(rank+1).
+
+def _pairwise_mi_matrix(X, n_sub=10000):
+    """Matriz d×d de MI entre pares de atributos (estimada por subamostragem)."""
+    n_sub = min(n_sub, len(X))
+    rng = np.random.default_rng(RANDOM_SEED)
+    idx = rng.choice(len(X), size=n_sub, replace=False)
+    Xs = X[idx]
+    d = Xs.shape[1]
+    M = np.zeros((d, d), dtype=np.float32)
+    log.info(f"  pré-computando matriz MI {d}x{d} (subamostra {n_sub})...")
+    for j in range(d):
+        # MI(x_j ; x_k) para todo k>=j  (simétrico)
+        target = Xs[:, j]
+        target_disc = pd.qcut(pd.Series(target), q=10, labels=False, duplicates="drop").to_numpy()
+        target_disc = np.nan_to_num(target_disc, nan=-1).astype(int)
+        if target_disc.max() < 1:
+            M[j, j:] = 0.0; continue
+        M[j, j:] = mutual_info_classif(
+            Xs[:, j:], target_disc, random_state=RANDOM_SEED, n_neighbors=3,
+        )
+        M[j:, j] = M[j, j:]
+    return M
+
+
+def _greedy_select(rel, MI_pair, k_max, criterio):
+    """
+    Seleção gulosa multivariada.
+      rel       : array (d,) com relevância MI(x_j ; y).
+      MI_pair   : matriz (d,d) com MI(x_j ; x_k).
+      criterio  : 'mrmr' | 'jmi' | 'cmim'
+    Retorna lista ordenada de índices selecionados.
+    """
+    d = len(rel)
+    k_max = min(k_max, d)
+    selected = []
+    remaining = list(range(d))
+    selected.append(int(np.argmax(rel)))
+    remaining.remove(selected[0])
+
+    while len(selected) < k_max and remaining:
+        best_j, best_score = None, -np.inf
+        S = np.array(selected)
+        for j in remaining:
+            if criterio == "mrmr":
+                redund = MI_pair[j, S].mean()
+                score = rel[j] - redund
+            elif criterio == "jmi":
+                # JMI: rel[j] + soma sobre s in S de MI(x_j , x_s ; y)
+                # Aproximação clássica: usa (MI(j,y) - MI(j,s)) somada
+                score = float(np.sum(rel[j] + rel[S] - MI_pair[j, S]))
+            elif criterio == "cmim":
+                # CMIM: minimiza max_s MI(x_j ; x_s | y)
+                # Aproximação: rel[j] - max_s MI(j, s)
+                score = rel[j] - MI_pair[j, S].max()
+            else:
+                raise ValueError(f"Critério inválido: {criterio}")
+            if score > best_score:
+                best_score = score; best_j = j
+        selected.append(int(best_j))
+        remaining.remove(best_j)
+
+    return selected
+
+
+def _multivariado_factory(criterio: str):
+    """Devolve uma função score(X,y) compatível com a interface dos demais métodos."""
+    def _score(X, y):
+        rel = score_mi(X, y)
+        MI_pair = _pairwise_mi_matrix(X)
+        order = _greedy_select(rel, MI_pair, k_max=X.shape[1], criterio=criterio)
+        # ranking → score sintético (maior = mais bem ranqueado)
+        scores = np.zeros(X.shape[1])
+        for rank, j in enumerate(order):
+            scores[j] = 1.0 / (rank + 1)
+        return scores
+    return _score
+
+
 METODOS = {
-    "Information_Gain":      score_ig,
+    # Univariados (baselines)
+    "Information_Gain":      information_gain,
     "Mutual_Information":    score_mi,
     "ANOVA_F":               score_anova,
     "RF_Feature_Importance": score_rf_importance,
     "IG_MI_60_40":           score_ig_mi_60_40,
+    # Multivariados (relevância + redundância)
+    "mRMR":                  _multivariado_factory("mrmr"),
+    "JMI":                   _multivariado_factory("jmi"),
+    "CMIM":                  _multivariado_factory("cmim"),
 }
 
 
@@ -163,7 +269,9 @@ def selecionar_top_k(scores, k, n_features):
     return np.argsort(scores)[::-1][:k]
 
 
-# ─── Avaliação ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#   AVALIAÇÃO
+# ═══════════════════════════════════════════════════════════════════════════
 
 def avaliar_combinacao(metodo_nome, k, scores, X_tr, X_val, X_te,
                         y_tr, y_val, y_te, n_cls):
@@ -183,142 +291,96 @@ def avaliar_combinacao(metodo_nome, k, scores, X_tr, X_val, X_te,
         EpochLogger(log, prefix=f"{metodo_nome}_k{k} "),
     ]
     m.fit(Xtr_s, y_tr, validation_data=(Xv_s, y_val),
-          epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0, callbacks=cb)
-    yp = np.argmax(m.predict(Xte_s, verbose=0, batch_size=BATCH_SIZE), axis=1)
-    r = metricas_completas(y_te, yp, n_classes=n_cls)
-    r.update({
-        "metodo": metodo_nome,
-        "k": k if isinstance(k, str) else int(k),
-        "k_real": int(len(idx)),
-        "tempo_s": time.time() - t0,
-    })
-    return r
+          epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=cb, verbose=0)
+    y_pred = np.argmax(m.predict(Xte_s, batch_size=BATCH_SIZE, verbose=0), axis=1)
+    out = metricas_completas(y_te, y_pred, n_cls)
+    out.update(metodo=metodo_nome, k=str(k), k_real=len(idx), tempo_s=time.time() - t0)
+    return out
 
 
-# ─── Plot ──────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#   PIPELINE PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════════════
 
-def plot_comparativo(df):
-    # Normaliza coluna k para valor numérico para plot ordenado
-    df = df.copy()
-    df["k_plot"] = df["k_real"]
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    metr = [("recall_macro", "Recall-macro (PRIMÁRIO)"),
-            ("mcc", "MCC"),
-            ("f1_macro", "F1-macro"),
-            ("fpr_macro", "FPR-macro")]
-    for ax, (col, lbl) in zip(axes.flat, metr):
-        if col not in df.columns: continue
-        for metodo in df["metodo"].unique():
-            sub = df[df["metodo"] == metodo].sort_values("k_plot")
-            ax.plot(sub["k_plot"], sub[col], marker="o", label=metodo)
-        ax.set_title(lbl); ax.set_xlabel("k (features selecionadas)")
-        ax.legend(fontsize=7, loc="best")
-        ax.grid(alpha=0.3)
-    fig.suptitle("Análise 3 — Seleção de Features sobre Universo Completo",
-                 fontsize=12, fontweight="bold")
-    fig.tight_layout()
-    p = fig_path(ANALISE_ID, "comparativo_selecao")
-    fig.savefig(p, dpi=300); plt.close(fig)
-    return p
+def executar(dataset_disponivel: bool = True) -> None:
+    log.info(f"ANÁLISE 3 — Teoria da Informação ({len(METODOS)} métodos × {len(K_GRID)} valores de k)")
 
+    Xfull, yfull = safe_run(log, "carregar_dataset_real", carregar_dataset_real)
+    if Xfull is None:
+        log.error("Sem dataset real. Abortando."); return
+    n_cls = int(np.max(yfull) + 1)
+    log.info(f"Dataset: {Xfull.shape[0]:,} amostras × {Xfull.shape[1]} features × {n_cls} classes")
 
-# ─── Main ──────────────────────────────────────────────────────────────────
-
-def main():
-    rel = Relatorio(ANALISE_ID)
-    log.info("ANÁLISE 3 — Seleção de Features (5 métodos × 6 valores de k)")
-
-    if not verificar_dataset(interativo=False):
-        log.error("Dataset real ausente — análise abortada.")
-        return
-
-    ok, dados = safe_run(log, "carregar_dataset_real",
-                         carregar_dataset_real,
-                         n_amostras_max=120_000, select_features=False)
-    if not ok or dados is None:
-        log.error("Falha ao carregar dataset.")
-        return
-    X_raw, y, _ = dados
-    n_cls = int(np.max(y) + 1)
-    n_feat_full = X_raw.shape[1]
-    log.info(f"Universo de features: {n_feat_full} atributos numéricos")
-    log.info(f"Dataset: {X_raw.shape[0]:,} amostras × {n_cls} classes")
-
-    X_tr_r, X_val_r, X_te_r, y_tr, y_val, y_te = stratified_split_3way(
-        X_raw, y, val_frac=0.15, test_frac=0.15, seed=RANDOM_SEED, logger=log,
+    X_tr_raw, X_val_raw, X_te_raw, y_tr, y_val, y_te = stratified_split_3way(
+        Xfull, yfull, val_frac=0.15, test_frac=0.15, seed=RANDOM_SEED,
     )
-    X_tr, X_val, X_te, _ = fit_scaler_no_leakage(X_tr_r, X_val_r, X_te_r)
+    X_tr, X_val, X_te = fit_scaler_no_leakage(X_tr_raw, X_val_raw, X_te_raw)
+    log.info(f"Split: treino={len(y_tr):,} val={len(y_val):,} teste={len(y_te):,}")
 
-    # Calcula scores de cada método UMA VEZ (apenas no treino — evita leakage)
-    scores_cache = {}
+    resultados = []
     for metodo_nome, score_fn in METODOS.items():
-        ok, scores = safe_run(log, f"calcular scores ({metodo_nome})",
-                               score_fn, X_tr, y_tr)
-        if ok and scores is not None:
-            scores_cache[metodo_nome] = scores
-        else:
-            log.warning(f"Método {metodo_nome} indisponível — pulando.")
-
-    # Avalia cada combinação (método, k)
-    res = []
-    for metodo_nome, scores in scores_cache.items():
+        log.info(f">>> Computando scores: {metodo_nome}")
+        scores = safe_run(log, f"score_{metodo_nome}", lambda f=score_fn: f(X_tr, y_tr))
+        if scores is None:
+            log.error(f"FALHA em scores de {metodo_nome}. Pulando."); continue
         for k in K_GRID:
-            label = f"{metodo_nome}_k{k}"
-            ok, r = safe_run(log, label,
-                              avaliar_combinacao,
-                              metodo_nome, k, scores,
-                              X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls)
-            if ok and r:
-                res.append(r)
-                log.info(f"  {label}: recall={r['recall_macro']:.4f} "
-                         f"mcc={r['mcc']:.4f} f1={r['f1_macro']:.4f}")
+            tag = f"{metodo_nome}_k{k}"
+            out = safe_run(
+                log, tag,
+                lambda mn=metodo_nome, kk=k, sc=scores:
+                    avaliar_combinacao(mn, kk, sc, X_tr, X_val, X_te,
+                                       y_tr, y_val, y_te, n_cls),
+            )
+            if out is not None:
+                resultados.append(out)
 
-    if not res:
-        log.error("Nenhuma combinação produziu resultado válido.")
-        return
+    if not resultados:
+        log.error("Nenhuma combinação concluída com sucesso."); return
 
-    df = pd.DataFrame(res)
+    df = pd.DataFrame(resultados)
     csv_path = tab_path(ANALISE_ID, "metricas_selecao")
-    safe_run(log, "salvar CSV", df.to_csv, csv_path, index=False)
+    safe_run(log, "salvar CSV", lambda: df.to_csv(csv_path, index=False))
     log.info(f"Tabela: {csv_path}")
+    safe_run(log, "plot_comparativo", lambda: _plot(df))
 
-    safe_run(log, "plot_comparativo", plot_comparativo, df)
-
-    # Veredito: melhor combinação por recall_macro
-    venc = max(res, key=lambda r: r["recall_macro"])
+    vencedor = df.sort_values("recall_macro", ascending=False).iloc[0]
     log.info("=" * 62)
-    log.info(f"MELHOR COMBINAÇÃO: {venc['metodo']} k={venc['k']}  "
-             f"recall={venc['recall_macro']:.4f} mcc={venc['mcc']:.4f} "
-             f"f1={venc['f1_macro']:.4f} fpr={venc['fpr_macro']:.4f}")
-    # Também mostra o IG_MI_60_40 (estratégia oficial) para comparação direta
-    igmi = [r for r in res if r["metodo"] == "IG_MI_60_40"]
-    if igmi:
-        igmi_best = max(igmi, key=lambda r: r["recall_macro"])
-        log.info(f"IG_MI_60_40 (oficial) melhor: k={igmi_best['k']}  "
-                 f"recall={igmi_best['recall_macro']:.4f} "
-                 f"mcc={igmi_best['mcc']:.4f}")
+    log.info(
+        f"VENCEDOR (recall_macro): {vencedor['metodo']} (k={vencedor['k']})  "
+        f"recall={vencedor['recall_macro']:.4f} mcc={vencedor['mcc']:.4f}"
+    )
     log.info("=" * 62)
 
-    try:
-        rel.secao("Resumo dos Resultados")
-        rel.tabela_df(df, "Métricas para cada (método, k)")
-        rel.secao("Veredito")
-        rel.texto(f"Melhor combinação por recall_macro: **{venc['metodo']} (k={venc['k']})**.")
-        rel.salvar()
-    except Exception as e:
-        log_exception(log, "rel.salvar", e)
 
-
-def executar(dataset_disponivel: bool = True, **kwargs) -> None:
-    try:
-        main()
-    except Exception as e:
-        log_exception(log, "executar", e)
+def _plot(df: pd.DataFrame) -> None:
+    """Painel 2x2: curvas (recall, MCC, F1, FPR) vs. k para cada método.
+    Sem título embutido; paleta neutra."""
+    df = df.copy()
+    df["k_num"] = df["k_real"].astype(int)
+    fig, ax = plt.subplots(2, 2, figsize=(13, 9))
+    metricas = [
+        ("recall_macro", "Recall-macro", ax[0, 0]),
+        ("mcc",          "MCC",          ax[0, 1]),
+        ("f1_macro",     "F1-macro",     ax[1, 0]),
+        ("fpr_macro",    "FPR-macro",    ax[1, 1]),
+    ]
+    metodos = sorted(df["metodo"].unique())
+    cores = sns.color_palette("Greys", n_colors=len(metodos) + 2)[2:]
+    estilos = ["-", "--", "-.", ":", "-", "--", "-.", ":"][:len(metodos)]
+    marcadores = ["o", "s", "^", "D", "v", "P", "X", "*"][:len(metodos)]
+    for col, titulo, a in metricas:
+        for i, met in enumerate(metodos):
+            sub = df[df["metodo"] == met].sort_values("k_num")
+            a.plot(sub["k_num"], sub[col],
+                   linestyle=estilos[i], marker=marcadores[i],
+                   color=cores[i], label=met, linewidth=1.5, markersize=6)
+        a.set_title(titulo, fontsize=13, fontweight="bold")
+        a.set_xlabel("k (atributos selecionados)"); a.set_ylabel(col)
+        a.grid(True, alpha=0.3); a.legend(fontsize=8, loc="best")
+    plt.tight_layout()
+    plt.savefig(fig_path(ANALISE_ID, "comparativo_selecao"), dpi=160, bbox_inches="tight")
+    plt.close(fig)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log_exception(log, "main", e)
-        sys.exit(0)
+    executar()

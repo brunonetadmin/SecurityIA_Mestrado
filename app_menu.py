@@ -436,24 +436,216 @@ def execute_test_analysis(analysis_id: int) -> bool:
         return False
 
 
-def execute_all_tests() -> None:
-    results: Dict[int, Tuple[bool, float]] = {}
-    started = time.perf_counter()
-    for analysis_id in sorted(TEST_MODULES):
-        t0 = time.perf_counter()
-        ok = execute_test_analysis(analysis_id)
-        results[analysis_id] = (ok, time.perf_counter() - t0)
-        print()
-    total = time.perf_counter() - started
+def execute_test_in_background(analysis_id: int) -> None:
+    """
+    Executa UMA análise em background imune a SIGHUP. Mesma mecânica de
+    execute_all_tests, mas para uma única análise — útil para repetir
+    apenas a que falhou sem refazer todas.
+    """
+    import shlex
+    import textwrap
 
-    print_header("Tests > Summary")
-    section("Resumo da execução conjunta")
-    for analysis_id, (ok, elapsed) in results.items():
-        icon = badge_ok("OK") if ok else badge_err("FALHA")
-        print(f"  [{analysis_id}] {TEST_MODULES[analysis_id][1][:56]:<56} {icon}  {elapsed:6.1f}s")
-    print(hline())
-    print(f"  Tempo total : {total:.1f}s ({total/60:.1f} min)")
-    print(f"  Relatórios  : {get_reports_dir()}")
+    print_header(f"Tests > Análise {analysis_id} em background")
+
+    mod_name, label = TEST_MODULES[analysis_id]
+    project_dir = ROOT_DIR
+    venv_python = (VENV_DIR / "bin" / "python3") if VENV_DIR.exists() else Path(sys.executable)
+    tests_dir = get_tests_dir()
+    logs_dir = tests_dir / "Logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    run_log = logs_dir / f"run_{mod_name}.log"
+    script_path = tests_dir / f"{mod_name}.py"
+
+    if not script_path.exists():
+        print("  " + badge_err(f"Script não encontrado: {script_path}"))
+        pause()
+        return
+
+    # Aborta se a mesma análise já está rodando
+    try:
+        check = subprocess.run(
+            ["pgrep", "-f", f"{mod_name}.py"],
+            capture_output=True, text=True, check=False,
+        )
+        if check.returncode == 0 and check.stdout.strip():
+            print("  " + badge_warn(f"Já existe execução de {mod_name} em andamento."))
+            print(f"    PIDs: {check.stdout.strip()}")
+            pause()
+            return
+    except FileNotFoundError:
+        pass
+
+    bash_runner = textwrap.dedent(f"""\
+        set -u
+        cd {shlex.quote(str(project_dir))}
+        RUN_LOG={shlex.quote(str(run_log))}
+        ts() {{ date '+%Y-%m-%d %H:%M:%S'; }}
+        {{
+          echo "==========================================================="
+          echo "[$(ts)] Iniciando {mod_name} em background"
+          echo "PID: $$"
+          echo "==========================================================="
+        }} >> "$RUN_LOG"
+        if {shlex.quote(str(venv_python))} {shlex.quote(str(script_path))} >> "$RUN_LOG" 2>&1; then
+          echo "[$(ts)] CONCLUIDO" >> "$RUN_LOG"
+        else
+          echo "[$(ts)] FALHOU (exit=$?)" >> "$RUN_LOG"
+        fi
+    """)
+
+    try:
+        proc = subprocess.Popen(
+            ["nohup", "setsid", "bash", "-c", bash_runner],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+            cwd=str(project_dir),
+        )
+    except Exception as exc:
+        print("  " + badge_err(f"Erro ao disparar execução: {exc}"))
+        pause()
+        return
+
+    section(f"Análise {analysis_id} em background — {label}")
+    print(f"  PID             : {proc.pid}")
+    print(f"  Log mestre      : {run_log}")
+    print(f"  Log detalhado   : {logs_dir}/analise_{analysis_id}_<timestamp>.log")
+    print()
+    print("  Acompanhar em outro terminal:")
+    print(f"    tail -f {run_log}")
+    print(f"    pgrep -af {mod_name}")
+    print()
+
+
+def execute_all_tests() -> None:
+    """
+    Executa as 4 análises em SEQUÊNCIA, em PROCESSO DE FUNDO IMUNE A SIGHUP.
+
+    Comportamento:
+      - Cada análise em subprocess Python independente (sem leak de TF acumulado
+        entre análises, sem importlib.reload).
+      - Falha de uma análise NÃO interrompe a fila — segue para a próxima.
+      - O processo mestre roda em novo grupo de sessão (setsid + nohup),
+        portanto sobrevive ao encerramento do SSH e do próprio app_menu.
+      - Logs persistidos em Tests/Logs/ (run_all.log + um log por análise).
+      - O usuário recebe o terminal de volta imediatamente.
+    """
+    import shlex
+    import textwrap
+
+    print_header("Tests > Execução conjunta em background")
+
+    project_dir = ROOT_DIR
+    venv_python = (VENV_DIR / "bin" / "python3") if VENV_DIR.exists() else Path(sys.executable)
+    tests_dir = get_tests_dir()
+    logs_dir = tests_dir / "Logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    run_log = logs_dir / "run_all.log"
+
+    # Aborta se já existe execução em andamento
+    try:
+        check = subprocess.run(
+            ["pgrep", "-f", r"analise_.*\.py"],
+            capture_output=True, text=True, check=False,
+        )
+        if check.returncode == 0 and check.stdout.strip():
+            print("  " + badge_warn("Já há análises em execução:"))
+            for line in check.stdout.strip().splitlines():
+                print(f"    PID {line}")
+            print()
+            print("  Para cancelar e reiniciar:  pkill -f analise_")
+            pause()
+            return
+    except FileNotFoundError:
+        # pgrep ausente — segue sem checar concorrência
+        pass
+
+    # Resolve caminhos das análises a partir de TEST_MODULES
+    scripts: List[Path] = []
+    for analysis_id in sorted(TEST_MODULES):
+        mod_name, _ = TEST_MODULES[analysis_id]
+        script_path = tests_dir / f"{mod_name}.py"
+        if not script_path.exists():
+            print("  " + badge_err(f"Não encontrado: {script_path}"))
+            pause()
+            return
+        scripts.append(script_path)
+
+    # Constroi o "runner" inline em bash. Cada análise como subprocess Python
+    # independente. Saídas anexadas em run_log.
+    quoted_scripts = " \\\n        ".join(shlex.quote(str(s)) for s in scripts)
+    bash_runner = textwrap.dedent(f"""\
+        set -u
+        cd {shlex.quote(str(project_dir))}
+        RUN_LOG={shlex.quote(str(run_log))}
+        PYBIN={shlex.quote(str(venv_python))}
+        ts() {{ date '+%Y-%m-%d %H:%M:%S'; }}
+        {{
+          echo "==========================================================="
+          echo "[$(ts)] Iniciando execução conjunta em background"
+          echo "PID master: $$"
+          echo "Python    : $PYBIN"
+          echo "==========================================================="
+        }} >> "$RUN_LOG"
+        for script in \\
+            {quoted_scripts}; do
+          {{
+            echo ""
+            echo "[$(ts)] >>> Iniciando $(basename "$script")"
+          }} >> "$RUN_LOG"
+          if "$PYBIN" "$script" >> "$RUN_LOG" 2>&1; then
+            echo "[$(ts)] <<< $(basename "$script") CONCLUIDO" >> "$RUN_LOG"
+          else
+            rc=$?
+            echo "[$(ts)] <<< $(basename "$script") FALHOU (exit=$rc)" >> "$RUN_LOG"
+          fi
+        done
+        {{
+          echo ""
+          echo "[$(ts)] FIM da execução conjunta."
+          echo "==========================================================="
+        }} >> "$RUN_LOG"
+    """)
+
+    # Dispara em novo grupo de sessão, imune a SIGHUP
+    try:
+        proc = subprocess.Popen(
+            ["nohup", "setsid", "bash", "-c", bash_runner],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+            cwd=str(project_dir),
+        )
+    except FileNotFoundError as exc:
+        print("  " + badge_err(f"Falha ao iniciar (binário ausente): {exc}"))
+        pause()
+        return
+    except Exception as exc:
+        print("  " + badge_err(f"Erro ao disparar execução: {exc}"))
+        pause()
+        return
+
+    section("Execução iniciada em background")
+    print(f"  PID master      : {proc.pid}")
+    print(f"  Log mestre      : {run_log}")
+    print(f"  Logs detalhados : {logs_dir}/analise_<n>_<timestamp>.log")
+    print()
+    print("  A execução é IMUNE ao encerramento do SSH e do app_menu.")
+    print("  Você pode fechar o terminal — as 4 análises continuarão.")
+    print()
+    print("  Acompanhar progresso (em outro terminal):")
+    print(f"    tail -f {run_log}")
+    print()
+    print("  Verificar se ainda está rodando:")
+    print("    pgrep -af analise_")
+    print()
+    print("  Cancelar a execução:")
+    print("    pkill -f analise_")
+    print()
     pause()
 
 
@@ -602,7 +794,15 @@ def tests_menu() -> None:
         if choice == "0":
             return
         if choice in {"1", "2", "3", "4"}:
-            execute_test_analysis(int(choice))
+            print()
+            print("  Modo de execução:")
+            print("    [F] Foreground (vê o progresso na tela, depende da sessão SSH)")
+            print("    [B] Background (libera o terminal, imune ao SSH)")
+            modo = menu_choice(["F", "B", "f", "b"]).upper()
+            if modo == "B":
+                execute_test_in_background(int(choice))
+            else:
+                execute_test_analysis(int(choice))
             pause()
         elif choice == "5":
             execute_all_tests()
