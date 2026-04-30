@@ -305,9 +305,16 @@ def avaliar_combinacao(metodo_nome, k, scores, X_tr, X_val, X_te,
 def executar(dataset_disponivel: bool = True) -> None:
     log.info(f"ANÁLISE 3 — Teoria da Informação ({len(METODOS)} métodos × {len(K_GRID)} valores de k)")
 
-    Xfull, yfull = safe_run(log, "carregar_dataset_real", carregar_dataset_real)
-    if Xfull is None:
+    dataset = safe_run(log, "carregar_dataset_real", carregar_dataset_real)
+    if dataset is None:
         log.error("Sem dataset real. Abortando."); return
+    # carregar_dataset_real() retorna (X, y) ou (X, y, label_encoder)
+    if isinstance(dataset, tuple) and len(dataset) >= 2:
+        Xfull, yfull = dataset[0], dataset[1]
+    else:
+        log.error(f"Formato inesperado de dataset: {type(dataset)}"); return
+    Xfull = np.asarray(Xfull, dtype=np.float32)
+    yfull = np.asarray(yfull).astype(np.int64).ravel()
     n_cls = int(np.max(yfull) + 1)
     log.info(f"Dataset: {Xfull.shape[0]:,} amostras × {Xfull.shape[1]} features × {n_cls} classes")
 
