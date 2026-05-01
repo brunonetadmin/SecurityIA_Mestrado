@@ -59,7 +59,10 @@ def _read_index() -> dict:
 
 
 def _write_index(idx: dict) -> None:
-    _ensure_layout()
+    # NÃO chamar _ensure_layout() aqui: gera recursão infinita quando
+    # _ensure_layout precisa criar o INDEX_FILE pela primeira vez.
+    # Todos os callers externos chamam _read_index() (que já chama
+    # _ensure_layout) imediatamente antes deste _write_index.
     tmp = INDEX_FILE.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(idx, f, indent=2, ensure_ascii=False)

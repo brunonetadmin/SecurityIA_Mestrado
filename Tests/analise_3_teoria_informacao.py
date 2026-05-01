@@ -74,7 +74,7 @@ log = get_logger(ANALISE_ID, "analise_3")
 def _run(label, fn, *a, **kw):
     """Wrapper: executa `fn` via safe_run e retorna apenas o resultado.
     Se `fn` falhar, devolve None (safe_run já loga a exceção)."""
-    ok, res = _run(label, fn, *a, **kw)
+    ok, res = safe_run(log, label, fn, *a, **kw)
     return res if ok else None
 
 
@@ -352,8 +352,8 @@ def executar(dataset_disponivel: bool = True) -> None:
             log.error(f"FALHA em scores de {metodo_nome}. Pulando."); continue
         for k in K_GRID:
             tag = f"{metodo_nome}_k{k}"
-            out = safe_run(
-                log, tag,
+            out = _run(
+                tag,
                 lambda mn=metodo_nome, kk=k, sc=scores:
                     avaliar_combinacao(mn, kk, sc, X_tr, X_val, X_te,
                                        y_tr, y_val, y_te, n_cls),

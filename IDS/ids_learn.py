@@ -62,69 +62,19 @@ from scipy.stats import entropy as scipy_entropy
 
 from IDS.modules.utils import get_learn_logger, get_app_logger, timed, format_duration
 from IDS.modules.versioning import versioned_path
+# CRÍTICO: importa BahdanauAttention e make_focal_loss_class_balanced do
+# módulo central. O import executa @register_keras_serializable, registrando
+# os componentes no objeto store do Keras — o que torna o modelo salvo
+# recarregável via keras.load_model() SEM custom_objects.
+from IDS.modules.custom_layers import (
+    BahdanauAttention,
+    make_focal_loss_class_balanced,
+)
 
 log  = get_learn_logger()
 alog = get_app_logger()
 tf.random.set_seed(Config.TRAINING_CONFIG["random_state"])
 np.random.seed(Config.TRAINING_CONFIG["random_state"])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Atenção de Bahdanau
-# ─────────────────────────────────────────────────────────────────────────────
-
-class BahdanauAttention(tf.keras.layers.Layer):
-    """
-    Atenção aditiva (Bahdanau et al., 2015).
-        e_t = v^T · tanh(W_h · h_t + b_a)
-        α_t = softmax(e_t)
-        c   = Σ α_t · h_t
-    """
-    def __init__(self, units: int = 64, **kwargs):
-        super().__init__(**kwargs)
-        self.units = units
-        self.W = Dense(units, use_bias=True, kernel_initializer="glorot_uniform")
-        self.V = Dense(1, use_bias=False, kernel_initializer="glorot_uniform")
-
-    def call(self, hidden_states, training=False):
-        score   = self.V(tf.nn.tanh(self.W(hidden_states)))
-        weights = tf.nn.softmax(score, axis=1)
-        context = tf.reduce_sum(weights * hidden_states, axis=1)
-        return context, weights
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"units": self.units})
-        return cfg
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Focal Loss reponderada (Cui et al., 2019; Lin et al., 2017)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def make_focal_loss_class_balanced(class_counts, gamma: float = 2.0,
-                                   beta: float = 0.9999):
-    """
-    Constrói Focal Loss com pesos por classe baseados em number of effective
-    samples. Compatível com sparse_categorical labels.
-    """
-    class_counts = np.asarray(class_counts, dtype=np.float64)
-    n_eff = (1.0 - np.power(beta, class_counts)) / (1.0 - beta)
-    weights = (1.0 - beta) / np.maximum(n_eff, 1e-12)
-    weights = weights / weights.sum() * len(weights)
-    weights_tf = tf.constant(weights, dtype=tf.float32)
-
-    def loss_fn(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.int32)
-        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
-        probs = tf.gather(y_pred, y_true, axis=1, batch_dims=1)
-        w = tf.gather(weights_tf, y_true)
-        focal_term = tf.pow(1.0 - probs, gamma)
-        ce_term = -tf.math.log(probs)
-        return tf.reduce_mean(w * focal_term * ce_term)
-
-    loss_fn.__name__ = "focal_loss_cb"
-    return loss_fn
 
 
 def compute_class_weight_dict(y_train_original):
@@ -577,12 +527,28 @@ class ModelTrainer:
         patience = ft_cfg["patience"] if finetune else cfg["patience"]
         bs       = cfg["batch_size"]
 
+        # Hiperparâmetros de convergência (lidos do TRAINING_CONFIG; defaults
+        # mantêm compatibilidade com configs antigos).
+        es_min_delta   = cfg.get("early_stopping_min_delta", 0.0)
+        lr_factor      = cfg.get("lr_reduce_factor", 0.5)
+        lr_patience    = cfg.get("lr_reduce_patience", max(3, patience // 2))
+        lr_min         = cfg.get("lr_min", 1e-7)
+
         callbacks = [
-            EarlyStopping(monitor="val_loss", patience=patience,
-                          restore_best_weights=True, verbose=1),
-            ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                              patience=max(3, patience // 2),
-                              min_lr=1e-7, verbose=1),
+            EarlyStopping(
+                monitor="val_loss",
+                patience=patience,
+                min_delta=es_min_delta,
+                restore_best_weights=True,
+                verbose=1,
+            ),
+            ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=lr_factor,
+                patience=lr_patience,
+                min_lr=lr_min,
+                verbose=1,
+            ),
         ]
 
         if not (class_weight is not None and cfg.get("use_class_weight", False)):

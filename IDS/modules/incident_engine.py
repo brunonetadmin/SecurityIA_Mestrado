@@ -31,6 +31,13 @@ import joblib
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 import tensorflow as tf
 from keras.models import load_model as keras_load_model
+
+# CRÍTICO: importar custom_layers ANTES de qualquer load_model().
+# O ato de importar executa os @register_keras_serializable, registrando
+# BahdanauAttention e focal_loss_cb_placeholder no objeto store do Keras.
+# Sem este import, keras_load_model() falha com:
+#   TypeError: Could not locate class 'BahdanauAttention'
+from IDS.modules import custom_layers  # noqa: F401
 tf.get_logger().setLevel("ERROR")
 
 import sys
@@ -136,7 +143,10 @@ class ModelArtifacts:
                 f"Execute o treinamento primeiro: python3 IDS/ids_learn.py train"
             )
         print(f"  ↳ Carregando {model_path.name} …", flush=True)
-        self.model   = keras_load_model(str(model_path))
+        # compile=False: em INFERÊNCIA não precisamos do otimizador nem da
+        # loss embarcada. Isso evita falhas com loss customizadas e remove
+        # latência do compile.
+        self.model   = keras_load_model(str(model_path), compile=False)
         self.scaler  = joblib.load(Config.MODEL_DIR / Config.SCALER_FILENAME)
         self.encoder = joblib.load(Config.MODEL_DIR / Config.LABEL_ENCODER_FILENAME)
 

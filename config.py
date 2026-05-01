@@ -74,7 +74,7 @@ class Config:
     # ------------------------------------------------------------------
     # IDS / operação
     # ------------------------------------------------------------------
-    CAPTURE_INTERFACE = "eth1"
+    CAPTURE_INTERFACE = "enp1s0"
     COLLECTOR_DIR = TEMP_DIR / "capture"
     COLLECTOR_SAMPLE_RATE = 1.0
     COLLECTOR_BUDGET_GB = 7.0
@@ -149,16 +149,33 @@ class Config:
 
     # ------------------------------------------------------------------
     # TRAINING_CONFIG — particionamento antes do balanceamento (D1)
+    #
+    # Calibração de tempo (validada com baseline de 23h30 / 50 épocas):
+    #   - epochs reduzido 50 → 30 (teto de segurança; early-stop deve disparar
+    #     em ~15-20 épocas baseado no histórico real).
+    #   - patience reduzido 10 → 4: o treino anterior teve 4 reduções de LR
+    #     consecutivas sem ganho real, consumindo ~12h após convergência.
+    #   - early_stopping_min_delta: força parada quando o ganho em val_loss
+    #     for menor que 1e-3. Sem isso, melhorias numéricas marginais
+    #     (~1e-5) impedem o early-stop.
+    #   - steps_per_execution 8 → 64: agrupa 64 steps por chamada Python,
+    #     reduz overhead em ~10-15% por época em CPU.
+    #   - lr_reduce_patience 2 + lr_reduce_factor 0.3: reduz LR mais rápido
+    #     e em passos maiores, acelerando convergência.
     # ------------------------------------------------------------------
     TRAINING_CONFIG = {
         "random_state": 42,
         "validation_split": 0.15,
         "test_split": 0.15,
-        "epochs": 50,
+        "epochs": 30,
         "batch_size": 4096,
-        "patience": 10,
+        "patience": 4,
+        "early_stopping_min_delta": 1e-3,
+        "lr_reduce_patience": 2,
+        "lr_reduce_factor": 0.3,
+        "lr_min": 1e-6,
         "force_retrain": False,
-        "steps_per_execution": 8,
+        "steps_per_execution": 64,
         # >>> Tratamento de desbalanceamento: APENAS via Focal Loss reponderada
         # (Cui et al. 2019). Class_weight no fit DESLIGADO para evitar dupla
         # penalização. Decisão validada empiricamente pela Análise 2.
