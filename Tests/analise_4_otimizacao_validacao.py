@@ -76,7 +76,7 @@ log = get_logger(ANALISE_ID, "analise_4")
 def _run(label, fn, *a, **kw):
     """Wrapper: executa `fn` via safe_run e retorna apenas o resultado.
     Se `fn` falhar, devolve None (safe_run já loga a exceção)."""
-    ok, res = _run(label, fn, *a, **kw)
+    ok, res = safe_run(log, label, fn, *a, **kw)
     return res if ok else None
 
 
@@ -258,8 +258,8 @@ def executar(dataset_disponivel: bool = True) -> None:
 
     # Reavaliação por K-fold da configuração vencedora (média ± desvio)
     log.info(">>> Reavaliação K-fold da configuração vencedora")
-    best_fold_metrics = safe_run(
-        log, "kfold_vencedor",
+    best_fold_metrics = _run(
+        "kfold_vencedor",
         lambda: avaliar_kfold(study.best_params, X_dev_raw, y_dev, n_cls,
                               log_prefix="best "),
     )

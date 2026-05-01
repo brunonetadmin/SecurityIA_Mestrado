@@ -73,7 +73,7 @@ log = get_logger(ANALISE_ID, "analise_2")
 def _run(label, fn, *a, **kw):
     """Wrapper: executa `fn` via safe_run e retorna apenas o resultado.
     Se `fn` falhar, devolve None (safe_run já loga a exceção)."""
-    ok, res = _run(label, fn, *a, **kw)
+    ok, res = safe_run(log, label, fn, *a, **kw)
     return res if ok else None
 
 
@@ -100,7 +100,7 @@ def build_mlp_bn(n_feat, n_cls, loss_fn):
 
 def focal_loss_pura(gamma=2.0):
     def fn(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.int32)
+        y_true = tf.reshape(tf.cast(y_true, tf.int32), [-1])
         y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
         p = tf.gather(y_pred, y_true, axis=1, batch_dims=1)
         return tf.reduce_mean(tf.pow(1.0 - p, gamma) * (-tf.math.log(p)))
@@ -116,7 +116,7 @@ def cb_focal_loss(class_counts, gamma=2.0, beta=0.9999):
     w = w / w.sum() * len(w)
     wt = tf.constant(w, dtype=tf.float32)
     def fn(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.int32)
+        y_true = tf.reshape(tf.cast(y_true, tf.int32), [-1])
         y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
         p = tf.gather(y_pred, y_true, axis=1, batch_dims=1)
         cw = tf.gather(wt, y_true)
@@ -236,7 +236,7 @@ def estrat_smote(X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls):
     dist = Counter(y_tr.astype(int))
     min_n = min(n for n in dist.values() if n > 1)
     k = max(1, min(5, min_n - 1))
-    sampler = SMOTE(k_neighbors=k, random_state=RANDOM_SEED, n_jobs=-1)
+    sampler = SMOTE(k_neighbors=k, random_state=RANDOM_SEED)
     X_res, y_res = _resample_seguro(sampler, "SMOTE", X_tr, y_tr)
     return avaliar("SMOTE", X_res, X_val, X_te, y_res, y_val, y_te, n_cls,
                    loss_fn="sparse_categorical_crossentropy")
@@ -252,7 +252,7 @@ def estrat_borderline_smote(X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls):
     k = max(1, min(5, min_n - 1))
     sampler = BorderlineSMOTE(
         k_neighbors=k, kind="borderline-2",
-        random_state=RANDOM_SEED, n_jobs=-1,
+        random_state=RANDOM_SEED,
     )
     X_res, y_res = _resample_seguro(sampler, "Borderline_SMOTE", X_tr, y_tr)
     return avaliar("Borderline_SMOTE", X_res, X_val, X_te, y_res, y_val, y_te, n_cls,
@@ -271,7 +271,7 @@ def estrat_smote_enn(X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls):
     k_smote = max(1, min(5, min_n - 1))
     k_enn = 3  # padrão da literatura (Batista et al., 2004)
     sampler = SMOTEENN(
-        smote=SMOTE(k_neighbors=k_smote, random_state=RANDOM_SEED, n_jobs=-1),
+        smote=SMOTE(k_neighbors=k_smote, random_state=RANDOM_SEED),
         enn=EditedNearestNeighbours(n_neighbors=k_enn, n_jobs=-1),
         random_state=RANDOM_SEED,
     )
@@ -346,8 +346,8 @@ def executar(dataset_disponivel: bool = True) -> None:
 
     resultados = []
     for nome, fn in ESTRATEGIAS:
-        out = safe_run(
-            log, nome,
+        out = _run(
+            nome,
             lambda f=fn: f(X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls),
         )
         if out is not None:

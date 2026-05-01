@@ -71,7 +71,7 @@ log = get_logger(ANALISE_ID, "analise_1")
 def _run(label, fn, *a, **kw):
     """Wrapper: executa `fn` via safe_run e retorna apenas o resultado.
     Se `fn` falhar, devolve None (safe_run já loga a exceção)."""
-    ok, res = _run(label, fn, *a, **kw)
+    ok, res = safe_run(log, label, fn, *a, **kw)
     return res if ok else None
 
 
