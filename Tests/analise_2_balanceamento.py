@@ -70,6 +70,14 @@ EPOCHS = 25
 PATIENCE = 5
 log = get_logger(ANALISE_ID, "analise_2")
 
+def _run(label, fn, *a, **kw):
+    """Wrapper: executa `fn` via safe_run e retorna apenas o resultado.
+    Se `fn` falhar, devolve None (safe_run já loga a exceção)."""
+    ok, res = _run(label, fn, *a, **kw)
+    return res if ok else None
+
+
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #   MODELO FIXO (MLP+BN) — mantém comparabilidade entre estratégias
@@ -332,7 +340,7 @@ def executar(dataset_disponivel: bool = True) -> None:
     X_tr_raw, X_val_raw, X_te_raw, y_tr, y_val, y_te = stratified_split_3way(
         Xfull, yfull, val_frac=0.15, test_frac=0.15, seed=RANDOM_SEED,
     )
-    X_tr, X_val, X_te = fit_scaler_no_leakage(X_tr_raw, X_val_raw, X_te_raw)
+    X_tr, X_val, X_te, _scaler = fit_scaler_no_leakage(X_tr_raw, X_val_raw, X_te_raw)
     log.info(f"Split: treino={len(y_tr):,} val={len(y_val):,} teste={len(y_te):,}")
     log.info(f"Distribuição treino: {dict(Counter(y_tr.astype(int)))}")
 
@@ -354,9 +362,9 @@ def executar(dataset_disponivel: bool = True) -> None:
 
     df = pd.DataFrame(resultados)
     csv_path = tab_path(ANALISE_ID, "metricas_balanceamento")
-    safe_run(log, "salvar CSV", lambda: df.to_csv(csv_path, index=False))
+    _run("salvar CSV", lambda: df.to_csv(csv_path, index=False))
     log.info(f"Tabela: {csv_path}")
-    safe_run(log, "plot_comparativo", lambda: _plot(df))
+    _run("plot_comparativo", lambda: _plot(df))
 
     vencedor = df.sort_values("recall_macro", ascending=False).iloc[0]
     log.info("=" * 62)

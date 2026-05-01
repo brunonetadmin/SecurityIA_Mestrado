@@ -73,6 +73,14 @@ N_FOLDS = 5
 N_TRIALS_OPTUNA = 30  # ajuste conforme orçamento computacional
 log = get_logger(ANALISE_ID, "analise_4")
 
+def _run(label, fn, *a, **kw):
+    """Wrapper: executa `fn` via safe_run e retorna apenas o resultado.
+    Se `fn` falhar, devolve None (safe_run já loga a exceção)."""
+    ok, res = _run(label, fn, *a, **kw)
+    return res if ok else None
+
+
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #   MODELO PARAMETRIZADO
@@ -284,8 +292,8 @@ def executar(dataset_disponivel: bool = True) -> None:
     df_folds = pd.DataFrame(best_fold_metrics)
     csv_trials = tab_path(ANALISE_ID, "metricas_otimizacao")
     csv_folds  = tab_path(ANALISE_ID, "kfold_vencedor")
-    safe_run(log, "salvar trials",  lambda: df_trials.to_csv(csv_trials, index=False))
-    safe_run(log, "salvar folds",   lambda: df_folds.to_csv(csv_folds, index=False))
+    _run("salvar trials",  lambda: df_trials.to_csv(csv_trials, index=False))
+    _run("salvar folds",   lambda: df_folds.to_csv(csv_folds, index=False))
     log.info(f"Tabela trials: {csv_trials}")
     log.info(f"Tabela folds : {csv_folds}")
 
@@ -309,10 +317,10 @@ def executar(dataset_disponivel: bool = True) -> None:
         "teste_fpr":    met_te["fpr_macro"],
     }])
     csv_resumo = tab_path(ANALISE_ID, "resumo_kfold_best")
-    safe_run(log, "salvar resumo", lambda: df_resumo.to_csv(csv_resumo, index=False))
+    _run("salvar resumo", lambda: df_resumo.to_csv(csv_resumo, index=False))
     log.info(f"Tabela resumo: {csv_resumo}")
 
-    safe_run(log, "plot_otimizacao", lambda: _plot(df_trials, df_folds))
+    _run("plot_otimizacao", lambda: _plot(df_trials, df_folds))
 
 
 def _plot(df_trials: pd.DataFrame, df_folds: pd.DataFrame) -> None:
