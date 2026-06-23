@@ -20,6 +20,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -40,7 +41,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 APP_NAME = "SecurityIA"
-APP_VERSION = "3.0.0"
+APP_VERSION = "1.0.0"
 APP_SUBTITLE = "Unified CLI for Tests and Intelligent IDS Operations"
 
 VENV_DIR = ROOT_DIR / ".venv"
@@ -870,23 +871,104 @@ def _proc_status_str(pid_file: Path) -> str:
     return color("PARADO", "red")
 
 
-def _run_background(cmd: list[str], log_file: Path | None = None,
-                    cwd: Path | None = None) -> subprocess.Popen:
-    """Inicia processo em background com stdout/stderr redirecionados."""
-    if log_file:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(log_file, "a", encoding="utf-8")
-    else:
-        fh = subprocess.DEVNULL
+# Script que carimba cada linha de stdin com data-hora. Gerado em disco na
+# primeira execução e reaproveitado. Garante que TODA linha do arquivo de log
+# — inclusive saída crua de Keras/TensorFlow e prints — tenha timestamp.
+_TIMESTAMPER_SRC = '''#!/usr/bin/env python3
+"""Prefixa cada linha de stdin com [YYYY-MM-DD HH:MM:SS].
 
-    proc = subprocess.Popen(
+Uso em pipeline:
+    <comando> 2>&1 | python3 -u _log_timestamper.py >> arquivo.log
+
+Gerado automaticamente pelo app_menu do SecurityIA. Não editar manualmente.
+"""
+import sys
+from datetime import datetime
+
+try:
+    for line in sys.stdin:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            sys.stdout.write(f"[{stamp}] {line}")
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            break
+except (KeyboardInterrupt, BrokenPipeError, OSError):
+    pass
+'''
+
+
+def _ensure_timestamper() -> Path | None:
+    """Garante a existência do script timestamper e retorna seu caminho.
+
+    Retorna None se não for possível criá-lo, caso em que _run_background
+    cai no redirecionamento direto (sem carimbo), preservando o funcionamento.
+    """
+    ts_path = _IDS_DIR / "_log_timestamper.py"
+    try:
+        if not ts_path.exists():
+            _IDS_DIR.mkdir(parents=True, exist_ok=True)
+            ts_path.write_text(_TIMESTAMPER_SRC, encoding="utf-8")
+        return ts_path
+    except OSError:
+        return None
+
+
+def _run_background(cmd: list[str], log_file: Path | None = None,
+                    cwd: Path | None = None,
+                    timestamp: bool = True) -> subprocess.Popen:
+    """Inicia processo em background com stdout/stderr redirecionados.
+
+    Quando log_file é fornecido e timestamp=True, a saída passa por um
+    pipeline que prefixa data-hora em cada linha, de modo que o arquivo de
+    log fique inteiramente carimbado — não apenas as linhas que passam pelo
+    logger (que já têm timestamp via Formatter), mas também a saída crua de
+    bibliotecas e prints. Injeta -u no interpretador Python para que o
+    acompanhamento em tempo real (follow) reflita o progresso sem buffering.
+    """
+    work_dir = str(cwd or ROOT_DIR)
+
+    # Sem arquivo de log: descarta a saída
+    if not log_file:
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=work_dir,
+            start_new_session=True,
+        )
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    ts_script = _ensure_timestamper() if timestamp else None
+
+    if ts_script is not None:
+        run_cmd = list(cmd)
+        # Streaming sem buffering quando o comando é o próprio interpretador
+        if (run_cmd and Path(run_cmd[0]).name.startswith("python")
+                and "-u" not in run_cmd):
+            run_cmd.insert(1, "-u")
+        cmd_str = " ".join(shlex.quote(c) for c in run_cmd)
+        pipeline = (
+            f"{cmd_str} 2>&1 | "
+            f"{shlex.quote(sys.executable)} -u {shlex.quote(str(ts_script))} "
+            f">> {shlex.quote(str(log_file))}"
+        )
+        return subprocess.Popen(
+            pipeline,
+            shell=True,
+            cwd=work_dir,
+            start_new_session=True,
+        )
+
+    # Fallback: redirecionamento direto, sem carimbo (comportamento anterior)
+    fh = open(log_file, "a", encoding="utf-8")
+    return subprocess.Popen(
         cmd,
-        stdout=fh if log_file else subprocess.DEVNULL,
-        stderr=subprocess.STDOUT if log_file else subprocess.DEVNULL,
-        cwd=cwd or ROOT_DIR,
+        stdout=fh,
+        stderr=subprocess.STDOUT,
+        cwd=work_dir,
         start_new_session=True,
     )
-    return proc
 
 
 def _tail_log(log_file: Path, n: int = 50) -> None:
@@ -900,6 +982,131 @@ def _tail_log(log_file: Path, n: int = 50) -> None:
             print("  " + row[:140])
     except Exception as exc:
         print("  " + badge_warn(f"Não foi possível ler o log: {exc}"))
+
+
+def _find_processes_by_script(script_basename: str) -> list[tuple[int, str, int]]:
+    """
+    Encontra processos Python rodando o script informado.
+    Retorna lista de tuplas (pid, cmd_resumido, tempo_decorrido_segundos).
+    Tolera ausência do pgrep/ps; retorna lista vazia em erro.
+    """
+    found = []
+    try:
+        # ps -eo pid,etime,cmd  → padrão POSIX, retorna ETIME no formato H:MM:SS
+        out = subprocess.run(
+            ["ps", "-eo", "pid,etimes,cmd", "--no-headers"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if out.returncode != 0:
+            return []
+        for line in out.stdout.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            try:
+                pid = int(parts[0])
+                etime = int(parts[1])
+                cmd = parts[2]
+            except ValueError:
+                continue
+            if script_basename in cmd and "python" in cmd.lower():
+                # O pipeline de log usa um wrapper shell e um timestamper cuja
+                # linha de comando contém o caminho do _log_timestamper.py.
+                # Ambos (wrapper bash -c e o próprio timestamper) carregam essa
+                # string; o processo de trabalho real não. Filtrar por ela deixa
+                # apenas o processo real na contagem.
+                if "_log_timestamper.py" in cmd:
+                    continue
+                # Resumo do comando (corta path completo)
+                short = cmd
+                if len(short) > 80:
+                    short = "..." + short[-77:]
+                found.append((pid, short, etime))
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return found
+
+
+def _fmt_elapsed(seconds: int) -> str:
+    """Formata duração em segundos como '1h23m45s' / '15m20s' / '42s'."""
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m{s:02d}s"
+
+
+def _follow_log_until_done(log_file: Path, watched_pid: int,
+                            poll_interval: float = 1.0) -> None:
+    """
+    Monitora um log_file em tempo real até o processo watched_pid encerrar.
+    Ctrl+C SAI do follow mas NÃO mata o processo (ele continua em background).
+
+    Esta função é a forma do usuário acompanhar uma operação iniciada em
+    background a partir do menu, sem precisar abrir outro terminal.
+    """
+    if not log_file.exists():
+        # Arquivo pode ainda não ter sido criado; tenta uma vez mais
+        time.sleep(0.5)
+    print()
+    print("  " + color(
+        "Acompanhando log em tempo real. Ctrl+C para voltar ao menu "
+        "(o processo continua em background).",
+        "dim"
+    ))
+    print(hline())
+    print()
+
+    last_size = 0
+    try:
+        while True:
+            if log_file.exists():
+                try:
+                    cur_size = log_file.stat().st_size
+                    if cur_size > last_size:
+                        with open(log_file, "rb") as f:
+                            f.seek(last_size)
+                            new = f.read(cur_size - last_size)
+                        try:
+                            sys.stdout.write(new.decode("utf-8", errors="replace"))
+                            sys.stdout.flush()
+                        except Exception:
+                            pass
+                        last_size = cur_size
+                except OSError:
+                    pass
+
+            if not _is_process_running(watched_pid):
+                # Última leitura para capturar saída final
+                time.sleep(0.3)
+                if log_file.exists():
+                    try:
+                        cur_size = log_file.stat().st_size
+                        if cur_size > last_size:
+                            with open(log_file, "rb") as f:
+                                f.seek(last_size)
+                                new = f.read(cur_size - last_size)
+                            sys.stdout.write(new.decode("utf-8", errors="replace"))
+                            sys.stdout.flush()
+                    except OSError:
+                        pass
+                print()
+                print(hline())
+                print("  " + badge_ok(f"Processo PID {watched_pid} encerrou."))
+                return
+
+            time.sleep(poll_interval)
+
+    except KeyboardInterrupt:
+        print()
+        print(hline())
+        print("  " + badge_info(
+            f"Follow interrompido. Processo PID {watched_pid} continua "
+            f"em background."
+        ))
+        print(f"  Log completo: {log_file}")
 
 
 # ── Resolução de caminhos IDS via Config ──────────────────────────────────────
@@ -1241,6 +1448,17 @@ def ids_training_menu() -> None:
             mc_label = badge_ok(f"{reg_state['n_versions']} versão(ões)")
         print(f"  Triplete  : M0 {m0_label}  |  Mc {mc_label}")
 
+        # Processos ativos relacionados a treinamento (M0 ou BiLSTM)
+        baseline_procs = _find_processes_by_script("baseline_rf.py")
+        learn_procs    = _find_processes_by_script("ids_learn.py")
+        if baseline_procs or learn_procs:
+            print()
+            print("  " + color("Processos ativos:", "cyan", "bold"))
+            for pid, _cmd, etime in baseline_procs:
+                print(f"    {badge_ok('M0 (RF)')}    PID {pid}  rodando há {_fmt_elapsed(etime)}")
+            for pid, _cmd, etime in learn_procs:
+                print(f"    {badge_ok('Treino')}    PID {pid}  rodando há {_fmt_elapsed(etime)}")
+
         # Aviso de dessincronia: modelo existe + arrays pendentes + registry vazio
         if reg_state["needs_reconcile"]:
             print()
@@ -1266,10 +1484,16 @@ def ids_training_menu() -> None:
             print(f"  [8] Reconciliar registry  {color('— Mc pendente', 'yellow')}")
         else:
             print("  [8] Reconciliar registry (manual)")
+
+        active_any = bool(baseline_procs or learn_procs)
+        if active_any:
+            print(f"  [9] Acompanhar processo em execução  {color('— ativo', 'green')}")
+        else:
+            print("  [9] Acompanhar processo em execução")
         print("  [0] Voltar")
         print()
 
-        choice = menu_choice(["0", "1", "2", "3", "4", "5", "6", "7", "8"])
+        choice = menu_choice(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"])
 
         if choice == "0":
             return
@@ -1284,13 +1508,17 @@ def ids_training_menu() -> None:
                     pause()
                     continue
                 extra = ["--force"] if force else []
+                log_file = _ids_log("learn")
                 proc = _run_background(
                     [sys.executable, str(learn_script), "train"] + extra,
-                    log_file=_ids_log("learn"),
+                    log_file=log_file,
                     cwd=ROOT_DIR,
                 )
                 print("  " + badge_ok(f"Treinamento iniciado — PID {proc.pid}"))
-                print(f"  Acompanhe em: {_ids_log('learn')}")
+                print(f"  Log: {log_file}")
+                print()
+                if confirm("Acompanhar log agora? (Ctrl+C volta ao menu sem matar)"):
+                    _follow_log_until_done(log_file, proc.pid)
             pause()
 
         elif choice == "3":
@@ -1304,12 +1532,17 @@ def ids_training_menu() -> None:
                     print("  " + badge_err(f"Script não encontrado: {learn_script}"))
                     pause()
                     continue
+                log_file = _ids_log("learn")
                 proc = _run_background(
                     [sys.executable, str(learn_script), "finetune"],
-                    log_file=_ids_log("learn"),
+                    log_file=log_file,
                     cwd=ROOT_DIR,
                 )
                 print("  " + badge_ok(f"Fine-tuning iniciado — PID {proc.pid}"))
+                print(f"  Log: {log_file}")
+                print()
+                if confirm("Acompanhar log agora? (Ctrl+C volta ao menu sem matar)"):
+                    _follow_log_until_done(log_file, proc.pid)
             pause()
 
         elif choice == "4":
@@ -1328,6 +1561,52 @@ def ids_training_menu() -> None:
 
         elif choice == "8":
             _reconcile_registry_now()
+
+        elif choice == "9":
+            _attach_to_active_process(baseline_procs, learn_procs)
+
+
+def _attach_to_active_process(
+    baseline_procs: list[tuple[int, str, int]],
+    learn_procs: list[tuple[int, str, int]],
+) -> None:
+    """Permite ao usuário escolher um processo ativo e seguir seu log."""
+    print_header("IDS > Treinamento > Acompanhar Processo")
+    section("Processos ativos")
+
+    options: list[tuple[str, int, Path]] = []
+    if baseline_procs:
+        for pid, _cmd, etime in baseline_procs:
+            options.append((
+                f"M0 (RandomForest) — PID {pid} — há {_fmt_elapsed(etime)}",
+                pid,
+                _ids_log("baseline"),
+            ))
+    if learn_procs:
+        for pid, _cmd, etime in learn_procs:
+            options.append((
+                f"Treino BiLSTM — PID {pid} — há {_fmt_elapsed(etime)}",
+                pid,
+                _ids_log("learn"),
+            ))
+
+    if not options:
+        print("  " + color("Nenhum processo de treinamento em execução.", "dim"))
+        pause()
+        return
+
+    for i, (label, _pid, _log) in enumerate(options, start=1):
+        print(f"  [{i}] {label}")
+    print("  [0] Voltar")
+    print()
+
+    valid = [str(i) for i in range(len(options) + 1)]
+    choice = menu_choice(valid)
+    if choice == "0":
+        return
+    _label, pid, log_file = options[int(choice) - 1]
+    _follow_log_until_done(log_file, pid)
+    pause()
 
 
 # =============================================================================
@@ -1386,8 +1665,13 @@ def _registry_state() -> dict:
 
 
 def _register_baseline_m0() -> None:
-    """Executa baseline_rf.py em background. O script já chama
-    register_baseline() ao final, populando M0."""
+    """
+    Gera o baseline M0 (RandomForest) com escolha de modo:
+      F - Foreground: roda direto no terminal, saída visível em tempo real,
+                      bloqueia o menu até concluir
+      B - Background: dispara via nohup setsid (imune a SSH timeout),
+                      pergunta se quer acompanhar o log (tail real-time)
+    """
     print_header("IDS > Treinamento > Baseline M0")
     section("Gerar baseline RandomForest (M0)")
 
@@ -1395,6 +1679,32 @@ def _register_baseline_m0() -> None:
     if not baseline_script.exists():
         print("  " + badge_err(f"Script não encontrado: {baseline_script}"))
         pause()
+        return
+
+    # Evita duplicar processo de M0 em paralelo
+    existing = _find_processes_by_script("baseline_rf.py")
+    if existing:
+        pid, _cmd, etime = existing[0]
+        print("  " + badge_warn(
+            f"Já existe um processo de baseline rodando — "
+            f"PID {pid}, há {_fmt_elapsed(etime)}."
+        ))
+        print()
+        print("  [1] Acompanhar log em tempo real")
+        print("  [2] Cancelar processo existente")
+        print("  [0] Voltar")
+        choice = menu_choice(["0", "1", "2"])
+        if choice == "1":
+            _follow_log_until_done(_ids_log("baseline"), pid)
+            pause()
+            return
+        if choice == "2":
+            try:
+                os.kill(pid, 15)  # SIGTERM
+                print("  " + badge_ok(f"Sinal de término enviado ao PID {pid}."))
+            except Exception as e:
+                print("  " + badge_err(f"Falha ao terminar: {e}"))
+            pause()
         return
 
     reg_state = _registry_state()
@@ -1410,21 +1720,79 @@ def _register_baseline_m0() -> None:
     print("    - Registra como M0 no triplete")
     print("    - Tempo estimado: 5-15 minutos em CPU")
     print()
-    if not confirm("Iniciar geração do baseline M0?"):
+    print("  " + color("Escolha o modo de execução:", "cyan", "bold"))
+    print("    [F] Foreground — saída visível, bloqueia o menu até concluir")
+    print("    [B] Background — libera o terminal (imune a SSH timeout)")
+    print("    [0] Cancelar")
+    print()
+
+    while True:
+        ans = input("  Modo [F/B/0]: ").strip().lower()
+        if ans in {"f", "b", "0"}:
+            break
+        print("  " + color("Opção inválida.", "yellow"))
+
+    if ans == "0":
         return
 
+    log_file = _ids_log("baseline")
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if ans == "f":
+        # FOREGROUND — passa stdout/stderr direto ao terminal, com tee opcional
+        print()
+        print(hline())
+        print("  " + color("Iniciando M0 em foreground.", "cyan", "bold"))
+        print(f"  Log também sendo gravado em: {log_file}")
+        print(hline())
+        print()
+        # tee: pipe via shell para gravar log e exibir simultaneamente.
+        # Quando o timestamper está disponível, cada linha (inclusive a saída
+        # crua do RandomForest/sklearn) é carimbada com data-hora antes do tee.
+        with open(log_file, "a", encoding="utf-8") as fh:
+            fh.write(f"\n=== M0 foreground iniciado em "
+                     f"{datetime.now().isoformat()} ===\n")
+        ts_script = _ensure_timestamper()
+        if ts_script:
+            mid = (f"| {shlex.quote(sys.executable)} -u "
+                   f"{shlex.quote(str(ts_script))} ")
+        else:
+            mid = ""
+        try:
+            rc = subprocess.call(
+                f"{shlex.quote(sys.executable)} -u "
+                f"{shlex.quote(str(baseline_script))} 2>&1 "
+                f"{mid}| tee -a {shlex.quote(str(log_file))}",
+                shell=True, cwd=str(ROOT_DIR),
+            )
+        except KeyboardInterrupt:
+            print()
+            print("  " + badge_warn(
+                "Interrompido com Ctrl+C. Verifique se o registro M0 foi gravado."
+            ))
+            pause()
+            return
+        print()
+        print(hline())
+        if rc == 0:
+            print("  " + badge_ok("Baseline M0 concluído."))
+        else:
+            print("  " + badge_err(f"Encerrou com código {rc}. Verifique o log."))
+        pause()
+        return
+
+    # BACKGROUND — nohup setsid, imune a SSH
     proc = _run_background(
         [sys.executable, str(baseline_script)],
-        log_file=_ids_log("learn"),
+        log_file=log_file,
         cwd=ROOT_DIR,
     )
-    print("  " + badge_ok(f"Baseline M0 iniciado — PID {proc.pid}"))
-    print(f"  Acompanhe em: {_ids_log('learn')}")
     print()
-    print("  " + color(
-        "Após a conclusão, volte a este menu para verificar o registro.",
-        "dim"
-    ))
+    print("  " + badge_ok(f"Baseline M0 iniciado em background — PID {proc.pid}"))
+    print(f"  Log: {log_file}")
+    print()
+    if confirm("Acompanhar o log agora? (Ctrl+C volta ao menu sem matar o processo)"):
+        _follow_log_until_done(log_file, proc.pid)
     pause()
 
 
