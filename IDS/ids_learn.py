@@ -769,25 +769,45 @@ def cmd_train(force: bool = False) -> None:
     np.save(versioned_path(out_dir, "y_pred", "npy"), y_pred)
     np.save(versioned_path(out_dir, "X_test_scaled", "npy"), X_te)
 
-    # Registro no triplete (Mc)
-    register_framework_version(
-        model_path=Config.MODEL_DIR / Config.MODEL_FILENAME,
-        y_true=y_te,
-        y_pred=y_pred,
-        metrics=_metrics_for_registry(y_te, y_pred),
-        source="train",
-        extra={
-            "loss": Config.MODEL_CONFIG["loss_function"],
-            "balancing_strategy": Config.BALANCING_CONFIG["strategy"],
-            "k_features": Config.FEATURE_SELECTION_CONFIG["k_best"],
-            "epochs_run": (
-                len(trainer.history.history["loss"]) if trainer.history else 0
-            ),
-        },
-    )
+    # Registro no triplete (Mc) — protegido para não invalidar o treino
+    # caso o registry esteja corrompido ou indisponível.
+    try:
+        register_framework_version(
+            model_path=Config.MODEL_DIR / Config.MODEL_FILENAME,
+            y_true=y_te,
+            y_pred=y_pred,
+            metrics=_metrics_for_registry(y_te, y_pred),
+            source="train",
+            extra={
+                "loss": Config.MODEL_CONFIG["loss_function"],
+                "balancing_strategy": Config.BALANCING_CONFIG["strategy"],
+                "k_features": Config.FEATURE_SELECTION_CONFIG["k_best"],
+                "epochs_run": (
+                    len(trainer.history.history["loss"]) if trainer.history else 0
+                ),
+            },
+        )
+    except Exception as e:
+        log.error(
+            f"FALHA AO REGISTRAR Mc no triplete: {type(e).__name__}: {e}. "
+            f"O modelo está SALVO e os arrays y_test/y_pred estão em {out_dir}. "
+            f"Execute `python3 reconcile_registry.py` para registrar manualmente."
+        )
+        import traceback
+        log.error(traceback.format_exc())
 
+    # Relatório comparativo M0/Mp/Mc — também protegido.
     rep_dir = Config.IDS_REPORTS_DIR / f"full_train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    generate_full_report(rep_dir, label_map=dh.label_mapping)
+    try:
+        generate_full_report(rep_dir, label_map=dh.label_mapping)
+    except Exception as e:
+        log.error(
+            f"FALHA AO GERAR relatório comparativo M0/Mp/Mc: "
+            f"{type(e).__name__}: {e}. Os relatórios individuais em "
+            f"{out_dir} permanecem válidos."
+        )
+        import traceback
+        log.error(traceback.format_exc())
 
     log.info("=" * 62)
     log.info("TREINAMENTO CONCLUÍDO — RELATÓRIO COMPLETO GERADO")
@@ -858,17 +878,35 @@ def cmd_finetune() -> None:
     np.save(versioned_path(out_dir, "y_test", "npy"), y_te)
     np.save(versioned_path(out_dir, "y_pred", "npy"), y_pred)
 
-    register_framework_version(
-        model_path=Config.MODEL_DIR / Config.MODEL_FILENAME,
-        y_true=y_te,
-        y_pred=y_pred,
-        metrics=_metrics_for_registry(y_te, y_pred),
-        source="finetune",
-        extra={"staging_files": [p.name for p in parquets]},
-    )
+    # Registro no triplete (Mc) — protegido contra falhas do registry.
+    try:
+        register_framework_version(
+            model_path=Config.MODEL_DIR / Config.MODEL_FILENAME,
+            y_true=y_te,
+            y_pred=y_pred,
+            metrics=_metrics_for_registry(y_te, y_pred),
+            source="finetune",
+            extra={"staging_files": [p.name for p in parquets]},
+        )
+    except Exception as e:
+        log.error(
+            f"FALHA AO REGISTRAR fine-tune no triplete: {type(e).__name__}: {e}. "
+            f"O modelo está SALVO e os arrays estão em {out_dir}. "
+            f"Execute `python3 reconcile_registry.py` para registrar manualmente."
+        )
+        import traceback
+        log.error(traceback.format_exc())
 
     rep_dir = Config.IDS_REPORTS_DIR / f"full_finetune_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    generate_full_report(rep_dir, label_map=dh.label_mapping)
+    try:
+        generate_full_report(rep_dir, label_map=dh.label_mapping)
+    except Exception as e:
+        log.error(
+            f"FALHA AO GERAR relatório comparativo M0/Mp/Mc: "
+            f"{type(e).__name__}: {e}."
+        )
+        import traceback
+        log.error(traceback.format_exc())
 
     log.info("=" * 62)
     log.info("FINE-TUNING CONCLUÍDO — RELATÓRIO COMPLETO GERADO")
