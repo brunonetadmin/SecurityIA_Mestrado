@@ -1231,6 +1231,24 @@ def ids_training_menu() -> None:
         staging_dir = _ids_staging_dir()
         stg_cnt = len(list(staging_dir.glob("*.parquet"))) if staging_dir.exists() else 0
         print(f"  Staging   : {stg_cnt} arquivo(s) para fine-tuning")
+
+        # Estado do triplete M0/Mp/Mc
+        reg_state = _registry_state()
+        m0_label = badge_ok("registrado") if reg_state["has_baseline"] else color("ausente", "red")
+        if reg_state["n_versions"] == 0:
+            mc_label = color("não registrado", "red")
+        else:
+            mc_label = badge_ok(f"{reg_state['n_versions']} versão(ões)")
+        print(f"  Triplete  : M0 {m0_label}  |  Mc {mc_label}")
+
+        # Aviso de dessincronia: modelo existe + arrays pendentes + registry vazio
+        if reg_state["needs_reconcile"]:
+            print()
+            print("  " + badge_warn(
+                "Modelo treinado mas não registrado no triplete. "
+                "Use a opção [8] para reconciliar."
+            ))
+
         print(hline())
 
         print("  [1] Treinamento completo (do zero)")
@@ -1240,10 +1258,18 @@ def ids_training_menu() -> None:
         print("  [4] Avaliar modelo (accuracy, recall, F1, ROC)")
         print("  [5] Ver log de treinamento")
         print("  [6] Listar modelos disponíveis")
+        if not reg_state["has_baseline"]:
+            print(f"  [7] Gerar baseline M0 (RandomForest)  {color('— ausente', 'yellow')}")
+        else:
+            print("  [7] Gerar baseline M0 (RandomForest)")
+        if reg_state["needs_reconcile"]:
+            print(f"  [8] Reconciliar registry  {color('— Mc pendente', 'yellow')}")
+        else:
+            print("  [8] Reconciliar registry (manual)")
         print("  [0] Voltar")
         print()
 
-        choice = menu_choice(["0", "1", "2", "3", "4", "5", "6"])
+        choice = menu_choice(["0", "1", "2", "3", "4", "5", "6", "7", "8"])
 
         if choice == "0":
             return
@@ -1296,6 +1322,236 @@ def ids_training_menu() -> None:
 
         elif choice == "6":
             _list_available_models()
+
+        elif choice == "7":
+            _register_baseline_m0()
+
+        elif choice == "8":
+            _reconcile_registry_now()
+
+
+# =============================================================================
+# REGISTRY M0/Mp/Mc — Gestão integrada pelo menu
+# =============================================================================
+
+def _registry_state() -> dict:
+    """
+    Retorna estado atual do triplete:
+      - has_baseline    : bool (M0 existe?)
+      - n_versions      : int  (quantas versões Mc registradas)
+      - needs_reconcile : bool (modelo treinado mas não no registry?)
+      - last_run_dir    : Path | None (última pasta Model/run_*/ com arrays)
+    Falha-segura: qualquer exceção retorna estado conservador (sem flags
+    acionando ações destrutivas).
+    """
+    state = {
+        "has_baseline": False,
+        "n_versions": 0,
+        "needs_reconcile": False,
+        "last_run_dir": None,
+    }
+    try:
+        from IDS.modules.model_registry import _read_index
+        idx = _read_index()
+        state["has_baseline"] = idx.get("baseline") is not None
+        state["n_versions"] = len(idx.get("framework_versions", []))
+    except Exception:
+        return state
+
+    # Verifica se há treino concluído sem registro correspondente
+    try:
+        model_file = _ids_model_file()
+        if not model_file.exists():
+            return state
+
+        from config import Config
+        runs = sorted(
+            Config.MODEL_DIR.glob("run_*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for run_dir in runs:
+            if list(run_dir.glob("y_test*.npy")) and list(run_dir.glob("y_pred*.npy")):
+                state["last_run_dir"] = run_dir
+                break
+
+        # Dessincronia: existe modelo + arrays do último treino, mas
+        # nenhuma versão registrada.
+        if state["last_run_dir"] is not None and state["n_versions"] == 0:
+            state["needs_reconcile"] = True
+    except Exception:
+        pass
+
+    return state
+
+
+def _register_baseline_m0() -> None:
+    """Executa baseline_rf.py em background. O script já chama
+    register_baseline() ao final, populando M0."""
+    print_header("IDS > Treinamento > Baseline M0")
+    section("Gerar baseline RandomForest (M0)")
+
+    baseline_script = ROOT_DIR / "baseline_rf.py"
+    if not baseline_script.exists():
+        print("  " + badge_err(f"Script não encontrado: {baseline_script}"))
+        pause()
+        return
+
+    reg_state = _registry_state()
+    if reg_state["has_baseline"]:
+        print("  " + badge_info("M0 já está registrado."))
+        if not confirm("Sobrescrever M0 existente? (gera novo RF do zero)"):
+            pause()
+            return
+
+    print()
+    print("  O baseline_rf.py:")
+    print("    - Treina um RandomForest sobre o mesmo split estratificado")
+    print("    - Registra como M0 no triplete")
+    print("    - Tempo estimado: 5-15 minutos em CPU")
+    print()
+    if not confirm("Iniciar geração do baseline M0?"):
+        return
+
+    proc = _run_background(
+        [sys.executable, str(baseline_script)],
+        log_file=_ids_log("learn"),
+        cwd=ROOT_DIR,
+    )
+    print("  " + badge_ok(f"Baseline M0 iniciado — PID {proc.pid}"))
+    print(f"  Acompanhe em: {_ids_log('learn')}")
+    print()
+    print("  " + color(
+        "Após a conclusão, volte a este menu para verificar o registro.",
+        "dim"
+    ))
+    pause()
+
+
+def _reconcile_registry_now() -> None:
+    """
+    Reconciliação manual do Mc a partir dos arrays salvos no último treino.
+
+    Executa em FOREGROUND (operação rápida — só calcula métricas e grava
+    JSON). Não retreina, não toca em pesos.
+    """
+    print_header("IDS > Treinamento > Reconciliar Registry")
+    section("Reconciliação do triplete M0/Mp/Mc")
+
+    reg_state = _registry_state()
+
+    if reg_state["n_versions"] > 0 and not reg_state["needs_reconcile"]:
+        print("  " + badge_info(
+            f"Registry consistente: {reg_state['n_versions']} versão(ões) registrada(s)."
+        ))
+        if not confirm("Forçar novo registro a partir do último treino?"):
+            pause()
+            return
+
+    if reg_state["last_run_dir"] is None:
+        print("  " + badge_err(
+            "Nenhuma pasta Model/run_*/ contém arrays y_test/y_pred."
+        ))
+        print("  Não é possível reconciliar sem retreinar.")
+        pause()
+        return
+
+    if not reg_state["has_baseline"]:
+        print("  " + badge_warn("M0 (baseline) NÃO está registrado."))
+        print("  Recomenda-se gerar o M0 antes de registrar o Mc para que")
+        print("  o relatório comparativo M0/Mp/Mc fique completo.")
+        print()
+        print(f"  Use a opção [7] do menu anterior para gerar o M0.")
+        print()
+        if not confirm("Continuar registrando apenas o Mc?"):
+            return
+
+    print()
+    print(f"  Última execução: {reg_state['last_run_dir'].name}")
+
+    try:
+        import numpy as np
+        from datetime import datetime as _dt
+        from sklearn.metrics import (
+            accuracy_score, balanced_accuracy_score, confusion_matrix,
+            f1_score, matthews_corrcoef, precision_score, recall_score,
+        )
+        from config import Config
+        from IDS.modules.model_registry import register_framework_version
+
+        run_dir = reg_state["last_run_dir"]
+        yt_file = max(run_dir.glob("y_test*.npy"), key=lambda p: p.stat().st_mtime)
+        yp_file = max(run_dir.glob("y_pred*.npy"), key=lambda p: p.stat().st_mtime)
+        y_true = np.load(yt_file)
+        y_pred = np.load(yp_file)
+
+        if len(y_true) != len(y_pred):
+            print("  " + badge_err(
+                f"Tamanhos divergem: y_test={len(y_true):,} vs y_pred={len(y_pred):,}"
+            ))
+            pause()
+            return
+
+        print(f"  y_test : {yt_file.name} ({len(y_true):,} amostras)")
+        print(f"  y_pred : {yp_file.name}")
+        print()
+        print("  Calculando métricas oficiais…")
+
+        cm = confusion_matrix(y_true, y_pred)
+        fpr_pc = []
+        for c in range(cm.shape[0]):
+            fp = cm[:, c].sum() - cm[c, c]
+            tn = cm.sum() - cm[c, :].sum() - cm[:, c].sum() + cm[c, c]
+            denom = fp + tn
+            fpr_pc.append(fp / denom if denom else 0.0)
+
+        metrics = {
+            "accuracy":        float(accuracy_score(y_true, y_pred)),
+            "balanced_acc":    float(balanced_accuracy_score(y_true, y_pred)),
+            "recall_macro":    float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+            "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
+            "f1_macro":        float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+            "f1_weighted":     float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
+            "mcc":             float(matthews_corrcoef(y_true, y_pred)),
+            "fpr_macro":       float(sum(fpr_pc) / len(fpr_pc)),
+            "n_test":          int(len(y_true)),
+        }
+        for k, v in metrics.items():
+            if isinstance(v, float):
+                print(f"    {k:18s} = {v:.6f}")
+            else:
+                print(f"    {k:18s} = {v}")
+
+        print()
+        print("  Registrando como nova versão Mc…")
+        entry = register_framework_version(
+            model_path=Config.MODEL_DIR / Config.MODEL_FILENAME,
+            y_true=y_true,
+            y_pred=y_pred,
+            metrics=metrics,
+            source="reconcile",
+            extra={
+                "reconciled_at":   _dt.now().isoformat(),
+                "source_run_dir":  str(run_dir),
+                "loss":            Config.MODEL_CONFIG.get("loss_function", "?"),
+                "balancing_strategy": Config.BALANCING_CONFIG.get("strategy", "?"),
+                "k_features":      Config.FEATURE_SELECTION_CONFIG.get("k_best", "?"),
+            },
+        )
+
+        print()
+        print("  " + badge_ok(f"Mc registrado: {entry['id']}"))
+        print(f"    recall_macro = {metrics['recall_macro']:.4f}")
+        print(f"    mcc          = {metrics['mcc']:.4f}")
+        print(f"    f1_macro     = {metrics['f1_macro']:.4f}")
+        print(f"    fpr_macro    = {metrics['fpr_macro']:.4f}")
+
+    except Exception as exc:
+        print()
+        print("  " + badge_err(f"Falha na reconciliação: {type(exc).__name__}: {exc}"))
+        traceback.print_exc()
+
+    pause()
 
 
 def _ids_model_evaluation() -> None:
