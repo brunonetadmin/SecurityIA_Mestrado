@@ -119,8 +119,11 @@ class CaptureThread(threading.Thread):
         ip    = pkt[IP]
         proto = ip.proto
         ts    = float(pkt.time)
-        src   = sys.intern(ip.src)
-        dst   = sys.intern(ip.dst)
+        # NÃO usar sys.intern aqui: strings internadas nunca são liberadas, e um
+        # IDS vê altíssima cardinalidade de IPs de origem (varreduras, DDoS com
+        # spoofing) — internar vazaria memória sem limite ao longo de dias.
+        src   = ip.src
+        dst   = ip.dst
         length = len(ip)
         sp = dp = flags = 0
 
@@ -169,16 +172,20 @@ class ProcessorThread(threading.Thread):
         log.info("[Processor] Iniciado")
         last_sweep = time.time()
 
-        while True:
+        while not self._stop.is_set():
+            # Sweep por TEMPO, independente de haver tráfego. Antes, o sweep
+            # (despejo de fluxos expirados) só rodava no ramo `queue.Empty`;
+            # sob tráfego contínuo a fila nunca esvaziava, o sweep nunca rodava
+            # e a tabela de fluxos crescia sem limite — vazamento de memória.
+            # O break de shutdown também vivia ali, então sob carga o stop era
+            # ignorado. Agora ambos rodam a cada iteração, por tempo.
+            now = time.time()
+            if now - last_sweep >= self.SWEEP_INTERVAL:
+                self._drain(self._tracker.sweep(now))
+                last_sweep = now
             try:
                 pkt = self._pkt_q.get(timeout=0.1)
             except queue.Empty:
-                if self._stop.is_set():
-                    break
-                now = time.time()
-                if now - last_sweep >= self.SWEEP_INTERVAL:
-                    self._drain(self._tracker.sweep(now))
-                    last_sweep = now
                 continue
 
             if not self._budget_hit.is_set():
@@ -246,6 +253,11 @@ class WriterThread(threading.Thread):
         self._last_flush   = time.time()
         self._t_start      = time.time()
 
+    @property
+    def total_rows(self) -> int:
+        """Total de fluxos efetivamente gravados em disco (somente leitura)."""
+        return self._total_rows
+
     def run(self) -> None:
         log.info(f"[Writer] Iniciado — saída='{self._dir}' budget={self._budget_bytes/1024**3:.1f} GiB")
         while True:
@@ -271,14 +283,14 @@ class WriterThread(threading.Thread):
             f"tamanho≈{format_bytes(self._bytes_today)}"
         )
 
-    def _maybe_flush(self) -> None:
-        if time.time() - self._last_flush >= self._flush_secs:
-            self._flush()
-
-    def _flush(self, force: bool = False) -> None:
-        if not self._buf:
-            return
-
+    def _check_rollover(self) -> None:
+        """Rotação diária e reset de budget. DEVE rodar independentemente de
+        haver dados no buffer. Antes, esta lógica vivia dentro de _flush(),
+        depois do guard `if not self._buf: return`: quando o budget diário era
+        atingido, o produtor parava, o buffer ficava vazio, _flush() retornava
+        cedo e a virada de meia-noite (que limpa budget_hit e abre o arquivo do
+        novo dia) NUNCA acontecia — o coletor congelava em 'budget atingido'
+        para sempre, sem nunca mais gravar."""
         today = date.today()
         if self._cur_date != today:
             self._close()
@@ -287,6 +299,16 @@ class WriterThread(threading.Thread):
             self._rows_today  = 0
             self._budget_hit.clear()
             self._open(today)
+
+    def _maybe_flush(self) -> None:
+        self._check_rollover()
+        if time.time() - self._last_flush >= self._flush_secs:
+            self._flush()
+
+    def _flush(self, force: bool = False) -> None:
+        self._check_rollover()
+        if not self._buf:
+            return
 
         if self._writer is None:
             self._buf.clear()
@@ -412,24 +434,49 @@ class CollectorDaemon:
         log.info(f"Arquivo hoje: {_filename(date.today())}")
         log.info("=" * 62)
 
-        threads = [
-            WriterThread(self._output_dir, self._budget_gb,
-                         self._flow_q, self._stop, self._budget_hit),
-            ProcessorThread(self._pkt_q, self._flow_q, self._stop,
-                            self._budget_hit, self._tracker),
-            CaptureThread(self._interface, self._pkt_q, self._stop),
-        ]
+        writer    = WriterThread(self._output_dir, self._budget_gb,
+                                 self._flow_q, self._stop, self._budget_hit)
+        processor = ProcessorThread(self._pkt_q, self._flow_q, self._stop,
+                                    self._budget_hit, self._tracker)
+        capture   = CaptureThread(self._interface, self._pkt_q, self._stop)
+        threads   = [writer, processor, capture]
         for t in threads:
             t.start()
 
-        MONITOR = 30
+        # Limite de fluxos ativos para alerta de acúmulo. O sweep por timeout
+        # (Bug B corrigido) deve manter a tabela limitada; este teto é apenas
+        # uma sentinela de visibilidade — se for ultrapassado, há algo errado
+        # no timeout/sweep do FlowTracker e o operador precisa saber.
+        MAX_ATIVOS = getattr(Config, "COLLECTOR_MAX_ACTIVE_FLOWS", 2_000_000)
+        MONITOR    = 30
         while not self._stop.is_set():
             self._stop.wait(timeout=MONITOR)
-            if not self._stop.is_set():
-                log.info(
-                    f"[Monitor] pkt_q={self._pkt_q.qsize():,} "
-                    f"flow_q={self._flow_q.qsize():,} "
-                    f"fluxos_ativos={self._tracker.active_count:,}"
+            if self._stop.is_set():
+                break
+
+            # Liveness: se uma thread de trabalho morreu, o daemon não pode
+            # continuar vivo gastando CPU/RAM sem capturar nada por dias.
+            # Encerra explicitamente para que a falha seja visível (e o
+            # systemd/supervisor possa reiniciar) em vez de degradar em silêncio.
+            mortas = [t.name for t in threads if not t.is_alive()]
+            if mortas:
+                log.critical(f"[Monitor] Thread(s) inativa(s): {mortas}. "
+                             f"Encerrando o daemon para não rodar degradado.")
+                self._stop.set()
+                break
+
+            ativos  = self._tracker.active_count
+            registra = log.warning if ativos > MAX_ATIVOS else log.info
+            registra(
+                f"[Monitor] pkt_q={self._pkt_q.qsize():,} "
+                f"flow_q={self._flow_q.qsize():,} "
+                f"fluxos_ativos={ativos:,} gravados={writer.total_rows:,}"
+            )
+            if ativos > MAX_ATIVOS:
+                log.warning(
+                    f"[Monitor] fluxos_ativos acima do teto ({MAX_ATIVOS:,}) — "
+                    f"acúmulo anormal; verifique active_timeout/idle_timeout e o "
+                    f"sweep do FlowTracker."
                 )
 
         for t in threads:

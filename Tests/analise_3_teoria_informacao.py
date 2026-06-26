@@ -47,28 +47,27 @@ from config import (
     verificar_dataset, carregar_dataset_real,
 )
 from _test_logging import (
-    get_logger, log_exception, safe_run, EpochLogger, silence_tensorflow,
+    get_logger, log_exception, safe_run, silence_tensorflow,
     stratified_split_3way, fit_scaler_no_leakage, metricas_completas,
 )
+from _pipeline import (
+    exigir_estado, selecionar_por_criterio, salvar_estado, familia_de,
+)
+from _models import treina_avalia
+from _balance import estrategia_por_nome
 
 silence_tensorflow()
 
-import tensorflow as tf
-from tensorflow.keras import backend as K
-from tensorflow.keras.layers import Input, Dense, Dropout, BatchNormalization, Activation
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import mutual_info_classif, f_classif
 
-tf.keras.utils.set_random_seed(RANDOM_SEED)
 apply_plot_style()
 
 ANALISE_ID = 3
 EPOCHS = 18
 PATIENCE = 5
 K_GRID = [10, 15, 23, 32, 48, "all"]
+DESEMPATE_INV3 = "recall"   # consistente com Inv. 1 e 2
 log = get_logger(ANALISE_ID, "analise_3")
 
 def _run(label, fn, *a, **kw):
@@ -81,19 +80,11 @@ def _run(label, fn, *a, **kw):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   MODELO FIXO (MLP+BN) — mantém comparabilidade entre métodos
+#   MODELO: vem do VENCEDOR da Inv. 1 (lido do estado), não mais um MLP fixo.
+#   A avaliação de cada par (método, k) usa treina_avalia sobre esse modelo,
+#   com o balanceamento escolhido na Inv. 2 — assim a seleção de atributos é
+#   medida nas MESMAS condições do pipeline final, sem trocar de classificador.
 # ═══════════════════════════════════════════════════════════════════════════
-
-def build_mlp_bn(n_feat, n_cls):
-    inp = Input(shape=(n_feat,))
-    x = Dense(256)(inp); x = BatchNormalization()(x); x = Activation("relu")(x); x = Dropout(0.3)(x)
-    x = Dense(128)(x);   x = BatchNormalization()(x); x = Activation("relu")(x); x = Dropout(0.3)(x)
-    x = Dense(64)(x);    x = BatchNormalization()(x); x = Activation("relu")(x); x = Dropout(0.2)(x)
-    out = Dense(n_cls, activation="softmax")(x)
-    m = Model(inp, out, name="MLP_BN")
-    m.compile(optimizer=Adam(1e-3),
-              loss="sparse_categorical_crossentropy", metrics=["accuracy"])
-    return m
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -281,28 +272,34 @@ def selecionar_top_k(scores, k, n_features):
 #   AVALIAÇÃO
 # ═══════════════════════════════════════════════════════════════════════════
 
-def avaliar_combinacao(metodo_nome, k, scores, X_tr, X_val, X_te,
-                        y_tr, y_val, y_te, n_cls):
-    K.clear_session()
-    tf.keras.utils.set_random_seed(RANDOM_SEED)
+def avaliar_combinacao(metodo_nome, k, scores, modelo, familia, balanceamento,
+                        X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls):
     t0 = time.time()
     idx = selecionar_top_k(scores, k, X_tr.shape[1])
     Xtr_s = X_tr[:, idx]
     Xv_s  = X_val[:, idx]
     Xte_s = X_te[:, idx]
-    log.info(f"  {metodo_nome} k={k}: {len(idx)} features de {X_tr.shape[1]}")
+    log.info(f"  {metodo_nome} k={k}: {len(idx)} features de {X_tr.shape[1]} "
+             f"({modelo}+{balanceamento})")
 
-    m = build_mlp_bn(Xtr_s.shape[1], n_cls)
-    cb = [
-        EarlyStopping(patience=PATIENCE, restore_best_weights=True, monitor="val_loss"),
-        ReduceLROnPlateau(factor=0.5, patience=3, min_lr=1e-7, monitor="val_loss"),
-        EpochLogger(log, prefix=f"{metodo_nome}_k{k} "),
-    ]
-    m.fit(Xtr_s, y_tr, validation_data=(Xv_s, y_val),
-          epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=cb, verbose=0)
-    y_pred = np.argmax(m.predict(Xte_s, batch_size=BATCH_SIZE, verbose=0), axis=1)
-    out = metricas_completas(y_te, y_pred, n_cls)
-    out.update(metodo=metodo_nome, k=str(k), k_real=len(idx), tempo_s=time.time() - t0)
+    # Reproduz o balanceamento vencedor da Inv. 2 (mesma família do vencedor):
+    # reamostragem só no treino + kwargs (balanceamento_nativo p/ árvore, ou
+    # loss_fn/class_weight p/ rede). Teste intacto — sem vazamento.
+    resampler, kwargs = estrategia_por_nome(balanceamento, familia, y_tr, n_cls)
+    if resampler is not None:
+        Xtr_b, ytr_b = resampler(Xtr_s, y_tr, logger=log)
+    else:
+        Xtr_b, ytr_b = Xtr_s, y_tr
+
+    out = treina_avalia(
+        modelo, Xtr_b, ytr_b, Xte_s, y_te, n_cls,
+        X_val=Xv_s, y_val=y_val, logger=log,
+        epochs=EPOCHS, patience=PATIENCE, batch_size=BATCH_SIZE,
+        **kwargs,
+    )
+    out.update(metodo=metodo_nome, k=str(k), k_real=len(idx),
+               combo=f"{metodo_nome}_k{k}", idx=idx.tolist())
+    out.setdefault("tempo_s", time.time() - t0)
     return out
 
 
@@ -312,6 +309,17 @@ def avaliar_combinacao(metodo_nome, k, scores, X_tr, X_val, X_te,
 
 def executar(dataset_disponivel: bool = True) -> None:
     log.info(f"ANÁLISE 3 — Teoria da Informação ({len(METODOS)} métodos × {len(K_GRID)} valores de k)")
+
+    # ── Estado da Inv. 2: modelo vencedor + balanceamento escolhido ─────────
+    try:
+        est2 = exigir_estado(2)
+    except RuntimeError as e:
+        log.error(str(e)); return
+    modelo = est2["modelo"]
+    familia = est2.get("familia") or familia_de(modelo)
+    balanceamento = est2["balanceamento"]
+    log.info(f"Encadeamento: modelo={modelo} [{familia}] "
+             f"balanceamento={balanceamento} (da Inv. 2)")
 
     # Carregamento direto (sem safe_run): a função pode retornar
     # (X, y) ou (X, y, label_encoder). O safe_run anterior embrulhava o
@@ -345,6 +353,7 @@ def executar(dataset_disponivel: bool = True) -> None:
     log.info(f"Split: treino={len(y_tr):,} val={len(y_val):,} teste={len(y_te):,}")
 
     resultados = []
+    idx_por_combo = {}
     for metodo_nome, score_fn in METODOS.items():
         log.info(f">>> Computando scores: {metodo_nome}")
         scores = _run(f"score_{metodo_nome}", lambda f=score_fn: f(X_tr, y_tr))
@@ -355,10 +364,11 @@ def executar(dataset_disponivel: bool = True) -> None:
             out = _run(
                 tag,
                 lambda mn=metodo_nome, kk=k, sc=scores:
-                    avaliar_combinacao(mn, kk, sc, X_tr, X_val, X_te,
-                                       y_tr, y_val, y_te, n_cls),
+                    avaliar_combinacao(mn, kk, sc, modelo, familia, balanceamento,
+                                       X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls),
             )
             if out is not None:
+                idx_por_combo[out["combo"]] = out.pop("idx")
                 resultados.append(out)
 
     if not resultados:
@@ -370,13 +380,27 @@ def executar(dataset_disponivel: bool = True) -> None:
     log.info(f"Tabela: {csv_path}")
     _run("plot_comparativo", lambda: _plot(df))
 
-    vencedor = df.sort_values("recall_macro", ascending=False).iloc[0]
+    # Seleção pelo CRITÉRIO HIERÁRQUICO (não recall puro). Cada linha é um par
+    # (método, k); o identificador é a coluna 'combo'.
+    venc = selecionar_por_criterio(df, coluna_id="combo",
+                                   desempate=DESEMPATE_INV3, logger=log)
+    idx_venc = idx_por_combo.get(venc["combo"], [])
     log.info("=" * 62)
-    log.info(
-        f"VENCEDOR (recall_macro): {vencedor['metodo']} (k={vencedor['k']})  "
-        f"recall={vencedor['recall_macro']:.4f} mcc={vencedor['mcc']:.4f}"
-    )
+    log.info(f"VENCEDOR (critério, desempate={DESEMPATE_INV3}): {venc['combo']}  "
+             f"recall={venc['recall_macro']:.4f} mcc={venc['mcc']:.4f} "
+             f"f1={venc['f1_macro']:.4f} fpr={venc['fpr_macro']:.4f} "
+             f"(k_real={venc['k_real']}, passou_criterio={venc['passou_criterio']})")
     log.info("=" * 62)
+
+    _run("salvar estado", lambda: salvar_estado(
+        3, modelo=modelo, familia=familia, balanceamento=balanceamento,
+        metodo=venc["metodo"], k=str(venc["k"]), k_real=int(venc["k_real"]),
+        atributos_idx=[int(i) for i in idx_venc],
+        recall_macro=float(venc["recall_macro"]), mcc=float(venc["mcc"]),
+        f1_macro=float(venc["f1_macro"]), fpr_macro=float(venc["fpr_macro"]),
+        passou_criterio=bool(venc["passou_criterio"]),
+        desempate=DESEMPATE_INV3,
+    ))
 
 
 def _plot(df: pd.DataFrame) -> None:

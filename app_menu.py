@@ -392,8 +392,13 @@ def report_status(analysis_id: int) -> str:
     md = rdir / f"Relatorio_{analysis_id}.md"
     figs = list((rdir / "figuras").glob("*.png")) if (rdir / "figuras").exists() else []
     tabs = list((rdir / "tabelas").glob("*.csv")) if (rdir / "tabelas").exists() else []
-    if md.exists():
-        return badge_ok(f"{len(figs)} figura(s) | {len(tabs)} tabela(s)")
+    if md.exists() or figs or tabs:
+        partes = []
+        if figs:
+            partes.append(f"{len(figs)} figura(s)")
+        if tabs:
+            partes.append(f"{len(tabs)} tabela(s)")
+        return badge_ok(" | ".join(partes) if partes else "relatório .md")
     return badge_warn("Não gerado")
 
 

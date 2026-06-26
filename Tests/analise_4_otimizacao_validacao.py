@@ -1,29 +1,23 @@
 """
 analise_4_otimizacao_validacao.py
 ==================================
-Otimização de hiperparâmetros com Optuna + validação cruzada estratificada
-K-fold 5. Esta análise determina os hiperparâmetros que serão usados pelo
-IDS em produção, eliminando o viés de um split fixo.
+Investigação 4 — Otimização de hiperparâmetros (Optuna/TPE) + validação cruzada
+estratificada K-fold sobre o MODELO VENCEDOR do pipeline (lido do estado), com
+o balanceamento da Inv. 2 e os atributos da Inv. 3. Não otimiza mais um MLP
+fixo: o espaço de busca é ESCOLHIDO PELA FAMÍLIA do vencedor
+(_models.espaco_busca) — árvore recebe knobs de árvore; rede, de rede.
 
-ESPAÇO DE BUSCA (Optuna TPE):
-  - learning_rate ∈ [1e-4, 5e-2]   (log-uniforme)
-  - batch_size    ∈ {1024, 2048, 4096, 8192}
-  - dropout       ∈ [0.10, 0.50]
-  - hidden_units  ∈ {64, 128, 256, 512}
-  - n_layers      ∈ {2, 3, 4}
-  - weight_decay  ∈ [1e-6, 1e-3]   (log-uniforme)
-  - optimizer     ∈ {Adam, AdamW, RMSprop}
+PROTOCOLO (livre de vazamento):
+  - Split dev (85%) / teste reservado (15%), estratificado.
+  - Projeção sobre os atributos selecionados na Inv. 3.
+  - Cada trial: StratifiedKFold(5) sobre o dev. Em cada dobra, o balanceamento
+    da Inv. 2 é aplicado SÓ ao treino da dobra (reamostragem) ou via ponderação
+    nativa/perda; o escalonamento (quando família=rede) é ajustado só no treino
+    da dobra. Objetivo = média(recall_macro) − 0.25·desvio(recall_macro).
+  - Reavaliação K-fold da config vencedora (média ± desvio de todas as métricas).
+  - Treino final no dev inteiro + reporte ÚNICO no teste reservado.
 
-PROTOCOLO DE AVALIAÇÃO:
-  Cada trial Optuna é avaliado por StratifiedKFold(n_splits=5).
-  Objetivo: maximizar média(macro_recall) − 0.25 * desvio(macro_recall).
-  Penaliza alta variância: hiperparâmetros instáveis são desencorajados.
-
-REPORTE FINAL:
-  Tabela com média ± desvio das 5 dobras para todas as métricas
-  (macro_recall, MCC, F1-macro, FPR-macro). Conjunto de teste mantido
-  reservado: usado apenas para reportar a configuração vencedora,
-  nunca para selecioná-la.
+Requer: optuna. Execute as Análises 1–3 antes (geram o estado encadeado).
 """
 import os, sys, time, warnings
 from pathlib import Path
@@ -48,152 +42,111 @@ from config import (
     verificar_dataset, carregar_dataset_real,
 )
 from _test_logging import (
-    get_logger, log_exception, safe_run, EpochLogger, silence_tensorflow,
-    stratified_split_3way, fit_scaler_no_leakage, metricas_completas,
+    get_logger, log_exception, safe_run, silence_tensorflow,
+    stratified_split_3way, metricas_completas,
 )
+from _pipeline import exigir_estado, salvar_estado, familia_de
+from _models import treina_avalia, espaco_busca
+from _balance import estrategia_por_nome
 
 silence_tensorflow()
 
-import tensorflow as tf
-from tensorflow.keras import backend as K
-from tensorflow.keras.layers import Input, Dense, Dropout, BatchNormalization, Activation
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam, AdamW, RMSprop
-from tensorflow.keras.callbacks import EarlyStopping
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 
-tf.keras.utils.set_random_seed(RANDOM_SEED)
 apply_plot_style()
 
 ANALISE_ID = 4
-EPOCHS = 30
-PATIENCE = 5
 N_FOLDS = 5
-N_TRIALS_OPTUNA = 30  # ajuste conforme orçamento computacional
+N_TRIALS_OPTUNA = 30      # ajuste conforme orçamento computacional
+LAMBDA_VAR = 0.25         # penalização da variância entre dobras
+EPOCHS = 30               # usado apenas se o vencedor for de família 'rede'
+PATIENCE = 5
+DESEMPATE_INV4 = "recall"
 log = get_logger(ANALISE_ID, "analise_4")
 
+
 def _run(label, fn, *a, **kw):
-    """Wrapper: executa `fn` via safe_run e retorna apenas o resultado.
-    Se `fn` falhar, devolve None (safe_run já loga a exceção)."""
     ok, res = safe_run(log, label, fn, *a, **kw)
     return res if ok else None
 
 
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-#   MODELO PARAMETRIZADO
+#   PREPARO DE DOBRA (escalonamento p/ rede) + BALANCEAMENTO DA INV. 2
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _make_optimizer(name, lr, weight_decay):
-    if name == "Adam":
-        return Adam(learning_rate=lr)
-    if name == "AdamW":
-        return AdamW(learning_rate=lr, weight_decay=weight_decay)
-    if name == "RMSprop":
-        return RMSprop(learning_rate=lr)
-    raise ValueError(f"Optimizer desconhecido: {name}")
+def _prep_fold(familia, X_tr, X_vl):
+    """Escalona só quando o vencedor é rede (árvore é invariante à escala).
+    O scaler é ajustado APENAS no treino da dobra — sem vazamento."""
+    if familia == "rede":
+        sc = StandardScaler().fit(X_tr)
+        return sc.transform(X_tr), sc.transform(X_vl)
+    return X_tr, X_vl
 
 
-def build_mlp(n_feat, n_cls, hidden, n_layers, dropout, optimizer):
-    inp = Input(shape=(n_feat,))
-    x = inp
-    units = hidden
-    for _ in range(n_layers):
-        x = Dense(units)(x)
-        x = BatchNormalization()(x)
-        x = Activation("relu")(x)
-        x = Dropout(dropout)(x)
-        units = max(units // 2, 32)
-    out = Dense(n_cls, activation="softmax")(x)
-    m = Model(inp, out)
-    m.compile(optimizer=optimizer,
-              loss="sparse_categorical_crossentropy", metrics=["accuracy"])
-    return m
+def _balancear(familia, balanceamento, n_cls, X_tr, y_tr):
+    """Aplica a estratégia da Inv. 2 ao treino. Devolve (X, y, kwargs) em que
+    kwargs vai para treina_avalia (balanceamento_nativo p/ árvore; loss_fn/
+    class_weight p/ rede)."""
+    resampler, kwargs = estrategia_por_nome(balanceamento, familia, y_tr, n_cls)
+    if resampler is not None:
+        X_b, y_b = resampler(X_tr, y_tr, logger=log)
+    else:
+        X_b, y_b = X_tr, y_tr
+    return X_b, y_b, kwargs
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#   AVALIAÇÃO POR K-FOLD
-# ═══════════════════════════════════════════════════════════════════════════
-
-def avaliar_kfold(params, X_dev, y_dev, n_cls, n_splits=N_FOLDS, log_prefix=""):
-    """
-    Avalia uma configuração 'params' por StratifiedKFold sobre (X_dev, y_dev).
-    Para cada dobra: ajusta StandardScaler apenas no fold de treino, treina,
-    avalia no fold de validação. Retorna lista de dicionários (1 por fold).
-    """
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
-    fold_metrics = []
-    for fold, (idx_tr, idx_vl) in enumerate(skf.split(X_dev, y_dev), start=1):
-        K.clear_session()
-        tf.keras.utils.set_random_seed(RANDOM_SEED + fold)
-        Xtr, Xvl = X_dev[idx_tr], X_dev[idx_vl]
-        ytr, yvl = y_dev[idx_tr], y_dev[idx_vl]
-        sc = StandardScaler().fit(Xtr)
-        Xtr_s, Xvl_s = sc.transform(Xtr), sc.transform(Xvl)
-        opt = _make_optimizer(params["optimizer"], params["lr"], params["weight_decay"])
-        m = build_mlp(
-            n_feat=Xtr_s.shape[1], n_cls=n_cls,
-            hidden=params["hidden"], n_layers=params["n_layers"],
-            dropout=params["dropout"], optimizer=opt,
+def avaliar_kfold(modelo, familia, balanceamento, hparams,
+                  X_dev, y_dev, n_cls, log_prefix=""):
+    """StratifiedKFold(5) sobre (X_dev, y_dev). Por dobra: escalona (se rede),
+    balanceia o treino (Inv. 2), treina o vencedor com `hparams`. Retorna lista
+    de dicts (1 por dobra)."""
+    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    folds = []
+    for fold, (i_tr, i_vl) in enumerate(skf.split(X_dev, y_dev), start=1):
+        X_tr, X_vl = X_dev[i_tr], X_dev[i_vl]
+        y_tr, y_vl = y_dev[i_tr], y_dev[i_vl]
+        X_tr, X_vl = _prep_fold(familia, X_tr, X_vl)
+        X_b, y_b, bkw = _balancear(familia, balanceamento, n_cls, X_tr, y_tr)
+        out = treina_avalia(
+            modelo, X_b, y_b, X_vl, y_vl, n_cls,
+            X_val=X_vl, y_val=y_vl, hparams=hparams, logger=None,
+            epochs=EPOCHS, patience=PATIENCE,
+            batch_size=hparams.get("batch_size", BATCH_SIZE), **bkw,
         )
-        cb = [EarlyStopping(patience=PATIENCE, restore_best_weights=True, monitor="val_loss")]
-        t0 = time.time()
-        m.fit(Xtr_s, ytr, validation_data=(Xvl_s, yvl),
-              epochs=EPOCHS, batch_size=params["batch_size"],
-              callbacks=cb, verbose=0)
-        y_pred = np.argmax(m.predict(Xvl_s, batch_size=params["batch_size"], verbose=0), axis=1)
-        met = metricas_completas(yvl, y_pred, n_cls)
-        met["fold"] = fold
-        met["tempo_s"] = time.time() - t0
-        fold_metrics.append(met)
-        log.info(
-            f"  {log_prefix}fold {fold}/{n_splits}: "
-            f"recall={met['recall_macro']:.4f} mcc={met['mcc']:.4f} "
-            f"f1={met['f1_macro']:.4f} ({met['tempo_s']:.1f}s)"
-        )
-    return fold_metrics
+        out["fold"] = fold
+        folds.append(out)
+        log.info(f"  {log_prefix}fold {fold}/{N_FOLDS}: "
+                 f"recall={out['recall_macro']:.4f} mcc={out['mcc']:.4f} "
+                 f"f1={out['f1_macro']:.4f} fpr={out['fpr_macro']:.4f} "
+                 f"({out['tempo_s']:.1f}s)")
+    return folds
 
 
-def _agregar(fold_metrics):
-    """Agrega lista de dicts (1 por fold) em médias e desvios."""
-    df = pd.DataFrame(fold_metrics)
+def _agregar(folds):
+    df = pd.DataFrame(folds)
     cols = ["acuracia", "balanced_acc", "f1_macro", "f1_weighted",
             "precision_macro", "recall_macro", "mcc", "fpr_macro", "tempo_s"]
     agg = {}
     for c in cols:
         if c in df.columns:
             agg[f"{c}_mean"] = float(df[c].mean())
-            agg[f"{c}_std"]  = float(df[c].std(ddof=1))
+            agg[f"{c}_std"]  = float(df[c].std(ddof=1)) if len(df) > 1 else 0.0
     return agg
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#   OPTUNA
+#   OPTUNA — objetivo family-aware
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _objective_factory(X_dev, y_dev, n_cls):
+def _objective_factory(modelo, familia, balanceamento, X_dev, y_dev, n_cls):
     def objective(trial):
-        params = dict(
-            lr           = trial.suggest_float("lr", 1e-4, 5e-2, log=True),
-            batch_size   = trial.suggest_categorical("batch_size", [1024, 2048, 4096, 8192]),
-            dropout      = trial.suggest_float("dropout", 0.10, 0.50),
-            hidden       = trial.suggest_categorical("hidden", [64, 128, 256, 512]),
-            n_layers     = trial.suggest_int("n_layers", 2, 4),
-            weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
-            optimizer    = trial.suggest_categorical("optimizer", ["Adam", "AdamW", "RMSprop"]),
-        )
-        fm = avaliar_kfold(params, X_dev, y_dev, n_cls,
-                           log_prefix=f"trial {trial.number} ")
-        recalls = [m["recall_macro"] for m in fm]
-        mu, sg = float(np.mean(recalls)), float(np.std(recalls, ddof=1))
-        score = mu - 0.25 * sg
-        log.info(
-            f"  trial {trial.number}: recall={mu:.4f}±{sg:.4f}  score={score:.4f}  "
-            f"params={params}"
-        )
-        return score
+        hp = espaco_busca(modelo, trial)
+        folds = avaliar_kfold(modelo, familia, balanceamento, hp,
+                              X_dev, y_dev, n_cls,
+                              log_prefix=f"trial {trial.number} ")
+        rec = np.array([f["recall_macro"] for f in folds], dtype=float)
+        return float(rec.mean() - LAMBDA_VAR * rec.std(ddof=1))
     return objective
 
 
@@ -205,16 +158,25 @@ def executar(dataset_disponivel: bool = True) -> None:
     try:
         import optuna
         from optuna.samplers import TPESampler
-    except ImportError as e:
-        raise RuntimeError(
-            "optuna não instalado. Execute: pip install optuna"
-        ) from e
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        log.error("Optuna ausente. Instale com: pip install optuna"); return
 
-    log.info(f"ANÁLISE 4 — Otimização com Optuna (TPE) + StratifiedKFold-{N_FOLDS}")
+    # ── Estado da Inv. 3: vencedor + balanceamento + atributos selecionados ─
+    try:
+        est3 = exigir_estado(3)
+    except RuntimeError as e:
+        log.error(str(e)); return
+    modelo = est3["modelo"]
+    familia = est3.get("familia") or familia_de(modelo)
+    balanceamento = est3["balanceamento"]
+    atributos_idx = est3.get("atributos_idx") or []
+    log.info(f"ANÁLISE 4 — Otimização (Optuna/TPE) + CV-{N_FOLDS} sobre "
+             f"{modelo} [{familia}] | balanceamento={balanceamento} | "
+             f"k={len(atributos_idx) or 'todos'}")
+    log.info(f"Espaço de busca: {familia} (selecionado pela família do vencedor)")
 
-    # Carregamento direto (sem safe_run): a função pode retornar
-    # (X, y) ou (X, y, label_encoder). O safe_run anterior embrulhava o
-    # resultado em uma estrutura aninhada que quebrava np.asarray(y).
+    # ── Dataset ────────────────────────────────────────────────────────────
     log.info(">>> carregar_dataset_real")
     try:
         _t0 = time.time()
@@ -223,98 +185,95 @@ def executar(dataset_disponivel: bool = True) -> None:
     except Exception as _e:
         log_exception(log, "carregar_dataset_real", _e)
         log.error("Sem dataset real. Abortando."); return
-    if _ds is None:
-        log.error("carregar_dataset_real retornou None. Abortando."); return
-    if not isinstance(_ds, (tuple, list)) or len(_ds) < 2:
-        log.error(f"Formato inesperado do dataset: type={type(_ds).__name__}, "
-                  f"len={len(_ds) if hasattr(_ds, '__len__') else 'N/A'}. Abortando.")
-        return
-    Xfull, yfull = _ds[0], _ds[1]
-    # Garantir tipos antes de QUALQUER operação numérica
-    Xfull = np.ascontiguousarray(Xfull, dtype=np.float32)
-    yfull = np.ascontiguousarray(yfull).astype(np.int64).ravel()
-    log.info(f"Dataset coerido: X={Xfull.shape} y={yfull.shape}")
+    if _ds is None or not isinstance(_ds, (tuple, list)) or len(_ds) < 2:
+        log.error("Dataset inválido. Abortando."); return
+    Xfull = np.ascontiguousarray(_ds[0], dtype=np.float32)
+    yfull = np.ascontiguousarray(_ds[1]).astype(np.int64).ravel()
     n_cls = int(np.max(yfull) + 1)
-    log.info(f"Dataset: {Xfull.shape[0]:,} amostras × {Xfull.shape[1]} features × {n_cls} classes")
 
-    # Split: dev (85%) para Optuna+CV, teste (15%) reservado para reporte final.
-    X_dev_raw, _Xv_raw, X_te_raw, y_dev, _yv, y_te = stratified_split_3way(
+    # Projeção sobre os atributos da Inv. 3 (se ausente, usa todos).
+    if atributos_idx:
+        idx = np.asarray(atributos_idx, dtype=int)
+        Xfull = Xfull[:, idx]
+    log.info(f"Dataset: {Xfull.shape[0]:,} amostras × {Xfull.shape[1]} features "
+             f"× {n_cls} classes")
+
+    # Split dev (85%) / teste reservado (15%). O vestígio de 'val' é reincorporado
+    # ao dev para mantê-lo íntegro na validação cruzada.
+    X_dev, X_tiny, X_te, y_dev, y_tiny, y_te = stratified_split_3way(
         Xfull, yfull, val_frac=0.0001, test_frac=0.15, seed=RANDOM_SEED,
     )
-    log.info(f"Split: dev={len(y_dev):,} (CV-{N_FOLDS}) teste={len(y_te):,} (reservado)")
+    if len(y_tiny):
+        X_dev = np.concatenate([X_dev, X_tiny])
+        y_dev = np.concatenate([y_dev, y_tiny])
+    log.info(f"Split: dev={len(y_dev):,} (CV-{N_FOLDS}) "
+             f"teste={len(y_te):,} (reservado)")
 
-    # Optuna não pode receber X já escalonado (cada fold escalona por conta própria)
+    # ── Otimização ─────────────────────────────────────────────────────────
     sampler = TPESampler(seed=RANDOM_SEED)
     study = optuna.create_study(direction="maximize", sampler=sampler)
+    log.info(f">>> Optuna: {N_TRIALS_OPTUNA} trials × CV-{N_FOLDS} "
+             f"= {N_TRIALS_OPTUNA * N_FOLDS} ajustes de {modelo}")
     study.optimize(
-        _objective_factory(X_dev_raw, y_dev, n_cls),
+        _objective_factory(modelo, familia, balanceamento, X_dev, y_dev, n_cls),
         n_trials=N_TRIALS_OPTUNA, show_progress_bar=False,
     )
-
     log.info("=" * 62)
     log.info(f"BEST PARAMS: {study.best_params}")
     log.info(f"BEST SCORE : {study.best_value:.4f}")
     log.info("=" * 62)
 
-    # Reavaliação por K-fold da configuração vencedora (média ± desvio)
+    # ── Reavaliação K-fold da config vencedora ─────────────────────────────
     log.info(">>> Reavaliação K-fold da configuração vencedora")
-    best_fold_metrics = _run(
-        "kfold_vencedor",
-        lambda: avaliar_kfold(study.best_params, X_dev_raw, y_dev, n_cls,
-                              log_prefix="best "),
-    )
-    if best_fold_metrics is None:
+    best_folds = _run("kfold_vencedor", lambda: avaliar_kfold(
+        modelo, familia, balanceamento, study.best_params,
+        X_dev, y_dev, n_cls, log_prefix="best "))
+    if best_folds is None:
         log.error("Falha na reavaliação K-fold."); return
-    agg_dev = _agregar(best_fold_metrics)
+    agg = _agregar(best_folds)
 
-    # Reporte único no conjunto de teste reservado (config. final treinada em dev inteiro)
-    log.info(">>> Treino final em dev inteiro + reporte no teste reservado")
-    K.clear_session()
-    tf.keras.utils.set_random_seed(RANDOM_SEED)
-    sc = StandardScaler().fit(X_dev_raw)
-    X_dev_s = sc.transform(X_dev_raw); X_te_s = sc.transform(X_te_raw)
-    p = study.best_params
-    opt = _make_optimizer(p["optimizer"], p["lr"], p["weight_decay"])
-    m = build_mlp(X_dev_s.shape[1], n_cls,
-                  p["hidden"], p["n_layers"], p["dropout"], opt)
-    m.fit(X_dev_s, y_dev,
-          epochs=EPOCHS, batch_size=p["batch_size"], verbose=0)
-    y_pred = np.argmax(m.predict(X_te_s, batch_size=p["batch_size"], verbose=0), axis=1)
-    met_te = metricas_completas(y_te, y_pred, n_cls)
-    log.info(
-        f"TESTE RESERVADO: recall={met_te['recall_macro']:.4f} "
-        f"mcc={met_te['mcc']:.4f} f1={met_te['f1_macro']:.4f} "
-        f"fpr={met_te['fpr_macro']:.4f}"
-    )
+    # ── Treino final no dev inteiro + reporte no teste reservado ───────────
+    log.info(">>> Treino final (dev inteiro) + teste reservado")
+    Xd, Xt = _prep_fold(familia, X_dev, X_te)        # escala só se rede
+    Xb, yb, bkw = _balancear(familia, balanceamento, n_cls, Xd, y_dev)
+    if familia == "rede":
+        # carve val p/ early stopping do treino final, sem tocar no teste
+        Xtr_f, Xval_f, ytr_f, yval_f = train_test_split(
+            Xb, yb, test_size=0.05, random_state=RANDOM_SEED, stratify=yb)
+        met_te = treina_avalia(
+            modelo, Xtr_f, ytr_f, Xt, y_te, n_cls,
+            X_val=Xval_f, y_val=yval_f, hparams=study.best_params,
+            epochs=EPOCHS, patience=PATIENCE,
+            batch_size=study.best_params.get("batch_size", BATCH_SIZE), **bkw)
+    else:
+        met_te = treina_avalia(
+            modelo, Xb, yb, Xt, y_te, n_cls,
+            X_val=None, y_val=None, hparams=study.best_params, **bkw)
+    log.info(f"TESTE RESERVADO: recall={met_te['recall_macro']:.4f} "
+             f"mcc={met_te['mcc']:.4f} f1={met_te['f1_macro']:.4f} "
+             f"fpr={met_te['fpr_macro']:.4f}")
 
-    # ─── persistência ────────────────────────────────────────────────────
+    # ── Persistência ───────────────────────────────────────────────────────
     df_trials = study.trials_dataframe(attrs=("number", "value", "params", "state"))
-    df_folds = pd.DataFrame(best_fold_metrics)
+    df_folds = pd.DataFrame(best_folds)
     csv_trials = tab_path(ANALISE_ID, "metricas_otimizacao")
     csv_folds  = tab_path(ANALISE_ID, "kfold_vencedor")
-    _run("salvar trials",  lambda: df_trials.to_csv(csv_trials, index=False))
-    _run("salvar folds",   lambda: df_folds.to_csv(csv_folds, index=False))
+    _run("salvar trials", lambda: df_trials.to_csv(csv_trials, index=False))
+    _run("salvar folds",  lambda: df_folds.to_csv(csv_folds, index=False))
     log.info(f"Tabela trials: {csv_trials}")
     log.info(f"Tabela folds : {csv_folds}")
 
-    # Resumo agregado para a tabela do artigo
     df_resumo = pd.DataFrame([{
-        "config":       "best_optuna",
-        "params":       str(study.best_params),
-        "n_folds":      N_FOLDS,
-        "recall_mean":  agg_dev["recall_macro_mean"],
-        "recall_std":   agg_dev["recall_macro_std"],
-        "mcc_mean":     agg_dev["mcc_mean"],
-        "mcc_std":      agg_dev["mcc_std"],
-        "f1_mean":      agg_dev["f1_macro_mean"],
-        "f1_std":       agg_dev["f1_macro_std"],
-        "fpr_mean":     agg_dev["fpr_macro_mean"],
-        "fpr_std":      agg_dev["fpr_macro_std"],
-        "tempo_mean_s": agg_dev["tempo_s_mean"],
-        "teste_recall": met_te["recall_macro"],
-        "teste_mcc":    met_te["mcc"],
-        "teste_f1":     met_te["f1_macro"],
-        "teste_fpr":    met_te["fpr_macro"],
+        "modelo": modelo, "familia": familia, "balanceamento": balanceamento,
+        "n_atributos": Xfull.shape[1], "params": str(study.best_params),
+        "n_folds": N_FOLDS,
+        "recall_mean": agg["recall_macro_mean"], "recall_std": agg["recall_macro_std"],
+        "mcc_mean": agg["mcc_mean"], "mcc_std": agg["mcc_std"],
+        "f1_mean": agg["f1_macro_mean"], "f1_std": agg["f1_macro_std"],
+        "fpr_mean": agg["fpr_macro_mean"], "fpr_std": agg["fpr_macro_std"],
+        "tempo_mean_s": agg["tempo_s_mean"],
+        "teste_recall": met_te["recall_macro"], "teste_mcc": met_te["mcc"],
+        "teste_f1": met_te["f1_macro"], "teste_fpr": met_te["fpr_macro"],
     }])
     csv_resumo = tab_path(ANALISE_ID, "resumo_kfold_best")
     _run("salvar resumo", lambda: df_resumo.to_csv(csv_resumo, index=False))
@@ -322,20 +281,33 @@ def executar(dataset_disponivel: bool = True) -> None:
 
     _run("plot_otimizacao", lambda: _plot(df_trials, df_folds))
 
+    _run("salvar estado", lambda: salvar_estado(
+        4, modelo=modelo, familia=familia, balanceamento=balanceamento,
+        atributos_idx=[int(i) for i in atributos_idx],
+        hparams={k: (v if isinstance(v, (int, float, str, bool, type(None)))
+                     else str(v)) for k, v in study.best_params.items()},
+        teste_recall=float(met_te["recall_macro"]), teste_mcc=float(met_te["mcc"]),
+        teste_f1=float(met_te["f1_macro"]), teste_fpr=float(met_te["fpr_macro"]),
+        cv_recall_mean=agg["recall_macro_mean"], cv_recall_std=agg["recall_macro_std"],
+        cv_mcc_mean=agg["mcc_mean"], cv_mcc_std=agg["mcc_std"],
+    ))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#   FIGURA (family-agnostic)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _plot(df_trials: pd.DataFrame, df_folds: pd.DataFrame) -> None:
-    """Painel 2x2: (a) histórico de trials, (b) recall por fold (best),
-    (c) importância dos hiperparâmetros (correlação Spearman),
-    (d) recall vs lr (best params em destaque)."""
     fig, ax = plt.subplots(2, 2, figsize=(13, 9))
 
     # (a) Histórico Optuna
     df_ok = df_trials.dropna(subset=["value"]).copy()
-    df_ok["best_so_far"] = df_ok["value"].cummax()
-    ax[0, 0].plot(df_ok["number"], df_ok["value"],
-                  color="black", marker="o", linewidth=1, markersize=4, alpha=0.6, label="trial")
-    ax[0, 0].plot(df_ok["number"], df_ok["best_so_far"],
-                  color="black", linestyle="--", linewidth=2, label="best so far")
+    if not df_ok.empty:
+        df_ok["best_so_far"] = df_ok["value"].cummax()
+        ax[0, 0].plot(df_ok["number"], df_ok["value"], color="black",
+                      marker="o", linewidth=1, markersize=4, alpha=0.6, label="trial")
+        ax[0, 0].plot(df_ok["number"], df_ok["best_so_far"], color="black",
+                      linestyle="--", linewidth=2, label="best so far")
     ax[0, 0].set_title("Histórico de otimização (Optuna)", fontsize=12, fontweight="bold")
     ax[0, 0].set_xlabel("Trial"); ax[0, 0].set_ylabel("Score (recall − 0.25·σ)")
     ax[0, 0].grid(True, alpha=0.3); ax[0, 0].legend()
@@ -352,38 +324,45 @@ def _plot(df_trials: pd.DataFrame, df_folds: pd.DataFrame) -> None:
         ax[0, 1].annotate(f"{v:.3f}", (p.get_x() + p.get_width()/2, v),
                           ha="center", va="bottom", fontsize=9)
 
-    # (c) Importância de hiperparâmetros (correlação |Spearman| de cada param com value)
+    # (c) Importância de hiperparâmetros (|Spearman| de cada param com value)
     param_cols = [c for c in df_trials.columns if c.startswith("params_")]
+    top_num_param = None
     if param_cols:
         from scipy.stats import spearmanr
         importancias = []
         for c in param_cols:
-            try:
-                vals = pd.to_numeric(df_trials[c], errors="coerce")
-                if vals.notna().sum() < 5:
-                    importancias.append((c.replace("params_", ""), 0.0)); continue
-                r, _ = spearmanr(vals, df_trials["value"], nan_policy="omit")
-                importancias.append((c.replace("params_", ""), abs(r) if r is not None else 0.0))
-            except Exception:
-                importancias.append((c.replace("params_", ""), 0.0))
-        df_imp = pd.DataFrame(importancias, columns=["param", "|spearman|"]).sort_values("|spearman|")
+            vals = pd.to_numeric(df_trials[c], errors="coerce")
+            if vals.notna().sum() < 5:
+                importancias.append((c.replace("params_", ""), 0.0, None)); continue
+            r, _ = spearmanr(vals, df_trials["value"], nan_policy="omit")
+            importancias.append((c.replace("params_", ""),
+                                 abs(r) if r is not None else 0.0, c))
+        importancias.sort(key=lambda t: t[1])
+        df_imp = pd.DataFrame([(n, v) for n, v, _ in importancias],
+                              columns=["param", "|spearman|"])
         ax[1, 0].barh(df_imp["param"], df_imp["|spearman|"],
                       color="dimgray", edgecolor="black")
         ax[1, 0].set_title("Importância de hiperparâmetros (|ρ Spearman|)",
                            fontsize=12, fontweight="bold")
         ax[1, 0].set_xlabel("|correlação de Spearman|")
         ax[1, 0].grid(True, axis="x", alpha=0.3)
+        if importancias and importancias[-1][1] > 0:
+            top_num_param = importancias[-1][2]  # param numérico mais influente
 
-    # (d) Trials espalhados: lr vs value
-    if "params_lr" in df_trials.columns:
-        df_trials["params_lr"] = pd.to_numeric(df_trials["params_lr"], errors="coerce")
-        ax[1, 1].scatter(df_trials["params_lr"], df_trials["value"],
-                         color="black", alpha=0.6, edgecolor="white", s=40)
-        ax[1, 1].set_xscale("log")
-        ax[1, 1].set_title("Score vs. learning rate (todos os trials)",
+    # (d) Score vs. o hiperparâmetro numérico mais influente (family-agnostic)
+    if top_num_param is not None:
+        xv = pd.to_numeric(df_trials[top_num_param], errors="coerce")
+        ax[1, 1].scatter(xv, df_trials["value"], color="black",
+                         alpha=0.6, edgecolor="white", s=40)
+        nome = top_num_param.replace("params_", "")
+        if (xv.dropna() > 0).all() and xv.dropna().max() / max(xv.dropna().min(), 1e-12) > 50:
+            ax[1, 1].set_xscale("log")
+        ax[1, 1].set_title(f"Score vs. {nome} (todos os trials)",
                            fontsize=12, fontweight="bold")
-        ax[1, 1].set_xlabel("learning_rate (log)"); ax[1, 1].set_ylabel("Score")
+        ax[1, 1].set_xlabel(nome); ax[1, 1].set_ylabel("Score")
         ax[1, 1].grid(True, alpha=0.3)
+    else:
+        ax[1, 1].axis("off")
 
     plt.tight_layout()
     plt.savefig(fig_path(ANALISE_ID, "comparativo_otimizacao"), dpi=160, bbox_inches="tight")
