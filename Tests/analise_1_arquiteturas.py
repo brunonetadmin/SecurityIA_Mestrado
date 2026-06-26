@@ -5,18 +5,23 @@ Comparação de arquiteturas para detecção multiclasse de intrusões sobre
 fluxos do CSE-CIC-IDS2018.
 
 MODELOS AVALIADOS (7):
-  Tabulares clássicos:
+  Tabulares clássicos (árvores):
     1. RandomForest          — baseline forte (Breiman, 2001)
     2. ExtraTrees            — splits aleatórios (Geurts et al., 2006)
     3. XGBoost               — gradient boosting regularizado (Chen & Guestrin, 2016)
     4. CatBoost              — ordered boosting (Prokhorenkova et al., 2018)
   Redes densas:
-    5. MLP+BatchNorm         — Ioffe & Szegedy (2015)
+    5. MLP+BatchNorm         — normalização em lote (Ioffe & Szegedy, 2015)
     6. ResNet Tabular        — conexões residuais (He et al., 2016)
-  Controle (recorrente):
-    7. BiLSTM com Atenção    — hipótese secundária
+    7. SNN                   — auto-normalização SELU/AlphaDropout (Klambauer et al., 2017)
 
-Critério primário: macro_recall. Secundários: MCC, F1-macro, FPR-macro, tempo.
+Critério de seleção: hierárquico (MCC>=0,80; FPR-macro<=0,010; depois maximiza
+recall-macro). Secundários reportados: F1-macro, tempo.
+
+CONDIÇÃO JUSTA: todas as 7 arquiteturas são comparadas SEM balanceamento
+(cru), de modo que a Inv. 1 isole a capacidade da arquitetura. O tratamento
+de desbalanceamento é investigado na Inv. 2 sobre o vencedor; o resultado cru
+do vencedor aqui coincide com o 'Sem_Tratamento' dele na Inv. 2.
 Cada modelo em safe_run() — falha individual não interrompe a fila.
 """
 import os, sys, time, warnings
@@ -45,14 +50,20 @@ from _test_logging import (
     get_logger, log_exception, safe_run, EpochLogger, silence_tensorflow,
     stratified_split_3way, fit_scaler_no_leakage, metricas_completas,
 )
+from _pipeline import selecionar_por_criterio, familia_de, salvar_estado
+
+# Desempate final do critério hierárquico na Inv. 1:
+#   "recall" → critério da dissertação (vence o RandomForest)
+#   "mcc"    → vence o XGBoost
+# Este é o ÚNICO ponto que decide o modelo que percorre as Inv. 2-4.
+DESEMPATE_INV1 = "recall"
 
 silence_tensorflow()
 
 import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras.layers import (
-    Input, Dense, Dropout, BatchNormalization, Activation, Add,
-    Bidirectional, LSTM, Reshape, Layer,
+    Input, Dense, Dropout, BatchNormalization, Activation, Add, AlphaDropout,
 )
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
@@ -82,11 +93,11 @@ def _run(label, fn, *a, **kw):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def avaliar_random_forest(X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls):
-    log.info("  fit RandomForest: 300 árvores, balanced_subsample")
+    log.info("  fit RandomForest: 300 árvores (cru — Inv.1 isola a arquitetura)")
     t0 = time.time()
     rf = RandomForestClassifier(
         n_estimators=300, n_jobs=-1, random_state=RANDOM_SEED,
-        class_weight="balanced_subsample", max_depth=None, min_samples_leaf=2,
+        class_weight=None, max_depth=None, min_samples_leaf=2,
     )
     rf.fit(X_tr, y_tr)
     y_pred = rf.predict(X_te)
@@ -100,7 +111,7 @@ def avaliar_extra_trees(X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls):
     t0 = time.time()
     et = ExtraTreesClassifier(
         n_estimators=400, n_jobs=-1, random_state=RANDOM_SEED,
-        class_weight="balanced_subsample", max_depth=None, min_samples_leaf=2,
+        class_weight=None, max_depth=None, min_samples_leaf=2,
         bootstrap=False,
     )
     et.fit(X_tr, y_tr)
@@ -145,7 +156,7 @@ def avaliar_catboost(X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls):
         iterations=500, depth=8, learning_rate=0.1,
         loss_function="MultiClass", thread_count=-1,
         random_seed=RANDOM_SEED, verbose=False, allow_writing_files=False,
-        auto_class_weights="Balanced",
+        auto_class_weights=None,
     )
     clf.fit(X_tr, y_tr, eval_set=(X_val, y_val), use_best_model=True)
     y_pred = clf.predict(X_te).ravel().astype(int)
@@ -185,27 +196,18 @@ def build_resnet_tabular(n_feat, n_cls, blocks=4, hidden=256):
     return m
 
 
-class BahdanauAttention(Layer):
-    def __init__(self, units=64, **kw):
-        super().__init__(**kw); self.units = units
-    def build(self, input_shape):
-        self.W = Dense(self.units); self.U = Dense(self.units); self.V = Dense(1)
-        super().build(input_shape)
-    def call(self, x):
-        score = self.V(tf.nn.tanh(self.W(x) + self.U(x)))
-        a = tf.nn.softmax(score, axis=1)
-        return tf.reduce_sum(a * x, axis=1)
-
-
-def build_bilstm_atencao(n_feat, n_cls, units=128):
+def build_snn(n_feat, n_cls, hidden=(256, 128, 64), dropout=0.10):
+    """Self-Normalizing Network (Klambauer et al., 2017): camadas densas com
+    ativação SELU, inicialização lecun_normal e AlphaDropout. Mantém as
+    ativações normalizadas SEM BatchNorm — terceiro paradigma denso, distinto
+    de MLP+BN (normalização em lote) e ResNet (conexões residuais)."""
     inp = Input(shape=(n_feat,))
-    x = Reshape((n_feat, 1))(inp)
-    x = Bidirectional(LSTM(units, return_sequences=True, dropout=0.3))(x)
-    x = Bidirectional(LSTM(units // 2, return_sequences=True, dropout=0.3))(x)
-    x = BahdanauAttention(64)(x)
-    x = Dense(64, activation="relu")(x); x = Dropout(0.3)(x)
+    x = inp
+    for u in hidden:
+        x = Dense(u, activation="selu", kernel_initializer="lecun_normal")(x)
+        x = AlphaDropout(dropout)(x)
     out = Dense(n_cls, activation="softmax")(x)
-    m = Model(inp, out, name="BiLSTM_Atencao")
+    m = Model(inp, out, name="SNN")
     m.compile(optimizer=Adam(1e-3),
               loss="sparse_categorical_crossentropy", metrics=["accuracy"])
     return m
@@ -276,8 +278,7 @@ def executar(dataset_disponivel: bool = True) -> None:
         ("CatBoost",       lambda: avaliar_catboost     (X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls)),
         ("MLP_BN",         lambda: avaliar_rede("MLP_BN",         build_mlp_bn,         X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls)),
         ("ResNet_Tabular", lambda: avaliar_rede("ResNet_Tabular", build_resnet_tabular, X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls)),
-        ("BiLSTM_Atencao_Tabular (hipótese secundária)",
-                           lambda: avaliar_rede("BiLSTM_Atencao", build_bilstm_atencao, X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls)),
+        ("SNN",            lambda: avaliar_rede("SNN",            build_snn,            X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls)),
     ]
     for nome, fn in avaliacoes:
         out = _run(nome, fn)
@@ -288,19 +289,53 @@ def executar(dataset_disponivel: bool = True) -> None:
         log.error("Nenhum modelo concluído com sucesso."); return
 
     df = pd.DataFrame(resultados)
+    df["familia"] = df["modelo"].map(familia_de)
+    # Ordena por família (árvore antes de rede) e recall, para o relatório
+    df = df.sort_values(["familia", "recall_macro"], ascending=[True, False]).reset_index(drop=True)
     csv_path = tab_path(ANALISE_ID, "metricas_arquiteturas")
     _run("salvar CSV", lambda: df.to_csv(csv_path, index=False))
     log.info(f"Tabela: {csv_path}")
     _run("plot_comparativo", lambda: _plot(df))
 
-    vencedor = df.sort_values("recall_macro", ascending=False).iloc[0]
+    vencedor = selecionar_por_criterio(df, coluna_id="modelo",
+                                       desempate=DESEMPATE_INV1, logger=log)
+    fam = familia_de(vencedor["modelo"])
     log.info("=" * 62)
     log.info(
-        f"VENCEDOR (recall_macro): {vencedor['modelo']}  "
+        f"VENCEDOR (critério hierárquico, desempate={DESEMPATE_INV1}): "
+        f"{vencedor['modelo']} [{fam}]  "
         f"recall={vencedor['recall_macro']:.4f} mcc={vencedor['mcc']:.4f} "
-        f"f1_macro={vencedor['f1_macro']:.4f} fpr={vencedor['fpr_macro']:.4f}"
+        f"f1_macro={vencedor['f1_macro']:.4f} fpr={vencedor['fpr_macro']:.4f} "
+        f"(passou_criterio={vencedor['passou_criterio']})"
     )
+    # Transparência: líder por métrica isolada (pode divergir do vencedor)
+    for met in ("recall_macro", "mcc", "f1_macro"):
+        lid = df.sort_values(met, ascending=False).iloc[0]
+        log.info(f"  líder {met}: {lid['modelo']} ({lid[met]:.4f})")
+    # Separação por família: melhor de cada uma sob o critério hierárquico
+    log.info("-" * 62)
+    log.info("MELHOR POR FAMÍLIA (critério hierárquico):")
+    for fam_nome in ("arvore", "rede"):
+        sub = df[df["familia"] == fam_nome]
+        if sub.empty:
+            continue
+        v = selecionar_por_criterio(sub, coluna_id="modelo",
+                                    desempate=DESEMPATE_INV1)
+        log.info(f"  [{fam_nome}] {v['modelo']}: recall={v['recall_macro']:.4f} "
+                 f"mcc={v['mcc']:.4f} f1={v['f1_macro']:.4f} fpr={v['fpr_macro']:.4f} "
+                 f"(passou_criterio={v['passou_criterio']})")
     log.info("=" * 62)
+
+    # Persiste a decisão para as Investigações 2-4 (encadeamento do pipeline)
+    _run("salvar estado", lambda: salvar_estado(
+        1, modelo=vencedor["modelo"], familia=fam,
+        recall_macro=float(vencedor["recall_macro"]),
+        mcc=float(vencedor["mcc"]),
+        f1_macro=float(vencedor["f1_macro"]),
+        fpr_macro=float(vencedor["fpr_macro"]),
+        passou_criterio=bool(vencedor["passou_criterio"]),
+        desempate=DESEMPATE_INV1,
+    ))
 
 
 def _plot(df: pd.DataFrame) -> None:
