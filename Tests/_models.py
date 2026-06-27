@@ -48,6 +48,65 @@ DEFAULTS_ARVORE = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#   ESPAÇO DE BUSCA (Optuna/TPE) — usado pela Investigação 4
+# ═══════════════════════════════════════════════════════════════════════════
+
+def espaco_busca(modelo: str, trial) -> dict:
+    """Sugere um conjunto de hiperparâmetros para `modelo` a partir de um
+    `trial` do Optuna. O dict retornado é passado a treina_avalia(..., hparams=)
+    e lá faz `DEFAULTS_ARVORE[modelo].update(hparams)` — portanto só precisa
+    conter as chaves que o ramo correspondente de _avalia_arvore/_avalia_rede
+    de fato lê. Parâmetros fixados internamente (random_seed, thread_count/
+    n_jobs, verbose, loss_function, auto_class_weights/balanceamento) NÃO são
+    sugeridos aqui de propósito: alterá-los não teria efeito ou duplicaria o
+    tratamento de desbalanceamento.
+
+    As faixas espelham e ampliam moderadamente os defaults da Investigação 1,
+    mantendo o modelo dentro da mesma família avaliada na comparação inicial.
+    """
+    if modelo == "CatBoost":
+        return {
+            "iterations":    trial.suggest_int("iterations", 300, 1200, step=100),
+            "depth":         trial.suggest_int("depth", 4, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 1e-2, 3e-1, log=True),
+        }
+
+    if modelo == "XGBoost":
+        return {
+            "n_estimators":     trial.suggest_int("n_estimators", 200, 1000, step=100),
+            "max_depth":        trial.suggest_int("max_depth", 4, 12),
+            "learning_rate":    trial.suggest_float("learning_rate", 1e-2, 3e-1, log=True),
+            "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+        }
+
+    if modelo in ("RandomForest", "ExtraTrees"):
+        hp = {
+            "n_estimators":     trial.suggest_int("n_estimators", 200, 800, step=100),
+            "max_depth":        trial.suggest_categorical("max_depth", [None, 10, 20, 30, 50]),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 8),
+        }
+        if modelo == "ExtraTrees":
+            hp["bootstrap"] = trial.suggest_categorical("bootstrap", [False, True])
+        return hp
+
+    if modelo in ("MLP_BN", "SNN"):
+        return {
+            "hidden":   trial.suggest_categorical("hidden", [128, 256, 512]),
+            "dropout":  trial.suggest_float("dropout", 0.05, 0.5),
+            "n_layers": trial.suggest_int("n_layers", 2, 5),
+        }
+
+    if modelo == "ResNet_Tabular":
+        return {
+            "hidden":  trial.suggest_categorical("hidden", [128, 256, 512]),
+            "dropout": trial.suggest_float("dropout", 0.05, 0.5),
+        }
+
+    raise ValueError(f"Sem espaço de busca definido para o modelo: {modelo}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #   ÁRVORES
 # ═══════════════════════════════════════════════════════════════════════════
 
