@@ -96,31 +96,62 @@ def _balancear(familia, balanceamento, n_cls, X_tr, y_tr):
     return X_b, y_b, kwargs
 
 
-def avaliar_kfold(modelo, familia, balanceamento, hparams,
-                  X_dev, y_dev, n_cls, log_prefix=""):
-    """StratifiedKFold(5) sobre (X_dev, y_dev). Por dobra: escalona (se rede),
-    balanceia o treino (Inv. 2), treina o vencedor com `hparams`. Retorna lista
-    de dicts (1 por dobra)."""
+def _preparar_dobras(familia, balanceamento, n_cls, X_dev, y_dev):
+    """Pré-computa, UMA única vez, as N_FOLDS dobras já preparadas (escala, se
+    família=rede) e BALANCEADAS (Inv. 2). O resultado independe dos
+    hiperparâmetros do Optuna: o SMOTE-ENN e o scaler dependem apenas dos
+    dados/rótulos de treino de cada dobra, que são fixos (mesmas dobras —
+    StratifiedKFold com seed fixo — e mesmas features da Inv. 3). Reutilizar
+    estas dobras em todos os trials elimina a recomputação do SMOTE-ENN a cada
+    trial (29×N_FOLDS reamostragens redundantes) SEM qualquer efeito sobre as
+    métricas. Pressupõe que treina_avalia trata X_b/y_b como somente-leitura
+    (verdadeiro para CatBoost/árvore; o Pool é construído sem alterar o array)."""
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
-    folds = []
+    dobras, t0 = [], time.time()
     for fold, (i_tr, i_vl) in enumerate(skf.split(X_dev, y_dev), start=1):
         X_tr, X_vl = X_dev[i_tr], X_dev[i_vl]
         y_tr, y_vl = y_dev[i_tr], y_dev[i_vl]
         X_tr, X_vl = _prep_fold(familia, X_tr, X_vl)
         X_b, y_b, bkw = _balancear(familia, balanceamento, n_cls, X_tr, y_tr)
+        dobras.append(dict(fold=fold, X_b=X_b, y_b=y_b, bkw=bkw,
+                           X_vl=X_vl, y_vl=y_vl))
+        log.info(f"  dobra {fold}/{N_FOLDS} preparada+balanceada "
+                 f"(treino {len(y_b):,} | val {len(y_vl):,})")
+    log.info(f"  {N_FOLDS} dobras pré-balanceadas em {time.time()-t0:.1f}s — "
+             f"reutilizadas nos {N_TRIALS_OPTUNA} trials")
+    return dobras
+
+
+def avaliar_kfold_cache(modelo, hparams, dobras, n_cls, log_prefix=""):
+    """Avalia `hparams` sobre dobras JÁ preparadas e balanceadas por
+    _preparar_dobras. Apenas o ajuste do modelo varia entre trials — que é a
+    única etapa que de fato depende dos hiperparâmetros. Retorna lista de dicts
+    (1 por dobra), idêntica à versão que rebalanceava a cada chamada."""
+    folds = []
+    for d in dobras:
         out = treina_avalia(
-            modelo, X_b, y_b, X_vl, y_vl, n_cls,
-            X_val=X_vl, y_val=y_vl, hparams=hparams, logger=None,
+            modelo, d["X_b"], d["y_b"], d["X_vl"], d["y_vl"], n_cls,
+            X_val=d["X_vl"], y_val=d["y_vl"], hparams=hparams, logger=None,
             epochs=EPOCHS, patience=PATIENCE,
-            batch_size=hparams.get("batch_size", BATCH_SIZE), **bkw,
+            batch_size=hparams.get("batch_size", BATCH_SIZE), **d["bkw"],
         )
-        out["fold"] = fold
+        out["fold"] = d["fold"]
         folds.append(out)
-        log.info(f"  {log_prefix}fold {fold}/{N_FOLDS}: "
+        log.info(f"  {log_prefix}fold {d['fold']}/{N_FOLDS}: "
                  f"recall={out['recall_macro']:.4f} mcc={out['mcc']:.4f} "
                  f"f1={out['f1_macro']:.4f} fpr={out['fpr_macro']:.4f} "
                  f"({out['tempo_s']:.1f}s)")
     return folds
+
+
+def avaliar_kfold(modelo, familia, balanceamento, hparams,
+                  X_dev, y_dev, n_cls, log_prefix=""):
+    """Compat: prepara as dobras e avalia `hparams` numa só chamada. Usado na
+    reavaliação ÚNICA do vencedor. No laço do Optuna as dobras são
+    pré-computadas uma vez (ver _preparar_dobras) e reutilizadas via
+    avaliar_kfold_cache, evitando rebalancear a cada trial."""
+    dobras = _preparar_dobras(familia, balanceamento, n_cls, X_dev, y_dev)
+    return avaliar_kfold_cache(modelo, hparams, dobras, n_cls, log_prefix=log_prefix)
 
 
 def _agregar(folds):
@@ -139,12 +170,13 @@ def _agregar(folds):
 #   OPTUNA — objetivo family-aware
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _objective_factory(modelo, familia, balanceamento, X_dev, y_dev, n_cls):
+def _objective_factory(modelo, dobras, n_cls):
+    """Objetivo do Optuna sobre dobras PRÉ-balanceadas (independem dos
+    hiperparâmetros). Só o ajuste do modelo varia entre trials."""
     def objective(trial):
         hp = espaco_busca(modelo, trial)
-        folds = avaliar_kfold(modelo, familia, balanceamento, hp,
-                              X_dev, y_dev, n_cls,
-                              log_prefix=f"trial {trial.number} ")
+        folds = avaliar_kfold_cache(modelo, hp, dobras, n_cls,
+                                    log_prefix=f"trial {trial.number} ")
         rec = np.array([f["recall_macro"] for f in folds], dtype=float)
         return float(rec.mean() - LAMBDA_VAR * rec.std(ddof=1))
     return objective
@@ -209,13 +241,26 @@ def executar(dataset_disponivel: bool = True) -> None:
     log.info(f"Split: dev={len(y_dev):,} (CV-{N_FOLDS}) "
              f"teste={len(y_te):,} (reservado)")
 
+    # ── Pré-balanceamento das dobras (UMA vez; reutilizado nos trials) ─────
+    # O SMOTE-ENN/escala dependem só dos dados de cada dobra (fixos), não dos
+    # hiperparâmetros. Calcular as dobras balanceadas uma única vez e reutilizá-
+    # las nos 30 trials elimina 29×N_FOLDS reamostragens redundantes — sem
+    # alterar nenhum resultado. (Custo: mantém N_FOLDS conjuntos balanceados em
+    # RAM simultaneamente, ~N_FOLDS× o pico anterior de um conjunto por vez.)
+    log.info(">>> Pré-balanceamento das dobras (reutilizado em todos os trials)")
+    dobras = _run("preparar_dobras", lambda: _preparar_dobras(
+        familia, balanceamento, n_cls, X_dev, y_dev))
+    if not dobras:
+        log.error("Falha ao preparar as dobras. Abortando."); return
+
     # ── Otimização ─────────────────────────────────────────────────────────
     sampler = TPESampler(seed=RANDOM_SEED)
     study = optuna.create_study(direction="maximize", sampler=sampler)
     log.info(f">>> Optuna: {N_TRIALS_OPTUNA} trials × CV-{N_FOLDS} "
-             f"= {N_TRIALS_OPTUNA * N_FOLDS} ajustes de {modelo}")
+             f"= {N_TRIALS_OPTUNA * N_FOLDS} ajustes de {modelo} "
+             f"(dobras pré-balanceadas — só o ajuste do modelo varia)")
     study.optimize(
-        _objective_factory(modelo, familia, balanceamento, X_dev, y_dev, n_cls),
+        _objective_factory(modelo, dobras, n_cls),
         n_trials=N_TRIALS_OPTUNA, show_progress_bar=False,
     )
     log.info("=" * 62)
@@ -223,11 +268,10 @@ def executar(dataset_disponivel: bool = True) -> None:
     log.info(f"BEST SCORE : {study.best_value:.4f}")
     log.info("=" * 62)
 
-    # ── Reavaliação K-fold da config vencedora ─────────────────────────────
+    # ── Reavaliação K-fold da config vencedora (reusa as dobras) ───────────
     log.info(">>> Reavaliação K-fold da configuração vencedora")
-    best_folds = _run("kfold_vencedor", lambda: avaliar_kfold(
-        modelo, familia, balanceamento, study.best_params,
-        X_dev, y_dev, n_cls, log_prefix="best "))
+    best_folds = _run("kfold_vencedor", lambda: avaliar_kfold_cache(
+        modelo, study.best_params, dobras, n_cls, log_prefix="best "))
     if best_folds is None:
         log.error("Falha na reavaliação K-fold."); return
     agg = _agregar(best_folds)
