@@ -46,6 +46,11 @@ DEFAULTS_ARVORE = {
     "CatBoost":     dict(iterations=500, depth=8, learning_rate=0.1),
 }
 
+# Early stopping das árvores boosting (CatBoost). 0 desliga. Aplica-se a TODOS
+# os fits de CatBoost (trials do Optuna, reavaliação do vencedor e treino
+# final), via fatia interna do treino — ver _avalia_arvore.
+EARLY_STOPPING_ROUNDS = 50
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #   ESPAÇO DE BUSCA (Optuna/TPE) — usado pela Investigação 4
@@ -66,7 +71,7 @@ def espaco_busca(modelo: str, trial) -> dict:
     """
     if modelo == "CatBoost":
         return {
-            "iterations":    trial.suggest_int("iterations", 300, 1200, step=100),
+            "iterations":    trial.suggest_int("iterations", 300, 600, step=100),
             "depth":         trial.suggest_int("depth", 4, 10),
             "learning_rate": trial.suggest_float("learning_rate", 1e-2, 3e-1, log=True),
         }
@@ -165,7 +170,22 @@ def _avalia_arvore(modelo, X_tr, y_tr, X_te, y_te, n_cls,
             allow_writing_files=False,
             auto_class_weights="Balanced" if balanceamento_nativo else None,
         )
-        clf.fit(X_tr, y_tr)
+        es = int(hp.get("early_stopping_rounds", EARLY_STOPPING_ROUNDS) or 0)
+        if es > 0:
+            # Early stopping sobre uma fatia INTERNA do treino (10%), separada de
+            # forma estratificada. NÃO usa X_te (conjunto de avaliação da dobra),
+            # para a parada não ser sintonizada no mesmo dado em que a métrica é
+            # reportada — evita otimismo. use_best_model restaura a melhor
+            # iteração. Corta o custo dos trials cujo `iterations` já convergiu.
+            from sklearn.model_selection import train_test_split
+            X_fit, X_es, y_fit, y_es = train_test_split(
+                X_tr, y_tr, test_size=0.10, random_state=RANDOM_SEED,
+                stratify=y_tr,
+            )
+            clf.fit(X_fit, y_fit, eval_set=(X_es, y_es),
+                    early_stopping_rounds=es, use_best_model=True)
+        else:
+            clf.fit(X_tr, y_tr)
         y_pred = clf.predict(X_te).ravel().astype(int)
 
     else:

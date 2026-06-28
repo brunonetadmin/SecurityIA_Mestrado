@@ -58,7 +58,7 @@ apply_plot_style()
 
 ANALISE_ID = 4
 N_FOLDS = 5
-N_TRIALS_OPTUNA = 30      # ajuste conforme orçamento computacional
+N_TRIALS_OPTUNA = 10      # ajuste conforme orçamento computacional
 LAMBDA_VAR = 0.25         # penalização da variância entre dobras
 EPOCHS = 30               # usado apenas se o vencedor for de família 'rede'
 PATIENCE = 5
