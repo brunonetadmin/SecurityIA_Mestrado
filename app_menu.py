@@ -1169,7 +1169,7 @@ def _ids_model_file() -> Path:
     model_dir = get_model_dir()
     if cfg and hasattr(cfg, "MODEL_FILENAME"):
         return model_dir / cfg.MODEL_FILENAME
-    return model_dir / "ids_model.keras"
+    return model_dir / "cerebro_catboost.cbm"
 
 
 def _ids_model_info_file() -> Path:
@@ -1975,7 +1975,7 @@ def _list_available_models() -> None:
     model_dir = get_model_dir()
     candidates: list[Path] = []
     if model_dir.exists():
-        for pattern in ["*.keras", "*.h5", "*.joblib", "*.pkl", "*.json", "*.yaml", "*.yml"]:
+        for pattern in ["*.cbm", "*.keras", "*.h5", "*.joblib", "*.pkl", "*.json", "*.yaml", "*.yml"]:
             candidates.extend(model_dir.rglob(pattern))
     candidates = sorted(set(candidates))
 

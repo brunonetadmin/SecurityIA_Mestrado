@@ -21,11 +21,8 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from config import Config
 
-Config.configure_tensorflow()
-
 import joblib
-import tensorflow as tf
-from keras.models import load_model as keras_load_model
+from catboost import CatBoostClassifier
 from sklearn.metrics import (
     accuracy_score, classification_report,
     confusion_matrix, f1_score, matthews_corrcoef,
@@ -53,15 +50,13 @@ _DELTA_WARN     = 0.005
 
 def load_eval_artifacts(model_path: Optional[Path] = None) -> dict:
     """Carrega modelo, scaler, encoder e info."""
-    from IDS.ids_learn import BahdanauAttention
-    custom = {"BahdanauAttention": BahdanauAttention}
-
     mp = model_path or (Config.MODEL_DIR / Config.MODEL_FILENAME)
     if not mp.exists():
         raise FileNotFoundError(f"Modelo não encontrado: {mp}")
 
-    # compile=False para tolerar Focal Loss customizada não serializada
-    model   = keras_load_model(str(mp), custom_objects=custom, compile=False)
+    # CatBoost nativo (.cbm)
+    model = CatBoostClassifier()
+    model.load_model(str(mp))
     scaler  = joblib.load(Config.MODEL_DIR / Config.SCALER_FILENAME)
     encoder = joblib.load(Config.MODEL_DIR / Config.LABEL_ENCODER_FILENAME)
 
@@ -93,14 +88,13 @@ def run_inference_np(
     classes  = np.empty(n, dtype=np.int32)
     conf_max = np.empty(n, dtype=np.float32)
 
-    first = artifacts["model"].predict(X[:1].reshape(1, -1, 1), verbose=0)
+    first = artifacts["model"].predict_proba(X[:1])   # (1, n_classes)
     n_cls = first.shape[1]
     proba = np.empty((n, n_cls), dtype=np.float32)
 
     for s in range(0, n, batch_size):
         e = min(s + batch_size, n)
-        chunk = X[s:e].reshape(e - s, X.shape[1], 1)
-        p = artifacts["model"].predict(chunk, verbose=0)
+        p = artifacts["model"].predict_proba(X[s:e])   # 2D, sem reshape
         classes[s:e]  = np.argmax(p, axis=1)
         conf_max[s:e] = np.max(p, axis=1)
         proba[s:e]    = p

@@ -134,7 +134,7 @@ def register_framework_version(
 
     if Path(model_path).exists():
         try:
-            shutil.copy2(model_path, version_dir / "model.keras")
+            shutil.copy2(model_path, version_dir / f"model{Path(model_path).suffix}")
         except (shutil.SameFileError, OSError):
             pass
     np.save(version_dir / "y_test.npy", np.asarray(y_true))
@@ -144,7 +144,7 @@ def register_framework_version(
 
     entry = {
         "id": version_id,
-        "kind": "BiLSTM_Bahdanau",
+        "kind": "CatBoost",
         "registered_at": datetime.now().isoformat(),
         "path": str(version_dir),
         "source": source,

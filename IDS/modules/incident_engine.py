@@ -29,22 +29,11 @@ import pyarrow.parquet as pq
 import joblib
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-import tensorflow as tf
-from keras.models import load_model as keras_load_model
-
-# CRÍTICO: importar custom_layers ANTES de qualquer load_model().
-# O ato de importar executa os @register_keras_serializable, registrando
-# BahdanauAttention e focal_loss_cb_placeholder no objeto store do Keras.
-# Sem este import, keras_load_model() falha com:
-#   TypeError: Could not locate class 'BahdanauAttention'
-from IDS.modules import custom_layers  # noqa: F401
-tf.get_logger().setLevel("ERROR")
+from catboost import CatBoostClassifier
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from config import Config
-
-Config.configure_tensorflow()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,10 +132,9 @@ class ModelArtifacts:
                 f"Execute o treinamento primeiro: python3 IDS/ids_learn.py train"
             )
         print(f"  ↳ Carregando {model_path.name} …", flush=True)
-        # compile=False: em INFERÊNCIA não precisamos do otimizador nem da
-        # loss embarcada. Isso evita falhas com loss customizadas e remove
-        # latência do compile.
-        self.model   = keras_load_model(str(model_path), compile=False)
+        # CatBoost: carrega o modelo nativo (.cbm). Sem compile/custom_objects.
+        self.model = CatBoostClassifier()
+        self.model.load_model(str(model_path))
         self.scaler  = joblib.load(Config.MODEL_DIR / Config.SCALER_FILENAME)
         self.encoder = joblib.load(Config.MODEL_DIR / Config.LABEL_ENCODER_FILENAME)
 
@@ -190,14 +178,13 @@ def run_inference(
 
     X_raw      = df[arts.selected_features].values.astype(np.float32)
     X_scaled   = arts.scaler.transform(X_raw)
-    X_reshaped = X_scaled.reshape(len(X_scaled), X_scaled.shape[1], 1)
 
     pred_cls  = np.empty(len(df), dtype=np.int32)
     pred_conf = np.empty(len(df), dtype=np.float32)
 
     for s in range(0, len(df), batch_size):
         e     = min(s + batch_size, len(df))
-        proba = arts.model.predict(X_reshaped[s:e], verbose=0)
+        proba = arts.model.predict_proba(X_scaled[s:e])   # (n, n_classes), 2D
         pred_cls[s:e]  = np.argmax(proba, axis=1)
         pred_conf[s:e] = np.max(proba, axis=1)
 

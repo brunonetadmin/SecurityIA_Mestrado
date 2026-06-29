@@ -31,7 +31,12 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from config import Config
 
-Config.configure_tensorflow()
+# Migrado de Rede Neural (Bi-LSTM + Atenção) para Árvore (CatBoost), espelhando
+# as técnicas vencedoras das Investigações 1-3:
+#   Inv. 1 (arquitetura)   → CatBoost
+#   Inv. 2 (balanceamento) → SMOTE-ENN (aplicado SÓ ao treino, sem leakage)
+#   Inv. 3 (seleção)       → k=all (todas as features; sem redução)
+# TensorFlow/Keras, Focal Loss e Atenção de Bahdanau deixam de ser necessários.
 
 import numpy as np
 import pandas as pd
@@ -41,12 +46,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-import tensorflow as tf
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.layers import Bidirectional, Dense, Dropout, Input, LSTM
-from tensorflow.keras.models import Model, load_model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.utils import plot_model
+from catboost import CatBoostClassifier
 
 from sklearn.metrics import (
     accuracy_score, classification_report, confusion_matrix,
@@ -58,22 +58,35 @@ from sklearn.feature_selection import mutual_info_classif
 from sklearn.utils.class_weight import compute_class_weight
 from imblearn.over_sampling import BorderlineSMOTE, SMOTE
 from imblearn.under_sampling import EditedNearestNeighbours, RandomUnderSampler
+from imblearn.combine import SMOTEENN
 from scipy.stats import entropy as scipy_entropy
 
 from IDS.modules.utils import get_learn_logger, get_app_logger, timed, format_duration
 from IDS.modules.versioning import versioned_path
-# CRÍTICO: importa BahdanauAttention e make_focal_loss_class_balanced do
-# módulo central. O import executa @register_keras_serializable, registrando
-# os componentes no objeto store do Keras — o que torna o modelo salvo
-# recarregável via keras.load_model() SEM custom_objects.
-from IDS.modules.custom_layers import (
-    BahdanauAttention,
-    make_focal_loss_class_balanced,
-)
+
+# ── Defaults da árvore (sobrescrevíveis via Config.TREE_CONFIG, se existir) ──
+# Espelham os defaults da Investigação 1; quando a Investigação 4 concluir, os
+# hiperparâmetros otimizados entram aqui (ou em Config.TREE_CONFIG) sem mexer
+# na lógica. early_stopping_rounds=0 desliga o early stopping.
+_TREE_DEFAULTS = {
+    "iterations": 500,
+    "depth": 8,
+    "learning_rate": 0.1,
+    "l2_leaf_reg": 3.0,
+    "early_stopping_rounds": 50,
+    "auto_class_weights": None,   # None = sem ponderação nativa (usa SMOTE-ENN)
+    "model_filename": "cerebro_catboost.cbm",
+}
+
+
+def _tree_cfg() -> dict:
+    cfg = dict(_TREE_DEFAULTS)
+    cfg.update(getattr(Config, "TREE_CONFIG", {}) or {})
+    return cfg
+
 
 log  = get_learn_logger()
 alog = get_app_logger()
-tf.random.set_seed(Config.TRAINING_CONFIG["random_state"])
 np.random.seed(Config.TRAINING_CONFIG["random_state"])
 
 
@@ -193,6 +206,18 @@ class DataHandler:
     def select_features(self, X: np.ndarray, y: np.ndarray, names: list) -> tuple:
         cfg  = Config.FEATURE_SELECTION_CONFIG
         k    = cfg["k_best"]
+
+        # Técnica vencedora da Investigação 3: k=all (todas as features). Quando
+        # k indica "tudo", pulamos o cálculo de IG/MI (caro: laço por
+        # feature×bin + mutual_info_classif) e usamos todas as colunas — grande
+        # economia de tempo no treino e nos retreinos.
+        if k in ("all", None, 0) or (isinstance(k, int) and k >= len(names)):
+            log.info(f"Seleção de features: usando TODAS as {len(names)} features "
+                     f"(k=all, vencedor da Inv. 3) — IG/MI ignorados por desempenho")
+            self.selected_features = list(names)
+            feature_scores = {n: {"selected": True} for n in names}
+            return list(names), feature_scores
+
         w_ig = cfg["ig_weight"]
         w_mi = cfg["mi_weight"]
         eps  = cfg["normalization_epsilon"]
@@ -249,6 +274,10 @@ class DataHandler:
         if cfg["strategy"] == "none":
             log.info("Balanceamento desativado (strategy='none')")
             return X, y
+
+        # Técnica VENCEDORA da Investigação 2: SMOTE-ENN.
+        if cfg["strategy"] == "smote_enn":
+            return self._balance_smote_enn(X, y)
 
         if cfg["strategy"] == "classic_smote_enn":
             return self._balance_classic(X, y)
@@ -313,6 +342,44 @@ class DataHandler:
         )
         Xb, yb = enn.fit_resample(Xr, yr)
         log.info(f"Após ENN: {Xb.shape[0]:,} amostras | dist={dict(Counter(yb))}")
+        return Xb, yb
+
+    def _balance_smote_enn(self, X: np.ndarray, y: np.ndarray) -> tuple:
+        """Técnica vencedora da Investigação 2: SMOTE-ENN combinado (imblearn).
+
+        SMOTE sintetiza minoritárias; ENN limpa amostras ruidosas/ambíguas na
+        fronteira. Determinístico via random_state. Aplica-se SOMENTE ao treino
+        (chamado em cmd_train após o split) — sem leakage.
+
+        Observação de desempenho: é a etapa mais cara do treino (a expansão
+        SMOTE pode multiplicar o nº de linhas ~10×). Para retreinos muito
+        rápidos, alternativa sem reamostragem: strategy='none' +
+        Config.TREE_CONFIG['auto_class_weights']='Balanced' (ponderação nativa
+        do CatBoost). Mantemos SMOTE-ENN por ser a técnica validada.
+        """
+        cfg = Config.BALANCING_CONFIG
+        dist = Counter(y)
+        log.info(f"SMOTE-ENN — distribuição original: {dict(dist)}")
+
+        k = cfg.get("smote_k_neighbors", 5)
+        smote = SMOTE(
+            sampling_strategy=cfg.get("smote_enn_sampling_strategy", "auto"),
+            k_neighbors=k,
+            random_state=Config.TRAINING_CONFIG["random_state"],
+        )
+        enn = EditedNearestNeighbours(
+            n_neighbors=cfg.get("enn_n_neighbors", 3),
+            kind_sel=cfg.get("enn_kind_sel", "all"),
+            n_jobs=-1,
+        )
+        sampler = SMOTEENN(
+            smote=smote, enn=enn,
+            random_state=Config.TRAINING_CONFIG["random_state"],
+        )
+        t0 = time.time()
+        Xb, yb = sampler.fit_resample(X, y)
+        log.info(f"Após SMOTE-ENN: {len(y):,} → {Xb.shape[0]:,} amostras "
+                 f"| dist={dict(Counter(yb))} | {format_duration(time.time() - t0)}")
         return Xb, yb
 
     def _balance_classic(self, X: np.ndarray, y: np.ndarray) -> tuple:
@@ -429,86 +496,63 @@ class DataHandler:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ModelTrainer:
-    """Constrói, treina, avalia e salva Bi-LSTM + Atenção de Bahdanau."""
+    """Constrói, treina, avalia e salva o CatBoost (modelo 'Cérebro').
+
+    Mantém a MESMA interface pública do trainer anterior (build / train /
+    evaluate / save / load_for_finetune) para a orquestração (cmd_train /
+    cmd_finetune) não precisar mudar. `self.history` permanece None — árvores
+    não têm histórico por época, então ReportGenerator.plot_history() vira
+    no-op automaticamente.
+    """
 
     def __init__(self) -> None:
         self.model   = None
-        self.history = None
+        self.history = None          # árvore não tem histórico por época
+        self._init_model_path = None  # warm-start opcional no fine-tuning
         Config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _model_path() -> Path:
+        return Config.MODEL_DIR / _tree_cfg()["model_filename"]
 
     def build(self, n_features: int, n_classes: int,
               class_counts=None) -> None:
-        cfg = Config.MODEL_CONFIG
-        inp = Input(shape=(n_features, 1), name="input")
-
-        x = Bidirectional(
-            LSTM(cfg["lstm_units_1"], return_sequences=True,
-                 recurrent_dropout=cfg["recurrent_dropout_rate"]),
-            name="bilstm_1",
-        )(inp)
-        x = Dropout(cfg["dropout_rate"], name="drop_1")(x)
-
-        x = Bidirectional(
-            LSTM(cfg["lstm_units_2"], return_sequences=True,
-                 recurrent_dropout=cfg["recurrent_dropout_rate"]),
-            name="bilstm_2",
-        )(x)
-        x = Dropout(cfg["dropout_rate"], name="drop_2")(x)
-
-        ctx, _ = BahdanauAttention(cfg["attention_units"], name="attention")(x)
-
-        x = Dense(cfg["dense_units"], activation="relu", name="dense_1")(ctx)
-        x = Dropout(cfg["dropout_rate"] * 0.5, name="drop_3")(x)
-        out = Dense(n_classes, activation="softmax", name="output")(x)
-
-        self.model = Model(inp, out, name="SecurityIA_BiLSTM_Bahdanau")
-
-        if cfg["loss_function"] == "focal_loss_cb" and class_counts is not None:
-            log.info(f"Compilando com Focal Loss reponderada — "
-                     f"gamma={cfg['focal_gamma']} beta={cfg['focal_class_balanced_beta']}")
-            loss = make_focal_loss_class_balanced(
-                class_counts=class_counts,
-                gamma=cfg["focal_gamma"],
-                beta=cfg["focal_class_balanced_beta"],
-            )
-        else:
-            log.info("Compilando com sparse_categorical_crossentropy")
-            loss = "sparse_categorical_crossentropy"
-
-        spe = Config.TRAINING_CONFIG.get("steps_per_execution", 1)
-        self.model.compile(
-            optimizer=Adam(learning_rate=cfg["learning_rate"]),
-            loss=loss,
-            metrics=cfg["metrics"],
-            steps_per_execution=spe,
+        """Instancia o CatBoostClassifier. `class_counts` é aceito por
+        compatibilidade de assinatura; o balanceamento vem do SMOTE-ENN
+        (Inv. 2), salvo se auto_class_weights for definido em TREE_CONFIG."""
+        tc = _tree_cfg()
+        self.model = CatBoostClassifier(
+            iterations=tc["iterations"],
+            depth=tc["depth"],
+            learning_rate=tc["learning_rate"],
+            l2_leaf_reg=tc["l2_leaf_reg"],
+            loss_function="MultiClass",
+            thread_count=-1,                 # usa todos os núcleos (CPU only)
+            random_seed=Config.TRAINING_CONFIG["random_state"],
+            verbose=False,
+            allow_writing_files=False,
+            auto_class_weights=tc["auto_class_weights"],
         )
-        log.info(f"steps_per_execution={spe}")
-        self.model.summary(print_fn=log.info)
-
-        try:
-            diag = versioned_path(Config.MODEL_DIR, "model_architecture", "png")
-            plot_model(self.model, to_file=str(diag), show_shapes=True,
-                       show_layer_names=True)
-            log.info(f"Diagrama salvo em '{diag}'")
-        except Exception:
-            pass
+        log.info(
+            f"CatBoost instanciado — iterations={tc['iterations']} "
+            f"depth={tc['depth']} lr={tc['learning_rate']} "
+            f"l2={tc['l2_leaf_reg']} early_stop={tc['early_stopping_rounds']} "
+            f"auto_class_weights={tc['auto_class_weights']} "
+            f"| features={n_features} classes={n_classes}"
+        )
 
     def load_for_finetune(self, n_classes: int) -> None:
-        mp = Config.MODEL_DIR / Config.MODEL_FILENAME
-        if not mp.exists():
-            raise FileNotFoundError(f"Modelo não encontrado: {mp}")
-        log.info(f"Carregando modelo para fine-tuning: {mp}")
-        custom = {"BahdanauAttention": BahdanauAttention}
-        # Em fine-tuning, a Focal Loss salva no .keras pode não ser
-        # serializável; recarregamos sem compilar e recompilamos.
-        self.model = load_model(str(mp), custom_objects=custom, compile=False)
-        ft_lr = Config.FINE_TUNING_CONFIG["learning_rate"]
-        self.model.compile(
-            optimizer=Adam(learning_rate=ft_lr),
-            loss="sparse_categorical_crossentropy",
-            metrics=Config.MODEL_CONFIG["metrics"],
-        )
-        log.info(f"Modelo recompilado para fine-tuning com lr={ft_lr}")
+        """Para árvore, 'fine-tuning' = retreino. Por padrão treina do zero
+        sobre os novos dados (rápido e robusto). Se TREE_CONFIG['warm_start']
+        for True, usa o modelo atual como init_model (continua o boosting)."""
+        mp = self._model_path()
+        self.build(n_features=0, n_classes=n_classes)   # nova instância
+        if getattr(Config, "TREE_CONFIG", {}).get("warm_start") and mp.exists():
+            self._init_model_path = str(mp)
+            log.info(f"Fine-tuning com warm-start (init_model) a partir de: {mp}")
+        else:
+            self._init_model_path = None
+            log.info("Fine-tuning = retreino do zero (sem warm-start)")
 
     @timed("Treinamento")
     def train(
@@ -517,79 +561,42 @@ class ModelTrainer:
         finetune: bool = False,
         class_weight: dict = None,
     ) -> None:
-        cfg = Config.TRAINING_CONFIG
-        ft_cfg = Config.FINE_TUNING_CONFIG
-
-        X_tr_r  = X_tr.reshape(len(X_tr),   X_tr.shape[1],  1)
-        X_val_r = X_val.reshape(len(X_val), X_val.shape[1], 1)
-
-        epochs   = ft_cfg["epochs"]   if finetune else cfg["epochs"]
-        patience = ft_cfg["patience"] if finetune else cfg["patience"]
-        bs       = cfg["batch_size"]
-
-        # Hiperparâmetros de convergência (lidos do TRAINING_CONFIG; defaults
-        # mantêm compatibilidade com configs antigos).
-        es_min_delta   = cfg.get("early_stopping_min_delta", 0.0)
-        lr_factor      = cfg.get("lr_reduce_factor", 0.5)
-        lr_patience    = cfg.get("lr_reduce_patience", max(3, patience // 2))
-        lr_min         = cfg.get("lr_min", 1e-7)
-
-        callbacks = [
-            EarlyStopping(
-                monitor="val_loss",
-                patience=patience,
-                min_delta=es_min_delta,
-                restore_best_weights=True,
-                verbose=1,
-            ),
-            ReduceLROnPlateau(
-                monitor="val_loss",
-                factor=lr_factor,
-                patience=lr_patience,
-                min_lr=lr_min,
-                verbose=1,
-            ),
-        ]
-
-        if not (class_weight is not None and cfg.get("use_class_weight", False)):
-            class_weight = None
+        """Treina o CatBoost. X_val/y_val (conjunto de validação real, separado
+        do teste) servem de eval_set para early stopping — sem otimismo, pois o
+        teste é avaliado à parte. `class_weight` é ignorado (o balanceamento é
+        SMOTE-ENN / auto_class_weights). Sem reshape 3D (entrada tabular 2D)."""
+        if self.model is None:
+            self.build(n_features=X_tr.shape[1],
+                       n_classes=int(np.max(y_tr) + 1))
+        es = int(_tree_cfg()["early_stopping_rounds"] or 0)
 
         log.info(
-            f"{'Fine-tuning' if finetune else 'Treinamento'} iniciado — "
-            f"épocas={epochs} batch={bs} "
-            f"class_weight={'sim' if class_weight else 'não'}"
+            f"{'Fine-tuning' if finetune else 'Treinamento'} CatBoost iniciado — "
+            f"treino={X_tr.shape[0]:,} val={X_val.shape[0]:,} "
+            f"early_stopping_rounds={es}"
         )
         t0 = time.time()
+        fit_kwargs = dict(eval_set=(X_val, y_val), verbose=False)
+        if es > 0:
+            fit_kwargs.update(early_stopping_rounds=es, use_best_model=True)
+        if self._init_model_path:
+            fit_kwargs["init_model"] = self._init_model_path
 
-        self.history = self.model.fit(
-            X_tr_r, y_tr,
-            validation_data=(X_val_r, y_val),
-            epochs=epochs,
-            batch_size=bs,
-            callbacks=callbacks,
-            class_weight=class_weight,
-            verbose=1,
-        )
+        self.model.fit(X_tr, y_tr, **fit_kwargs)
+
+        best_it = self.model.get_best_iteration()
         elapsed = time.time() - t0
-        log.info(f"Treinamento concluído em {format_duration(elapsed)}")
+        log.info(f"Treinamento concluído em {format_duration(elapsed)} "
+                 f"| melhor iteração={best_it} de {self.model.tree_count_}")
 
     def evaluate(self, X_te: np.ndarray, y_te: np.ndarray) -> np.ndarray:
-        X_r = X_te.reshape(len(X_te), X_te.shape[1], 1)
-        bs  = Config.EVALUATION_CONFIG.get("batch_size", 4096)
-        return np.argmax(self.model.predict(X_r, batch_size=bs, verbose=0), axis=1)
+        """Predição tabular (sem reshape). Retorna rótulos inteiros."""
+        return self.model.predict(X_te).ravel().astype(int)
 
     def save(self) -> None:
-        mp = Config.MODEL_DIR / Config.MODEL_FILENAME
-        self.model.save(str(mp))
-        log.info(f"Modelo salvo: '{mp}'")
-
-        if self.history:
-            hp = versioned_path(Config.MODEL_DIR, "training_history", "json")
-            hist = {k: [float(v) for v in vals]
-                    for k, vals in self.history.history.items()}
-            with open(hp, "w", encoding="utf-8") as f:
-                json.dump(hist, f, indent=2)
-            log.info(f"Histórico salvo: '{hp}'")
+        mp = self._model_path()
+        self.model.save_model(str(mp), format="cbm")
+        log.info(f"Modelo CatBoost salvo: '{mp}'")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -735,12 +742,12 @@ def cmd_train(force: bool = False) -> None:
         log.info(f"Treino pós-balanceamento: {X_tr.shape[0]:,} amostras")
 
     trainer = ModelTrainer()
-    mp = Config.MODEL_DIR / Config.MODEL_FILENAME
+    mp = ModelTrainer._model_path()
 
     if mp.exists() and Config.FINE_TUNING_CONFIG["enable"] and not force:
         log.warning(
-            "Modelo existente detectado. Após mudanças estruturais (loss, "
-            "balanceamento, split), TREINAMENTO DO ZERO é recomendado."
+            "Modelo existente detectado. Após mudanças estruturais (modelo, "
+            "balanceamento, features), TREINAMENTO DO ZERO é recomendado."
         )
         trainer.load_for_finetune(n_classes=len(dh.label_mapping))
         trainer.train(X_tr, y_tr, X_val, y_val, finetune=True,
@@ -773,18 +780,17 @@ def cmd_train(force: bool = False) -> None:
     # caso o registry esteja corrompido ou indisponível.
     try:
         register_framework_version(
-            model_path=Config.MODEL_DIR / Config.MODEL_FILENAME,
+            model_path=ModelTrainer._model_path(),
             y_true=y_te,
             y_pred=y_pred,
             metrics=_metrics_for_registry(y_te, y_pred),
             source="train",
             extra={
-                "loss": Config.MODEL_CONFIG["loss_function"],
+                "model": "CatBoost",
                 "balancing_strategy": Config.BALANCING_CONFIG["strategy"],
                 "k_features": Config.FEATURE_SELECTION_CONFIG["k_best"],
-                "epochs_run": (
-                    len(trainer.history.history["loss"]) if trainer.history else 0
-                ),
+                "iterations_run": int(trainer.model.tree_count_),
+                "best_iteration": int(trainer.model.get_best_iteration()),
             },
         )
     except Exception as e:
@@ -811,7 +817,7 @@ def cmd_train(force: bool = False) -> None:
 
     log.info("=" * 62)
     log.info("TREINAMENTO CONCLUÍDO — RELATÓRIO COMPLETO GERADO")
-    log.info(f"Modelo: {Config.MODEL_DIR / Config.MODEL_FILENAME}")
+    log.info(f"Modelo: {ModelTrainer._model_path()}")
     log.info(f"Relatório por execução: {out_dir}")
     log.info(f"Relatório completo M0/Mp/Mc: {rep_dir}")
     log.info("=" * 62)
@@ -881,7 +887,7 @@ def cmd_finetune() -> None:
     # Registro no triplete (Mc) — protegido contra falhas do registry.
     try:
         register_framework_version(
-            model_path=Config.MODEL_DIR / Config.MODEL_FILENAME,
+            model_path=ModelTrainer._model_path(),
             y_true=y_te,
             y_pred=y_pred,
             metrics=_metrics_for_registry(y_te, y_pred),
@@ -916,7 +922,7 @@ def cmd_finetune() -> None:
 
 def cmd_status() -> None:
     """Status do modelo atual e do triplete."""
-    mp = Config.MODEL_DIR / Config.MODEL_FILENAME
+    mp = ModelTrainer._model_path()
     mi = Config.MODEL_DIR / Config.MODEL_INFO_FILENAME
 
     if not mp.exists():

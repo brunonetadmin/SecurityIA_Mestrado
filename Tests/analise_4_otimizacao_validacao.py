@@ -58,7 +58,7 @@ apply_plot_style()
 
 ANALISE_ID = 4
 N_FOLDS = 5
-N_TRIALS_OPTUNA = 10      # ajuste conforme orçamento computacional
+N_TRIALS_OPTUNA = 1       # ajuste conforme orçamento computacional
 LAMBDA_VAR = 0.25         # penalização da variância entre dobras
 EPOCHS = 30               # usado apenas se o vencedor for de família 'rede'
 PATIENCE = 5
@@ -170,13 +170,19 @@ def _agregar(folds):
 #   OPTUNA — objetivo family-aware
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _objective_factory(modelo, dobras, n_cls):
+def _objective_factory(modelo, dobras, n_cls, folds_por_trial=None):
     """Objetivo do Optuna sobre dobras PRÉ-balanceadas (independem dos
-    hiperparâmetros). Só o ajuste do modelo varia entre trials."""
+    hiperparâmetros). Só o ajuste do modelo varia entre trials. Se
+    `folds_por_trial` (dict) for passado, guarda as métricas por dobra de cada
+    trial — assim a reavaliação do vencedor reutiliza o resultado JÁ calculado
+    em vez de recomputar a CV (que, com os mesmos params e as mesmas dobras,
+    seria idêntica bit a bit)."""
     def objective(trial):
         hp = espaco_busca(modelo, trial)
         folds = avaliar_kfold_cache(modelo, hp, dobras, n_cls,
                                     log_prefix=f"trial {trial.number} ")
+        if folds_por_trial is not None:
+            folds_por_trial[trial.number] = folds
         rec = np.array([f["recall_macro"] for f in folds], dtype=float)
         return float(rec.mean() - LAMBDA_VAR * rec.std(ddof=1))
     return objective
@@ -254,13 +260,14 @@ def executar(dataset_disponivel: bool = True) -> None:
         log.error("Falha ao preparar as dobras. Abortando."); return
 
     # ── Otimização ─────────────────────────────────────────────────────────
+    folds_por_trial = {}      # métricas por dobra de cada trial (reuso no vencedor)
     sampler = TPESampler(seed=RANDOM_SEED)
     study = optuna.create_study(direction="maximize", sampler=sampler)
     log.info(f">>> Optuna: {N_TRIALS_OPTUNA} trials × CV-{N_FOLDS} "
              f"= {N_TRIALS_OPTUNA * N_FOLDS} ajustes de {modelo} "
              f"(dobras pré-balanceadas — só o ajuste do modelo varia)")
     study.optimize(
-        _objective_factory(modelo, dobras, n_cls),
+        _objective_factory(modelo, dobras, n_cls, folds_por_trial),
         n_trials=N_TRIALS_OPTUNA, show_progress_bar=False,
     )
     log.info("=" * 62)
@@ -268,10 +275,19 @@ def executar(dataset_disponivel: bool = True) -> None:
     log.info(f"BEST SCORE : {study.best_value:.4f}")
     log.info("=" * 62)
 
-    # ── Reavaliação K-fold da config vencedora (reusa as dobras) ───────────
-    log.info(">>> Reavaliação K-fold da configuração vencedora")
-    best_folds = _run("kfold_vencedor", lambda: avaliar_kfold_cache(
-        modelo, study.best_params, dobras, n_cls, log_prefix="best "))
+    # ── Métricas K-fold da config vencedora ────────────────────────────────
+    # Reutiliza as dobras JÁ avaliadas no trial vencedor (mesmos params, mesmas
+    # dobras ⇒ idêntico a recomputar), evitando uma segunda passada de N_FOLDS
+    # fits. Fallback defensivo recomputa caso o trial vencedor não esteja no
+    # cache (não deve ocorrer sem pruner).
+    best_folds = folds_por_trial.get(study.best_trial.number)
+    if best_folds is None:
+        log.info(">>> Reavaliação K-fold da configuração vencedora (fallback)")
+        best_folds = _run("kfold_vencedor", lambda: avaliar_kfold_cache(
+            modelo, study.best_params, dobras, n_cls, log_prefix="best "))
+    else:
+        log.info(f">>> Métricas K-fold do trial vencedor "
+                 f"(#{study.best_trial.number}) reutilizadas — sem recomputar CV")
     if best_folds is None:
         log.error("Falha na reavaliação K-fold."); return
     agg = _agregar(best_folds)

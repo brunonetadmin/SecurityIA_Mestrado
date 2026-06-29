@@ -86,7 +86,7 @@ class Config:
     COLLECTOR_FLUSH_ROWS = 50_000
     COLLECTOR_FLUSH_SECS = 60
 
-    MODEL_FILENAME = "ids_lstm_model.keras"
+    MODEL_FILENAME = "cerebro_catboost.cbm"
     SCALER_FILENAME = "scaler.pkl"
     LABEL_ENCODER_FILENAME = "label_encoder.pkl"
     MODEL_INFO_FILENAME = "ids_model_info.json"
@@ -119,7 +119,7 @@ class Config:
     }
 
     FEATURE_SELECTION_CONFIG = {
-        "k_best": 23,
+        "k_best": "all",   # vencedor Inv. 3 (usa todas as features)
         "ig_weight": 0.6,
         "mi_weight": 0.4,
         "normalization_epsilon": 1e-9,
@@ -145,6 +145,25 @@ class Config:
         "focal_class_balanced_beta": 0.9999,
         "metrics": ["accuracy"],
         "sequence_length": 100,
+    }
+
+    # ------------------------------------------------------------------
+    # TREE_CONFIG — hiperparâmetros do modelo 'Cérebro' CatBoost (Inv. 1).
+    # Defaults espelham a Investigação 1. Quando a Investigação 4 concluir,
+    # substitua iterations/depth/learning_rate pelos valores otimizados.
+    # 'auto_class_weights'=None: balanceamento vem do SMOTE-ENN (Inv. 2).
+    # 'warm_start'=False: fine-tuning retreina do zero (rápido e robusto);
+    # True usa o modelo atual como init_model (boosting incremental).
+    # ------------------------------------------------------------------
+    TREE_CONFIG = {
+        "iterations": 500,
+        "depth": 8,
+        "learning_rate": 0.1,
+        "l2_leaf_reg": 3.0,
+        "early_stopping_rounds": 50,
+        "auto_class_weights": None,
+        "warm_start": False,
+        "model_filename": MODEL_FILENAME,   # fonte única de verdade
     }
 
     # ------------------------------------------------------------------
@@ -199,10 +218,12 @@ class Config:
     # reponderada (Cui et al. 2019) + class_weight no fit.
     # ------------------------------------------------------------------
     BALANCING_CONFIG = {
-        # 'none' | 'adaptive_borderline' | 'classic_smote_enn'
-        # 'none' é a estratégia VALIDADA pela Análise 2 (recall macro 0.71
-        # contra 0.14 do adaptativo). Mantida como padrão do framework.
-        "strategy": "none",
+        # 'none' | 'smote_enn' | 'adaptive_borderline' | 'classic_smote_enn'
+        # 'smote_enn' é a estratégia vencedora da Análise 2 na cadeia CatBoost
+        # (logs "CatBoost+SMOTE_ENN"). O 'none' (recall 0.71 vs 0.14 do
+        # adaptativo) refere-se à Análise 2 ANTERIOR, do pipeline de rede
+        # neural com focal loss — contexto diferente.
+        "strategy": "smote_enn",
         # Borderline-SMOTE-2 (Han et al., 2005)
         "borderline_kind": "borderline-2",
         "smote_k_neighbors_max": 11,
