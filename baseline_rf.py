@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-baseline_rf.py — Treina e registra o classificador Random Forest baseline (M0)
+baseline_rf.py — Treina e registra o classificador Random Forest baseline (Baseline)
 
 Reproduz EXATAMENTE o split estratificado do cmd_train(), garantindo que
-M0 use o mesmo conjunto de treino e o mesmo conjunto de teste que a Bi-LSTM.
+o Baseline use o mesmo conjunto de treino e o mesmo conjunto de teste que o
+modelo inicial do framework (M1).
 
 Saídas (todas com nome versionado _YYYYMMDD-N):
     Model/baseline_rf.pkl
@@ -126,7 +127,7 @@ def plot_confusion_matrix(y_true, y_pred, label_map, out_path):
 
 def main():
     print("=" * 62)
-    print("  BASELINE RF — Treinamento e Registro como M0")
+    print("  BASELINE RF — Treinamento e Registro como Baseline")
     print("=" * 62)
 
     Config.ensure_dirs()
@@ -200,7 +201,7 @@ def main():
     plot_confusion_matrix(y_te, y_pred, label_map, cm_path)
     print(f"  Matriz de confusão salva: {cm_path}")
 
-    # Registro como M0 imutável
+    # Registro como Baseline imutável
     register_baseline(
         model_pickle_path=model_path,
         y_true=y_te,
@@ -209,12 +210,12 @@ def main():
         overwrite=False,
     )
 
-    # Relatório completo (apenas M0 disponível por enquanto)
+    # Relatório completo (apenas Baseline disponível por enquanto)
     rep_dir = Config.IDS_REPORTS_DIR / f"full_baseline_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     generate_full_report(rep_dir, label_map=label_map)
 
     print("\n" + "=" * 62)
-    print("  RESUMO BASELINE M0 (Random Forest)")
+    print("  RESUMO BASELINE (Random Forest)")
     print("=" * 62)
     print(f"  Acurácia          : {metrics['accuracy']:.4f}")
     print(f"  F1-macro          : {metrics['f1_macro']:.4f}")
@@ -224,7 +225,7 @@ def main():
     print(f"  MCC               : {metrics['mcc']:.4f}")
     print(f"  FPR-macro         : {metrics['fpr_macro']:.4f}")
     print("=" * 62)
-    print(f"\n  M0 registrado no triplete. Próximo passo:")
+    print(f"\n  Baseline registrado na progressão. Próximo passo:")
     print(f"  python3 IDS/ids_learn.py train --force")
 
 

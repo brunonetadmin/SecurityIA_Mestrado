@@ -1444,23 +1444,25 @@ def ids_training_menu() -> None:
         stg_cnt = len(list(staging_dir.glob("*.parquet"))) if staging_dir.exists() else 0
         print(f"  Staging   : {stg_cnt} arquivo(s) para fine-tuning")
 
-        # Estado do triplete M0/Mp/Mc
+        # Estado da progressão Baseline/M1/M2/M3
         reg_state = _registry_state()
-        m0_label = badge_ok("registrado") if reg_state["has_baseline"] else color("ausente", "red")
-        if reg_state["n_versions"] == 0:
-            mc_label = color("não registrado", "red")
-        else:
-            mc_label = badge_ok(f"{reg_state['n_versions']} versão(ões)")
-        print(f"  Triplete  : M0 {m0_label}  |  Mc {mc_label}")
+        nv = reg_state["n_versions"]
+        base_label = badge_ok("registrado") if reg_state["has_baseline"] else color("ausente", "red")
+        m1_label = badge_ok("ok") if nv >= 1 else color("—", "yellow")
+        m2_label = badge_ok("ok") if nv >= 2 else color("—", "yellow")
+        m3_label = badge_ok("ok") if nv >= 1 else color("—", "yellow")
+        print(f"  Progressão: Baseline {base_label}  ·  M1 {m1_label}  ·  M2 {m2_label}  ·  M3 {m3_label}")
+        if nv:
+            print(f"  Framework : {nv} versão(ões)  (M1=inicial · M3=atual)")
 
-        # Processos ativos relacionados a treinamento (M0 ou BiLSTM)
+        # Processos ativos relacionados a treinamento (Baseline ou framework)
         baseline_procs = _find_processes_by_script("baseline_rf.py")
         learn_procs    = _find_processes_by_script("ids_learn.py")
         if baseline_procs or learn_procs:
             print()
             print("  " + color("Processos ativos:", "cyan", "bold"))
             for pid, _cmd, etime in baseline_procs:
-                print(f"    {badge_ok('M0 (RF)')}    PID {pid}  rodando há {_fmt_elapsed(etime)}")
+                print(f"    {badge_ok('Baseline (RF)')}    PID {pid}  rodando há {_fmt_elapsed(etime)}")
             for pid, _cmd, etime in learn_procs:
                 print(f"    {badge_ok('Treino')}    PID {pid}  rodando há {_fmt_elapsed(etime)}")
 
@@ -1468,7 +1470,7 @@ def ids_training_menu() -> None:
         if reg_state["needs_reconcile"]:
             print()
             print("  " + badge_warn(
-                "Modelo treinado mas não registrado no triplete. "
+                "Modelo treinado mas não registrado na progressão. "
                 "Use a opção [8] para reconciliar."
             ))
 
@@ -1482,11 +1484,11 @@ def ids_training_menu() -> None:
         print("  [5] Ver log de treinamento")
         print("  [6] Listar modelos disponíveis")
         if not reg_state["has_baseline"]:
-            print(f"  [7] Gerar baseline M0 (RandomForest)  {color('— ausente', 'yellow')}")
+            print(f"  [7] Gerar Baseline (RandomForest)  {color('— ausente', 'yellow')}")
         else:
-            print("  [7] Gerar baseline M0 (RandomForest)")
+            print("  [7] Gerar Baseline (RandomForest)")
         if reg_state["needs_reconcile"]:
-            print(f"  [8] Reconciliar registry  {color('— Mc pendente', 'yellow')}")
+            print(f"  [8] Reconciliar registry  {color('— M3 pendente', 'yellow')}")
         else:
             print("  [8] Reconciliar registry (manual)")
 
@@ -1583,14 +1585,14 @@ def _attach_to_active_process(
     if baseline_procs:
         for pid, _cmd, etime in baseline_procs:
             options.append((
-                f"M0 (RandomForest) — PID {pid} — há {_fmt_elapsed(etime)}",
+                f"Baseline (RandomForest) — PID {pid} — há {_fmt_elapsed(etime)}",
                 pid,
                 _ids_log("baseline"),
             ))
     if learn_procs:
         for pid, _cmd, etime in learn_procs:
             options.append((
-                f"Treino BiLSTM — PID {pid} — há {_fmt_elapsed(etime)}",
+                f"Treino framework — PID {pid} — há {_fmt_elapsed(etime)}",
                 pid,
                 _ids_log("learn"),
             ))
@@ -1615,14 +1617,14 @@ def _attach_to_active_process(
 
 
 # =============================================================================
-# REGISTRY M0/Mp/Mc — Gestão integrada pelo menu
+# REGISTRY Baseline/M1/M2/M3 — Gestão integrada pelo menu
 # =============================================================================
 
 def _registry_state() -> dict:
     """
-    Retorna estado atual do triplete:
-      - has_baseline    : bool (M0 existe?)
-      - n_versions      : int  (quantas versões Mc registradas)
+    Retorna estado atual da progressão:
+      - has_baseline    : bool (Baseline existe?)
+      - n_versions      : int  (quantas versões do framework registradas)
       - needs_reconcile : bool (modelo treinado mas não no registry?)
       - last_run_dir    : Path | None (última pasta Model/run_*/ com arrays)
     Falha-segura: qualquer exceção retorna estado conservador (sem flags
@@ -1671,14 +1673,14 @@ def _registry_state() -> dict:
 
 def _register_baseline_m0() -> None:
     """
-    Gera o baseline M0 (RandomForest) com escolha de modo:
+    Gera o Baseline (RandomForest) com escolha de modo:
       F - Foreground: roda direto no terminal, saída visível em tempo real,
                       bloqueia o menu até concluir
       B - Background: dispara via nohup setsid (imune a SSH timeout),
                       pergunta se quer acompanhar o log (tail real-time)
     """
-    print_header("IDS > Treinamento > Baseline M0")
-    section("Gerar baseline RandomForest (M0)")
+    print_header("IDS > Treinamento > Baseline")
+    section("Gerar Baseline (RandomForest)")
 
     baseline_script = ROOT_DIR / "baseline_rf.py"
     if not baseline_script.exists():
@@ -1686,7 +1688,7 @@ def _register_baseline_m0() -> None:
         pause()
         return
 
-    # Evita duplicar processo de M0 em paralelo
+    # Evita duplicar processo de Baseline em paralelo
     existing = _find_processes_by_script("baseline_rf.py")
     if existing:
         pid, _cmd, etime = existing[0]
@@ -1714,15 +1716,15 @@ def _register_baseline_m0() -> None:
 
     reg_state = _registry_state()
     if reg_state["has_baseline"]:
-        print("  " + badge_info("M0 já está registrado."))
-        if not confirm("Sobrescrever M0 existente? (gera novo RF do zero)"):
+        print("  " + badge_info("Baseline já está registrado."))
+        if not confirm("Sobrescrever Baseline existente? (gera novo RF do zero)"):
             pause()
             return
 
     print()
     print("  O baseline_rf.py:")
     print("    - Treina um RandomForest sobre o mesmo split estratificado")
-    print("    - Registra como M0 no triplete")
+    print("    - Registra como Baseline na progressão")
     print("    - Tempo estimado: 5-15 minutos em CPU")
     print()
     print("  " + color("Escolha o modo de execução:", "cyan", "bold"))
@@ -1747,7 +1749,7 @@ def _register_baseline_m0() -> None:
         # FOREGROUND — passa stdout/stderr direto ao terminal, com tee opcional
         print()
         print(hline())
-        print("  " + color("Iniciando M0 em foreground.", "cyan", "bold"))
+        print("  " + color("Iniciando Baseline em foreground.", "cyan", "bold"))
         print(f"  Log também sendo gravado em: {log_file}")
         print(hline())
         print()
@@ -1755,7 +1757,7 @@ def _register_baseline_m0() -> None:
         # Quando o timestamper está disponível, cada linha (inclusive a saída
         # crua do RandomForest/sklearn) é carimbada com data-hora antes do tee.
         with open(log_file, "a", encoding="utf-8") as fh:
-            fh.write(f"\n=== M0 foreground iniciado em "
+            fh.write(f"\n=== Baseline foreground iniciado em "
                      f"{datetime.now().isoformat()} ===\n")
         ts_script = _ensure_timestamper()
         if ts_script:
@@ -1773,14 +1775,14 @@ def _register_baseline_m0() -> None:
         except KeyboardInterrupt:
             print()
             print("  " + badge_warn(
-                "Interrompido com Ctrl+C. Verifique se o registro M0 foi gravado."
+                "Interrompido com Ctrl+C. Verifique se o registro do Baseline foi gravado."
             ))
             pause()
             return
         print()
         print(hline())
         if rc == 0:
-            print("  " + badge_ok("Baseline M0 concluído."))
+            print("  " + badge_ok("Baseline concluído."))
         else:
             print("  " + badge_err(f"Encerrou com código {rc}. Verifique o log."))
         pause()
@@ -1793,7 +1795,7 @@ def _register_baseline_m0() -> None:
         cwd=ROOT_DIR,
     )
     print()
-    print("  " + badge_ok(f"Baseline M0 iniciado em background — PID {proc.pid}"))
+    print("  " + badge_ok(f"Baseline iniciado em background — PID {proc.pid}"))
     print(f"  Log: {log_file}")
     print()
     if confirm("Acompanhar o log agora? (Ctrl+C volta ao menu sem matar o processo)"):
@@ -1803,13 +1805,13 @@ def _register_baseline_m0() -> None:
 
 def _reconcile_registry_now() -> None:
     """
-    Reconciliação manual do Mc a partir dos arrays salvos no último treino.
+    Reconciliação manual do M3 (atual) a partir dos arrays salvos no último treino.
 
     Executa em FOREGROUND (operação rápida — só calcula métricas e grava
     JSON). Não retreina, não toca em pesos.
     """
     print_header("IDS > Treinamento > Reconciliar Registry")
-    section("Reconciliação do triplete M0/Mp/Mc")
+    section("Reconciliação da progressão Baseline/M1/M2/M3")
 
     reg_state = _registry_state()
 
@@ -1830,13 +1832,13 @@ def _reconcile_registry_now() -> None:
         return
 
     if not reg_state["has_baseline"]:
-        print("  " + badge_warn("M0 (baseline) NÃO está registrado."))
-        print("  Recomenda-se gerar o M0 antes de registrar o Mc para que")
-        print("  o relatório comparativo M0/Mp/Mc fique completo.")
+        print("  " + badge_warn("Baseline NÃO está registrado."))
+        print("  Recomenda-se gerar o Baseline antes de registrar o M3 para que")
+        print("  o relatório comparativo Baseline/M1/M2/M3 fique completo.")
         print()
-        print(f"  Use a opção [7] do menu anterior para gerar o M0.")
+        print(f"  Use a opção [7] do menu anterior para gerar o Baseline.")
         print()
-        if not confirm("Continuar registrando apenas o Mc?"):
+        if not confirm("Continuar registrando apenas o M3?"):
             return
 
     print()
@@ -1896,7 +1898,7 @@ def _reconcile_registry_now() -> None:
                 print(f"    {k:18s} = {v}")
 
         print()
-        print("  Registrando como nova versão Mc…")
+        print("  Registrando como nova versão M3 (atual)…")
         entry = register_framework_version(
             model_path=Config.MODEL_DIR / Config.MODEL_FILENAME,
             y_true=y_true,
@@ -1913,7 +1915,7 @@ def _reconcile_registry_now() -> None:
         )
 
         print()
-        print("  " + badge_ok(f"Mc registrado: {entry['id']}"))
+        print("  " + badge_ok(f"M3 registrado: {entry['id']}"))
         print(f"    recall_macro = {metrics['recall_macro']:.4f}")
         print(f"    mcc          = {metrics['mcc']:.4f}")
         print(f"    f1_macro     = {metrics['f1_macro']:.4f}")

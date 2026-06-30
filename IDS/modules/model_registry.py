@@ -2,13 +2,21 @@
 """
 IDS/modules/model_registry.py — Registro Versionado de Modelos SecurityIA
 
-Mantém triplete canônico de modelos para comparação direta:
-    M0  : baseline imutável — Random Forest treinado sobre dataset puro
-    Mp  : modelo anterior   — versão imediatamente precedente do framework
-    Mc  : modelo atual      — versão recém-treinada do framework
+Mantém a progressão canônica de modelos para comparação direta:
+    Baseline : referência imutável — Random Forest treinado sobre o dataset puro
+    M1       : modelo inicial do framework — primeira versão registrada (scripts 1-4)
+    M2       : modelo anterior — versão imediatamente precedente à atual
+    M3       : modelo atual — versão mais recente registrada
+
+Mapeamento sobre o armazenamento (formato inalterado):
+    Baseline = baseline
+    M1       = framework_versions[0]
+    M2       = framework_versions[-2]
+    M3       = framework_versions[-1]
+Casos de borda: com 1 versão, M1 == M3 e M2 é None; com 2 versões, M1 == M2.
 
 Persistência em $MODEL_DIR/registry/:
-    baseline/                    M0 (não rotaciona)
+    baseline/                    Baseline (não rotaciona)
     v0001_<timestamp>/           versões do framework
     v0002_<timestamp>/
     ...
@@ -17,7 +25,8 @@ Persistência em $MODEL_DIR/registry/:
 API:
     register_baseline(model_path, y_true, y_pred, metrics)
     register_framework_version(model_path, y_true, y_pred, metrics, source)
-    load_triplet() -> dict('M0','Mp','Mc')   cada um é dict ou None
+    load_progression() -> dict('Baseline','M1','M2','M3')   cada um é dict ou None
+    load_triplet() -> dict('M0','Mp','Mc')   legado; prefira load_progression()
     list_versions() -> List[dict]
     cleanup_old_versions(keep=10)
 """
@@ -111,7 +120,7 @@ def register_baseline(
     }
     idx["baseline"] = entry
     _write_index(idx)
-    print(f"  [registry] Baseline M0 registrado: {BASELINE_DIR}")
+    print(f"  [registry] Baseline registrado: {BASELINE_DIR}")
     return entry
 
 
@@ -178,13 +187,35 @@ def _load_artifacts(entry: Optional[dict]) -> Optional[dict]:
 
 
 def load_triplet() -> dict:
-    """Retorna dict com 'M0', 'Mp', 'Mc'; cada um é dict completo ou None."""
+    """Retorna dict com 'M0', 'Mp', 'Mc'; cada um é dict completo ou None.
+
+    Legado. Prefira load_progression(), que expõe também M1 (modelo inicial).
+    """
     idx = _read_index()
     versions = idx["framework_versions"]
     return {
         "M0": _load_artifacts(idx.get("baseline")),
         "Mp": _load_artifacts(versions[-2]) if len(versions) >= 2 else None,
         "Mc": _load_artifacts(versions[-1]) if len(versions) >= 1 else None,
+    }
+
+
+def load_progression() -> dict:
+    """Retorna dict com 'Baseline', 'M1', 'M2', 'M3'; cada um é dict completo ou None.
+
+    Baseline = referência imutável (RandomForest sobre o dataset puro).
+    M1       = primeira versão do framework (modelo inicial, scripts 1-4).
+    M2       = versão imediatamente anterior à atual.
+    M3       = versão atual (mais recente).
+    Com 1 versão: M1 == M3 e M2 é None. Com 2 versões: M1 == M2.
+    """
+    idx = _read_index()
+    versions = idx["framework_versions"]
+    return {
+        "Baseline": _load_artifacts(idx.get("baseline")),
+        "M1": _load_artifacts(versions[0]) if len(versions) >= 1 else None,
+        "M2": _load_artifacts(versions[-2]) if len(versions) >= 2 else None,
+        "M3": _load_artifacts(versions[-1]) if len(versions) >= 1 else None,
     }
 
 
@@ -221,29 +252,36 @@ def cleanup_old_versions(keep: int = 10) -> int:
 
 def _print_status() -> None:
     idx = _read_index()
+    versions = idx["framework_versions"]
+    nv = len(versions)
     print("\n  REGISTRO DE MODELOS — SecurityIA")
     print("  " + "─" * 60)
     if idx.get("baseline"):
         b = idx["baseline"]
-        print(f"  M0  Baseline       : {b['kind']:<20s}  F1={b['f1_macro']:.4f}  "
+        print(f"  Baseline       : {b['kind']:<20s}  F1={b['f1_macro']:.4f}  "
               f"({b['registered_at'][:19]})")
     else:
-        print("  M0  Baseline       : NÃO REGISTRADO")
+        print("  Baseline       : NÃO REGISTRADO")
 
-    versions = idx["framework_versions"]
-    if not versions:
-        print("  Mc  Atual          : NÃO REGISTRADO")
+    if nv == 0:
+        print("  M1  Inicial    : NÃO REGISTRADO")
+        print("  M2  Anterior   : —")
+        print("  M3  Atual      : NÃO REGISTRADO")
     else:
-        c = versions[-1]
-        print(f"  Mc  Atual          : {c['id']}  F1={c['f1_macro']:.4f}  "
-              f"src={c.get('source','?')}  ({c['registered_at'][:19]})")
-        if len(versions) >= 2:
-            p = versions[-2]
-            print(f"  Mp  Anterior       : {p['id']}  F1={p['f1_macro']:.4f}  "
-                  f"src={p.get('source','?')}  ({p['registered_at'][:19]})")
+        v1 = versions[0]
+        vc = versions[-1]
+        print(f"  M1  Inicial    : {v1['id']}  F1={v1['f1_macro']:.4f}  "
+              f"src={v1.get('source','?')}  ({v1['registered_at'][:19]})")
+        if nv >= 2:
+            vp = versions[-2]
+            print(f"  M2  Anterior   : {vp['id']}  F1={vp['f1_macro']:.4f}  "
+                  f"src={vp.get('source','?')}  ({vp['registered_at'][:19]})")
         else:
-            print("  Mp  Anterior       : (sem histórico — apenas Mc)")
-    print(f"\n  Total de versões registradas: {len(versions)}")
+            print("  M2  Anterior   : (sem histórico — M1 ainda é o atual)")
+        print(f"  M3  Atual      : {vc['id']}  F1={vc['f1_macro']:.4f}  "
+              f"src={vc.get('source','?')}  ({vc['registered_at'][:19]})")
+
+    print(f"\n  Total de versões do framework: {nv}")
     print("  " + "─" * 60)
 
 
@@ -251,7 +289,7 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser(description="SecurityIA — Registro de Modelos")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("status", help="exibe status do triplete M0/Mp/Mc")
+    sub.add_parser("status", help="exibe status da progressão Baseline/M1/M2/M3")
     sub.add_parser("list", help="lista todas as versões")
     cl = sub.add_parser("cleanup", help="remove versões antigas")
     cl.add_argument("--keep", type=int, default=10)
