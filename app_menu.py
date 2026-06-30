@@ -1497,10 +1497,11 @@ def ids_training_menu() -> None:
             print(f"  [9] Acompanhar processo em execução  {color('— ativo', 'green')}")
         else:
             print("  [9] Acompanhar processo em execução")
+        print("  [10] Ranking IG_MI60/40 (top-23, sem treinar)")
         print("  [0] Voltar")
         print()
 
-        choice = menu_choice(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"])
+        choice = menu_choice(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
 
         if choice == "0":
             return
@@ -1571,6 +1572,9 @@ def ids_training_menu() -> None:
 
         elif choice == "9":
             _attach_to_active_process(baseline_procs, learn_procs)
+
+        elif choice == "10":
+            _dump_ig_mi_23()
 
 
 def _attach_to_active_process(
@@ -1669,6 +1673,35 @@ def _registry_state() -> dict:
         pass
 
     return state
+
+
+def _dump_ig_mi_23() -> None:
+    """Executa dump_ig_mi_23.py: ranking IG_MI60/40 e grava o JSON das 23 features.
+
+    Apenas seleção de atributos (IG + MI sobre a amostra). Nenhum modelo é
+    treinado; roda em foreground por ser rápido.
+    """
+    print_header("IDS > Treinamento > Ranking IG_MI60/40 (top-23)")
+    section("Seleção de atributos — top-23 do IG_MI60/40 (sem treinar)")
+
+    script = ROOT_DIR / "dump_ig_mi_23.py"
+    if not script.exists():
+        print("  " + badge_err(f"Script não encontrado: {script}"))
+        pause()
+        return
+
+    print("  " + badge_info(
+        "Calcula IG + MI sobre a amostra de seleção e ordena as features; "
+        "grava Model/ids_selected_features_k23.json. Nenhum modelo é treinado."
+    ))
+    print()
+    try:
+        subprocess.run([sys.executable, str(script)], cwd=str(ROOT_DIR), check=False)
+    except KeyboardInterrupt:
+        print("\n  " + badge_warn("Interrompido."))
+    except Exception as exc:
+        print("  " + badge_err(f"Falha ao executar: {exc}"))
+    pause()
 
 
 def _register_baseline_m0() -> None:
