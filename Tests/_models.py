@@ -168,6 +168,7 @@ def _avalia_arvore(modelo, X_tr, y_tr, X_te, y_te, n_cls,
             learning_rate=hp["learning_rate"], loss_function="MultiClass",
             thread_count=-1, random_seed=RANDOM_SEED, verbose=False,
             allow_writing_files=False,
+            boosting_type="Plain",   # explícito: base grande — modo escalável em CPU
             auto_class_weights="Balanced" if balanceamento_nativo else None,
         )
         es = int(hp.get("early_stopping_rounds", EARLY_STOPPING_ROUNDS) or 0)

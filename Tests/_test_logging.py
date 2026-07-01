@@ -33,8 +33,14 @@ class _SafeStreamHandler(logging.StreamHandler):
 def get_logger(analise_id: int, name: str) -> logging.Logger:
     log_dir = Path(__file__).resolve().parent / "Logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_file = log_dir / f"analise_{analise_id}_{ts}.log"
+    # Log VERSIONADO no mesmo padrão de tabelas/figuras (analise_N_AAAAMMDD-NN.log),
+    # via IDS.modules.versioning; fallback para timestamp se o módulo não existir.
+    try:
+        from IDS.modules.versioning import versioned_path
+        log_file = versioned_path(log_dir, f"analise_{analise_id}", "log")
+    except Exception:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_file = log_dir / f"analise_{analise_id}_{ts}.log"
 
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)

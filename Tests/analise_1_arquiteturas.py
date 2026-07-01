@@ -155,6 +155,7 @@ def avaliar_catboost(X_tr, X_val, X_te, y_tr, y_val, y_te, n_cls):
     clf = CatBoostClassifier(
         iterations=500, depth=8, learning_rate=0.1,
         loss_function="MultiClass", thread_count=-1,
+        boosting_type="Plain",   # explícito: base grande (~256k) — modo escalável em CPU
         random_seed=RANDOM_SEED, verbose=False, allow_writing_files=False,
         auto_class_weights=None,
     )
@@ -295,7 +296,7 @@ def executar(dataset_disponivel: bool = True) -> None:
     csv_path = tab_path(ANALISE_ID, "metricas_arquiteturas")
     _run("salvar CSV", lambda: df.to_csv(csv_path, index=False))
     log.info(f"Tabela: {csv_path}")
-    _run("plot_comparativo", lambda: _plot(df))
+    fig_file = _run("plot_comparativo", lambda: _plot(df))
 
     vencedor = selecionar_por_criterio(df, coluna_id="modelo",
                                        desempate=DESEMPATE_INV1, logger=log)
@@ -337,6 +338,27 @@ def executar(dataset_disponivel: bool = True) -> None:
         desempate=DESEMPATE_INV1,
     ))
 
+    # Relatório .md versionado (Relatorio_1_AAAAMMDD-NN.md + cópia canônica)
+    def _relatorio():
+        rel = Relatorio(ANALISE_ID)
+        rel.secao("Configuração")
+        rel.texto(f"Comparação de {len(df)} arquiteturas sobre "
+                  f"{Xfull.shape[0]:,} amostras × {Xfull.shape[1]} atributos × "
+                  f"{n_cls} classes, sem tratamento de desbalanceamento (isola a "
+                  f"arquitetura). Critério: hierárquico (MCC>=0,80; FPR<=0,010; "
+                  f"depois recall), desempate={DESEMPATE_INV1}.")
+        rel.secao("Resultados")
+        rel.tabela_df(df, "Métricas por arquitetura no conjunto de teste.")
+        if fig_file is not None:
+            rel.figura(Path(fig_file).stem, "Comparativo por métrica.")
+        rel.secao("Decisão")
+        rel.metrica("Classificador-base (Inv. 2–4)",
+                    f"{vencedor['modelo']} [{fam}] — recall={vencedor['recall_macro']:.4f}, "
+                    f"MCC={vencedor['mcc']:.4f}, F1={vencedor['f1_macro']:.4f}, "
+                    f"FPR={vencedor['fpr_macro']:.4f}")
+        return rel.salvar()
+    _run("salvar relatorio", _relatorio)
+
 
 def _plot(df: pd.DataFrame) -> None:
     """Painel 2x2: Recall-macro, MCC, F1-macro, FPR-macro.
@@ -360,8 +382,10 @@ def _plot(df: pd.DataFrame) -> None:
             a.annotate(f"{v:.3f}", (p.get_x() + p.get_width()/2, v),
                        ha="center", va="bottom", fontsize=9)
     plt.tight_layout()
-    plt.savefig(fig_path(ANALISE_ID, "comparativo_arquiteturas"), dpi=160, bbox_inches="tight")
+    fp = fig_path(ANALISE_ID, "comparativo_arquiteturas")
+    plt.savefig(fp, dpi=160, bbox_inches="tight")
     plt.close(fig)
+    return fp
 
 
 if __name__ == "__main__":

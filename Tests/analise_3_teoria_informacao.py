@@ -51,7 +51,8 @@ from _test_logging import (
     stratified_split_3way, fit_scaler_no_leakage, metricas_completas,
 )
 from _pipeline import (
-    exigir_estado, selecionar_por_criterio, salvar_estado, familia_de,
+    exigir_estado, selecionar_por_criterio, selecionar_recall_parcimonia,
+    salvar_estado, familia_de,
 )
 from _models import treina_avalia
 from _balance import estrategia_por_nome
@@ -67,7 +68,18 @@ ANALISE_ID = 3
 EPOCHS = 18
 PATIENCE = 5
 K_GRID = [10, 15, 23, 32, 48, "all"]
-DESEMPATE_INV3 = "recall"   # consistente com Inv. 1 e 2
+DESEMPATE_INV3 = "recall"   # (legado) desempate do critério não-parcimonioso
+# Inv. 3 — RECALL-PRIMÁRIO + parcimônia no nível de RUÍDO. A métrica primária é
+# o recall-macro (critério declarado): entre as configurações que passam no gate
+# (MCC>=0,80; FPR<=0,010) e cujo recall fica a até DELTA_RUIDO_INV3 do melhor,
+# escolhe-se a de MENOS atributos. DELTA calibrado pelo desvio-padrão do recall
+# entre dobras da Inv.4 (~0,0074): 0,005 fica dentro do ruído — troca por um
+# modelo menor só quando a diferença de recall é indistinguível de ruído e nunca
+# aceita perda real de recall. Sob qualquer DELTA<=~0,007 o vencedor é mRMR k=32.
+DELTA_RUIDO_INV3 = 0.005
+# Preferência de método em empates numéricos exatos (mRMR e JMI produzem métricas
+# idênticas neste dataset): prioriza mRMR (Peng et al.).
+PREF_METODOS_INV3 = ("mRMR",)
 log = get_logger(ANALISE_ID, "analise_3")
 
 def _run(label, fn, *a, **kw):
@@ -378,15 +390,23 @@ def executar(dataset_disponivel: bool = True) -> None:
     csv_path = tab_path(ANALISE_ID, "metricas_selecao")
     _run("salvar CSV", lambda: df.to_csv(csv_path, index=False))
     log.info(f"Tabela: {csv_path}")
-    _run("plot_comparativo", lambda: _plot(df))
+    fig_file = _run("plot_comparativo", lambda: _plot(df))
 
     # Seleção pelo CRITÉRIO HIERÁRQUICO (não recall puro). Cada linha é um par
     # (método, k); o identificador é a coluna 'combo'.
-    venc = selecionar_por_criterio(df, coluna_id="combo",
-                                   desempate=DESEMPATE_INV3, logger=log)
+    # Seleção RECALL-PRIMÁRIA (critério declarado) + desempate de parcimônia no
+    # nível de ruído. Gate hierárquico (MCC>=0,80; FPR<=0,010); depois recall
+    # máximo; entre os que ficam a até DELTA_RUIDO_INV3 do melhor recall, escolhe
+    # o de MENOS atributos (mRMR preferido a JMI em empate exato). Não sacrifica
+    # recall além do ruído — apenas troca por um modelo menor quando é indistinto.
+    venc = selecionar_recall_parcimonia(
+        df, coluna_id="combo", coluna_metodo="metodo",
+        delta_ruido=DELTA_RUIDO_INV3, preferencia_metodo=PREF_METODOS_INV3,
+        logger=log,
+    )
     idx_venc = idx_por_combo.get(venc["combo"], [])
     log.info("=" * 62)
-    log.info(f"VENCEDOR (critério, desempate={DESEMPATE_INV3}): {venc['combo']}  "
+    log.info(f"VENCEDOR (recall-primário, parcimônia Δ={DELTA_RUIDO_INV3}): {venc['combo']}  "
              f"recall={venc['recall_macro']:.4f} mcc={venc['mcc']:.4f} "
              f"f1={venc['f1_macro']:.4f} fpr={venc['fpr_macro']:.4f} "
              f"(k_real={venc['k_real']}, passou_criterio={venc['passou_criterio']})")
@@ -399,8 +419,32 @@ def executar(dataset_disponivel: bool = True) -> None:
         recall_macro=float(venc["recall_macro"]), mcc=float(venc["mcc"]),
         f1_macro=float(venc["f1_macro"]), fpr_macro=float(venc["fpr_macro"]),
         passou_criterio=bool(venc["passou_criterio"]),
+        criterio="recall_parcimonia", delta_ruido=float(DELTA_RUIDO_INV3),
         desempate=DESEMPATE_INV3,
     ))
+
+    # Relatório .md versionado
+    def _relatorio():
+        rel = Relatorio(ANALISE_ID)
+        rel.secao("Configuração")
+        rel.texto(f"Seleção de atributos por Teoria da Informação sobre "
+                  f"{modelo} [{familia}] + {balanceamento} (Inv. 2). "
+                  f"{len(METODOS)} métodos × {len(K_GRID)} cardinalidades. "
+                  f"Seleção RECALL-PRIMÁRIA: gate (MCC>=0,80; FPR<=0,010), depois "
+                  f"recall-macro máximo; entre os que ficam a até {DELTA_RUIDO_INV3} "
+                  f"do melhor recall (nível de ruído), escolhe-se o de MENOS "
+                  f"atributos (mRMR preferido a JMI em empate exato).")
+        rel.secao("Resultados")
+        rel.tabela_df(df, "Métricas por (método, k).")
+        if fig_file is not None:
+            rel.figura(Path(fig_file).stem, "Métricas vs. k por método.")
+        rel.secao("Decisão")
+        rel.metrica("Seleção (Inv. 4)",
+                    f"{venc['metodo']} k={venc['k']} (k_real={int(venc['k_real'])}) — "
+                    f"recall={venc['recall_macro']:.4f}, MCC={venc['mcc']:.4f}, "
+                    f"FPR={venc['fpr_macro']:.4f}")
+        return rel.salvar()
+    _run("salvar relatorio", _relatorio)
 
 
 def _plot(df: pd.DataFrame) -> None:
@@ -429,8 +473,10 @@ def _plot(df: pd.DataFrame) -> None:
         a.set_xlabel("k (atributos selecionados)"); a.set_ylabel(col)
         a.grid(True, alpha=0.3); a.legend(fontsize=8, loc="best")
     plt.tight_layout()
-    plt.savefig(fig_path(ANALISE_ID, "comparativo_selecao"), dpi=160, bbox_inches="tight")
+    fp = fig_path(ANALISE_ID, "comparativo_selecao")
+    plt.savefig(fp, dpi=160, bbox_inches="tight")
     plt.close(fig)
+    return fp
 
 
 if __name__ == "__main__":

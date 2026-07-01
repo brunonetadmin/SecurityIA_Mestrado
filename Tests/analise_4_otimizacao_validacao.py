@@ -57,8 +57,22 @@ from sklearn.preprocessing import StandardScaler
 apply_plot_style()
 
 ANALISE_ID = 4
+# N_FOLDS: 5 dobras — compromisso padrão viés/variância; cada dobra treina em
+# 80% do dev e valida em 20%, sem tocar o teste reservado.
 N_FOLDS = 5
-N_TRIALS_OPTUNA = 1       # ajuste conforme orçamento computacional
+# N_TRIALS_OPTUNA: orçamento do TPE. 30 trials cobrem razoavelmente um espaço de
+# 3 hiperparâmetros (iterations, depth, learning_rate); a poda e a parada por
+# estagnação abaixo cortam trials improdutivos, então o custo real fica < 30×CV.
+N_TRIALS_OPTUNA = 30
+# Poda intra-trial (MedianPruner): após >=5 trials de aquecimento, um trial é
+# podado se sua média parcial de recall (por dobra) ficar abaixo da mediana dos
+# trials completos no mesmo passo — evita gastar as 5 dobras em configs ruins.
+PRUNER_STARTUP_TRIALS = 5
+PRUNER_WARMUP_STEPS = 1
+# Parada por estagnação: encerra o estudo se o melhor score não melhorar mais que
+# MIN_DELTA_ESTAGNACAO por PACIENCIA_ESTAGNACAO trials completos consecutivos.
+PACIENCIA_ESTAGNACAO = 8
+MIN_DELTA_ESTAGNACAO = 1e-3
 LAMBDA_VAR = 0.25         # penalização da variância entre dobras
 EPOCHS = 30               # usado apenas se o vencedor for de família 'rede'
 PATIENCE = 5
@@ -122,13 +136,17 @@ def _preparar_dobras(familia, balanceamento, n_cls, X_dev, y_dev):
     return dobras
 
 
-def avaliar_kfold_cache(modelo, hparams, dobras, n_cls, log_prefix=""):
+def avaliar_kfold_cache(modelo, hparams, dobras, n_cls, log_prefix="", trial=None):
     """Avalia `hparams` sobre dobras JÁ preparadas e balanceadas por
     _preparar_dobras. Apenas o ajuste do modelo varia entre trials — que é a
     única etapa que de fato depende dos hiperparâmetros. Retorna lista de dicts
-    (1 por dobra), idêntica à versão que rebalanceava a cada chamada."""
-    folds = []
-    for d in dobras:
+    (1 por dobra), idêntica à versão que rebalanceava a cada chamada.
+
+    Se `trial` (do Optuna) for passado, reporta a média PARCIAL de recall a cada
+    dobra e consulta o pruner: um trial improdutivo é interrompido antes de
+    consumir as 5 dobras (levanta optuna.TrialPruned)."""
+    folds, recalls = [], []
+    for step, d in enumerate(dobras, start=1):
         out = treina_avalia(
             modelo, d["X_b"], d["y_b"], d["X_vl"], d["y_vl"], n_cls,
             X_val=d["X_vl"], y_val=d["y_vl"], hparams=hparams, logger=None,
@@ -137,10 +155,18 @@ def avaliar_kfold_cache(modelo, hparams, dobras, n_cls, log_prefix=""):
         )
         out["fold"] = d["fold"]
         folds.append(out)
+        recalls.append(out["recall_macro"])
         log.info(f"  {log_prefix}fold {d['fold']}/{N_FOLDS}: "
                  f"recall={out['recall_macro']:.4f} mcc={out['mcc']:.4f} "
                  f"f1={out['f1_macro']:.4f} fpr={out['fpr_macro']:.4f} "
                  f"({out['tempo_s']:.1f}s)")
+        if trial is not None:
+            import optuna
+            trial.report(float(np.mean(recalls)), step)   # média parcial de recall
+            if trial.should_prune():
+                log.info(f"  {log_prefix}PODADO no passo {step}/{N_FOLDS} "
+                         f"(recall parcial {np.mean(recalls):.4f})")
+                raise optuna.TrialPruned()
     return folds
 
 
@@ -180,12 +206,41 @@ def _objective_factory(modelo, dobras, n_cls, folds_por_trial=None):
     def objective(trial):
         hp = espaco_busca(modelo, trial)
         folds = avaliar_kfold_cache(modelo, hp, dobras, n_cls,
-                                    log_prefix=f"trial {trial.number} ")
+                                    log_prefix=f"trial {trial.number} ", trial=trial)
         if folds_por_trial is not None:
             folds_por_trial[trial.number] = folds
         rec = np.array([f["recall_macro"] for f in folds], dtype=float)
         return float(rec.mean() - LAMBDA_VAR * rec.std(ddof=1))
     return objective
+
+
+class ParadaPorEstagnacao:
+    """Callback de estudo: interrompe a otimização se o MELHOR score não melhorar
+    mais que `min_delta` por `paciencia` trials COMPLETOS consecutivos. Evita
+    gastar CPU quando o TPE deixou de progredir (early stop de estudo). Trials
+    podados não contam para a estagnação."""
+    def __init__(self, paciencia=8, min_delta=1e-3, logger=None):
+        self.paciencia = paciencia
+        self.min_delta = min_delta
+        self.logger = logger
+        self.melhor = None
+        self.sem_melhora = 0
+
+    def __call__(self, study, trial):
+        import optuna
+        if trial.state != optuna.trial.TrialState.COMPLETE or trial.value is None:
+            return
+        if self.melhor is None or trial.value > self.melhor + self.min_delta:
+            self.melhor = trial.value
+            self.sem_melhora = 0
+        else:
+            self.sem_melhora += 1
+            if self.sem_melhora >= self.paciencia:
+                if self.logger:
+                    self.logger.info(
+                        f"PARADA POR ESTAGNAÇÃO: {self.paciencia} trials sem "
+                        f"ganho > {self.min_delta}; encerrando o estudo.")
+                study.stop()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -262,14 +317,26 @@ def executar(dataset_disponivel: bool = True) -> None:
     # ── Otimização ─────────────────────────────────────────────────────────
     folds_por_trial = {}      # métricas por dobra de cada trial (reuso no vencedor)
     sampler = TPESampler(seed=RANDOM_SEED)
-    study = optuna.create_study(direction="maximize", sampler=sampler)
-    log.info(f">>> Optuna: {N_TRIALS_OPTUNA} trials × CV-{N_FOLDS} "
-             f"= {N_TRIALS_OPTUNA * N_FOLDS} ajustes de {modelo} "
-             f"(dobras pré-balanceadas — só o ajuste do modelo varia)")
+    pruner = optuna.pruners.MedianPruner(
+        n_startup_trials=PRUNER_STARTUP_TRIALS, n_warmup_steps=PRUNER_WARMUP_STEPS)
+    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
+    parada = ParadaPorEstagnacao(paciencia=PACIENCIA_ESTAGNACAO,
+                                 min_delta=MIN_DELTA_ESTAGNACAO, logger=log)
+    log.info(f">>> Optuna: até {N_TRIALS_OPTUNA} trials × CV-{N_FOLDS} de {modelo} "
+             f"(dobras pré-balanceadas; MedianPruner por dobra + parada por "
+             f"estagnação após {PACIENCIA_ESTAGNACAO} trials sem ganho)")
     study.optimize(
         _objective_factory(modelo, dobras, n_cls, folds_por_trial),
-        n_trials=N_TRIALS_OPTUNA, show_progress_bar=False,
+        n_trials=N_TRIALS_OPTUNA, callbacks=[parada], show_progress_bar=False,
     )
+    n_complete = sum(1 for t in study.trials
+                     if t.state == optuna.trial.TrialState.COMPLETE)
+    n_pruned = sum(1 for t in study.trials
+                   if t.state == optuna.trial.TrialState.PRUNED)
+    log.info(f"Trials: {n_complete} completos, {n_pruned} podados "
+             f"(de {len(study.trials)} iniciados)")
+    if n_complete == 0:
+        log.error("Nenhum trial completo (todos podados/falhos). Abortando."); return
     log.info("=" * 62)
     log.info(f"BEST PARAMS: {study.best_params}")
     log.info(f"BEST SCORE : {study.best_value:.4f}")
@@ -339,7 +406,7 @@ def executar(dataset_disponivel: bool = True) -> None:
     _run("salvar resumo", lambda: df_resumo.to_csv(csv_resumo, index=False))
     log.info(f"Tabela resumo: {csv_resumo}")
 
-    _run("plot_otimizacao", lambda: _plot(df_trials, df_folds))
+    fig_file = _run("plot_otimizacao", lambda: _plot(df_trials, df_folds))
 
     _run("salvar estado", lambda: salvar_estado(
         4, modelo=modelo, familia=familia, balanceamento=balanceamento,
@@ -351,6 +418,30 @@ def executar(dataset_disponivel: bool = True) -> None:
         cv_recall_mean=agg["recall_macro_mean"], cv_recall_std=agg["recall_macro_std"],
         cv_mcc_mean=agg["mcc_mean"], cv_mcc_std=agg["mcc_std"],
     ))
+
+    # Relatório .md versionado
+    def _relatorio():
+        rel = Relatorio(ANALISE_ID)
+        rel.secao("Configuração")
+        rel.texto(f"Otimização (Optuna/TPE) + validação cruzada de {N_FOLDS} "
+                  f"dobras sobre {modelo} [{familia}] + {balanceamento}, "
+                  f"projetado em {Xfull.shape[1]} atributos (Inv. 3). Orçamento: "
+                  f"até {N_TRIALS_OPTUNA} trials com poda (MedianPruner) e parada "
+                  f"por estagnação ({PACIENCIA_ESTAGNACAO} trials). "
+                  f"Trials completos={n_complete}, podados={n_pruned}. "
+                  f"Melhor configuração: {study.best_params}.")
+        rel.secao("Validação cruzada e teste reservado")
+        rel.tabela_df(df_folds, "Métricas por dobra (configuração vencedora).")
+        rel.tabela_df(df_resumo, "Resumo: média±desvio da CV e teste reservado.")
+        if fig_file is not None:
+            rel.figura(Path(fig_file).stem, "Histórico, dobras e importância.")
+        rel.secao("Decisão")
+        rel.metrica("Modelo final (teste reservado)",
+                    f"{modelo} — recall={met_te['recall_macro']:.4f}, "
+                    f"MCC={met_te['mcc']:.4f}, F1={met_te['f1_macro']:.4f}, "
+                    f"FPR={met_te['fpr_macro']:.4f}")
+        return rel.salvar()
+    _run("salvar relatorio", _relatorio)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -425,8 +516,10 @@ def _plot(df_trials: pd.DataFrame, df_folds: pd.DataFrame) -> None:
         ax[1, 1].axis("off")
 
     plt.tight_layout()
-    plt.savefig(fig_path(ANALISE_ID, "comparativo_otimizacao"), dpi=160, bbox_inches="tight")
+    fp = fig_path(ANALISE_ID, "comparativo_otimizacao")
+    plt.savefig(fp, dpi=160, bbox_inches="tight")
     plt.close(fig)
+    return fp
 
 
 if __name__ == "__main__":

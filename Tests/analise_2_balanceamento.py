@@ -139,7 +139,7 @@ def executar(dataset_disponivel: bool = True) -> None:
     csv_path = tab_path(ANALISE_ID, "metricas_balanceamento")
     _run("salvar CSV", lambda: df.to_csv(csv_path, index=False))
     log.info(f"Tabela: {csv_path}")
-    _run("plot_comparativo", lambda: _plot(df))
+    fig_file = _run("plot_comparativo", lambda: _plot(df))
 
     # ── 4. Seleção pelo critério hierárquico + ganho vs baseline ───────────
     venc = selecionar_por_criterio(df, coluna_id="estrategia",
@@ -164,6 +164,25 @@ def executar(dataset_disponivel: bool = True) -> None:
         desempate=DESEMPATE_INV2,
     ))
 
+    # Relatório .md versionado
+    def _relatorio():
+        rel = Relatorio(ANALISE_ID)
+        rel.secao("Configuração")
+        rel.texto(f"Tratamento de desbalanceamento sobre o vencedor da Inv. 1 "
+                  f"({modelo} [{familia}]). Estratégias adaptadas à família; "
+                  f"reamostragem apenas no treino (sem vazamento). Critério "
+                  f"hierárquico (MCC>=0,80; FPR<=0,010; depois recall).")
+        rel.secao("Resultados")
+        rel.tabela_df(df, "Métricas por estratégia de balanceamento.")
+        if fig_file is not None:
+            rel.figura(Path(fig_file).stem, "Comparativo por métrica.")
+        rel.secao("Decisão")
+        rel.metrica("Balanceamento (Inv. 3–4)",
+                    f"{venc['estrategia']} — recall={venc['recall_macro']:.4f}, "
+                    f"MCC={venc['mcc']:.4f}, FPR={venc['fpr_macro']:.4f}{delta}")
+        return rel.salvar()
+    _run("salvar relatorio", _relatorio)
+
 
 def _plot(df: pd.DataFrame) -> None:
     fig, ax = plt.subplots(2, 2, figsize=(13, 9))
@@ -185,9 +204,10 @@ def _plot(df: pd.DataFrame) -> None:
             a.annotate(f"{v:.3f}", (p.get_x() + p.get_width()/2, v),
                        ha="center", va="bottom", fontsize=8)
     plt.tight_layout()
-    plt.savefig(fig_path(ANALISE_ID, "comparativo_balanceamento"),
-                dpi=160, bbox_inches="tight")
+    fp = fig_path(ANALISE_ID, "comparativo_balanceamento")
+    plt.savefig(fp, dpi=160, bbox_inches="tight")
     plt.close(fig)
+    return fp
 
 
 if __name__ == "__main__":
