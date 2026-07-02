@@ -24,6 +24,12 @@ try:
 except Exception:
     RANDOM_SEED = 42
 
+# Piso de amostras por classe após SMOTE-ENN. O split estratificado do early
+# stopping (CatBoost) exige >=2 por classe; abaixo disso a classe também fica
+# efetivamente ausente do ajuste. 2 é o mínimo que restaura a viabilidade do
+# split reintroduzindo o menor número possível de amostras reais.
+MIN_POR_CLASSE_ENN = 2
+
 
 # ─── Reamostragens (model-agnostic) ────────────────────────────────────────
 
@@ -83,15 +89,28 @@ def smote_enn(X_tr, y_tr, logger=None):
         random_state=RANDOM_SEED,
     )
     X_res, y_res = s.fit_resample(X_tr, y_tr)
-    # ENN pode remover classes raras inteiras; reinjeta 1 amostra de cada.
-    faltantes = set(np.unique(y_tr).tolist()) - set(np.unique(y_res).tolist())
-    if faltantes:
-        if logger:
-            logger.info(f"  SMOTE_ENN: ENN removeu {faltantes}; reinjetando 1 de cada.")
-        for c in faltantes:
-            idx = np.where(y_tr == c)[0][:1]
-            X_res = np.concatenate([X_res, X_tr[idx]])
-            y_res = np.concatenate([y_res, y_tr[idx]])
+    # O ENN pode reduzir (ou zerar) classes raras. Uma classe abaixo de
+    # MIN_POR_CLASSE_ENN inviabiliza o split estratificado de early stopping a
+    # jusante e fica sem representação no ajuste do modelo. Repõe-se o mínimo
+    # necessário a partir das amostras ORIGINAIS de cada classe (ciclando quando
+    # a classe original tem menos que o déficit). O custo é reintroduzir poucas
+    # amostras reais; a alternativa — perder a classe — zera o recall dela, que é
+    # a métrica primária do estudo.
+    cont = Counter(np.asarray(y_res).tolist())
+    repostas = {}
+    for c in np.unique(y_tr):
+        deficit = MIN_POR_CLASSE_ENN - cont.get(int(c), 0)
+        if deficit > 0:
+            orig = np.where(y_tr == c)[0]
+            if len(orig) == 0:
+                continue
+            take = orig[np.arange(deficit) % len(orig)]
+            X_res = np.concatenate([X_res, X_tr[take]])
+            y_res = np.concatenate([y_res, y_tr[take]])
+            repostas[int(c)] = int(deficit)
+    if repostas and logger:
+        logger.info(f"  SMOTE_ENN: reposição para o mínimo de "
+                    f"{MIN_POR_CLASSE_ENN} amostras/classe: {repostas}")
     if logger:
         logger.info(f"  SMOTE_ENN: {len(y_tr):,} → {len(y_res):,}")
     return X_res, y_res

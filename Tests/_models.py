@@ -172,7 +172,12 @@ def _avalia_arvore(modelo, X_tr, y_tr, X_te, y_te, n_cls,
             auto_class_weights="Balanced" if balanceamento_nativo else None,
         )
         es = int(hp.get("early_stopping_rounds", EARLY_STOPPING_ROUNDS) or 0)
-        if es > 0:
+        # O split estratificado do early stopping exige >=2 amostras por classe.
+        # Após SMOTE-ENN, classes raras podem ficar com 1 amostra (o ENN remove a
+        # classe inteira e a reinjeção a repõe). Nesse caso, treina-se sem early
+        # stopping — preserva a classe rara no ajuste e evita quebrar o split.
+        _, _cnt = np.unique(y_tr, return_counts=True)
+        if es > 0 and _cnt.min() >= 2:
             # Early stopping sobre uma fatia INTERNA do treino (10%), separada de
             # forma estratificada. NÃO usa X_te (conjunto de avaliação da dobra),
             # para a parada não ser sintonizada no mesmo dado em que a métrica é
